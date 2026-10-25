@@ -1,0 +1,43 @@
+"""Small, JSON-serializable card projections, not entire print records."""
+
+import unicodedata
+from typing import Any
+
+Card = dict[str, Any]
+
+
+def name_key(name: str) -> str:
+    """Normalize case/spacing, without guessing spelling or removing punctuation."""
+    return " ".join(unicodedata.normalize("NFC", name).casefold().split())
+
+
+def trim_card(card: Card) -> Card:
+    """Keep the six gameplay fields and the ID needed to request rulings."""
+    faces = card.get("card_faces", [])
+    return {
+        "id": card["id"],
+        "name": card["name"],
+        "mana_cost": card.get("mana_cost")
+        or " // ".join(face.get("mana_cost", "") for face in faces),
+        "type_line": card.get("type_line")
+        or " // ".join(face.get("type_line", "") for face in faces),
+        "oracle_text": card.get("oracle_text")
+        or "\n//\n".join(face.get("oracle_text", "") for face in faces),
+        "color_identity": card["color_identity"],
+        "game_changer": bool(card.get("game_changer")),
+    }
+
+
+def validation_card(card: Card) -> Card:
+    """Retain only additional fields needed for deterministic validation."""
+    result = trim_card(card)
+    result.update(
+        oracle_id=card.get("oracle_id", card["id"]),
+        layout=card.get("layout", "normal"),
+        legalities={"commander": card.get("legalities", {}).get("commander", "not_legal")},
+        card_faces=[
+            {key: face.get(key, "") for key in ("name", "type_line", "oracle_text")}
+            for face in card.get("card_faces", [])
+        ],
+    )
+    return result
