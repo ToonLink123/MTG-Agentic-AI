@@ -29,12 +29,13 @@ class PipelineCliTests(unittest.TestCase):
             store.import_cards(self.cards)
             self.pool_data = make_pool(store).to_dict()
 
-    def run_cli(self, *args, model=None):
+    def run_cli(self, *args, model=None, stderr=None):
         if args and args[0] in {"draft", "build"}:
             args = (*args, "--skip-review")
         output = io.StringIO()
         with (
             contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(stderr or io.StringIO()),
             patch("mtg_agentic.__main__._make_model", return_value=model or FakeModel()),
             patch(
                 "mtg_agentic.scryfall.ScryfallClient.get_card",
@@ -42,7 +43,8 @@ class PipelineCliTests(unittest.TestCase):
             ),
             patch("mtg_agentic.scryfall.urlopen", side_effect=AssertionError("No real HTTP")),
         ):
-            status = main(["--data-dir", str(self.path), *args])
+            quiet = [] if stderr else ["--quiet"]
+            status = main([*quiet, "--data-dir", str(self.path), *args])
         return status, json.loads(output.getvalue())
 
     def test_schema_command_needs_no_model_or_network(self):
@@ -92,6 +94,18 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertFalse(result["valid"])
         self.assertTrue(result["validation"]["errors"])
+
+    def test_progress_goes_to_stderr_and_stdout_stays_json(self):
+        pool_file = self.path / "pool.json"
+        pool_file.write_text(json.dumps(self.pool_data), encoding="utf-8")
+        stderr = io.StringIO()
+        status, result = self.run_cli(
+            "draft", "--pool", str(pool_file), model=FakeModel(draft()), stderr=stderr
+        )
+        self.assertEqual(status, 0)
+        self.assertTrue(result["valid"])
+        self.assertIn("draft: attempt 1/4", stderr.getvalue())
+        self.assertIn("draft: attempt 1 passed", stderr.getvalue())
 
     def test_malformed_spec_returns_machine_readable_schema_errors(self):
         spec_file = self.path / "bad-spec.json"

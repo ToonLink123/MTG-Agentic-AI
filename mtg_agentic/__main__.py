@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
@@ -37,13 +38,16 @@ from .validator import validate_deck
 def _model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
-        choices=("ollama", "openai-compatible"),
+        choices=("ollama", "openai-compatible", "claude"),
         default=os.getenv("MTG_LLM_PROVIDER", "ollama"),
     )
     parser.add_argument("--model", default=os.getenv("MTG_LLM_MODEL"))
     parser.add_argument("--llm-url", default=os.getenv("MTG_LLM_BASE_URL"))
     parser.add_argument("--llm-timeout", type=float, default=300)
     parser.add_argument("--context-size", type=int, default=65536)
+    parser.add_argument(
+        "--effort", choices=("low", "medium", "high", "xhigh", "max"), default="high"
+    )
     parser.add_argument(
         "--output", type=Path, help="Save JSON to a NEW file; existing files are never overwritten"
     )
@@ -57,6 +61,16 @@ def _make_model(args: argparse.Namespace):
             timeout=args.llm_timeout,
             context_size=args.context_size,
         )
+    if args.provider == "claude":
+        from .claude import ClaudeClient  # Loads the optional Anthropic SDK only when selected.
+
+        return ClaudeClient(
+            args.model or "claude-haiku-5-5",
+            api_key=_claude_api_key(),
+            timeout=args.llm_timeout,
+            effort=args.effort,
+            progress=None if args.quiet else sys.stderr,
+        )
     if args.provider != "openai-compatible":
         raise ValueError("Unknown MTG_LLM_PROVIDER")
     if not args.model:
@@ -67,6 +81,18 @@ def _make_model(args: argparse.Namespace):
         base_url=args.llm_url or "https://api.openai.com/v1",
         timeout=args.llm_timeout,
     )
+
+
+def _claude_api_key(env_file: Path = Path(".env")) -> str:
+    """CLAUDE_API from the environment, else from a local, git-ignored .env file."""
+    if os.getenv("CLAUDE_API"):
+        return os.environ["CLAUDE_API"]
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+            name, _, value = line.partition("=")
+            if name.strip().removeprefix("export ").strip() == "CLAUDE_API":
+                return value.strip().strip("'\"")
+    return ""
 
 
 def _embedding_options(parser: argparse.ArgumentParser) -> None:
@@ -164,6 +190,7 @@ def _emit(result: Any, output: Path | None = None) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--quiet", action="store_true", help="No live progress on stderr")
     commands = parser.add_subparsers(dest="command", required=True)
     bulk = commands.add_parser("download-oracle", help="Download/index Oracle Cards once")
     bulk.add_argument("--refresh", action="store_true")
@@ -251,6 +278,13 @@ def main(argv: list[str] | None = None) -> int:
         args.runs_dir = args.data_dir / "evaluations"
     if args.command == "revise" and args.runs_dir is None:
         args.runs_dir = args.data_dir / "revisions"
+    # Stage updates go to stderr so stdout stays clean JSON.
+    progress = logging.StreamHandler(sys.stderr)
+    progress.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("mtg_agentic")
+    if not args.quiet:
+        logger.setLevel(logging.INFO)
+        logger.addHandler(progress)
 
     try:
         result: Any
@@ -284,6 +318,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("Output already exists; choose a new filename")
             model = _make_model(args)
             with ExitStack() as stack:
+                if hasattr(model, "report"):
+                    stack.callback(model.report)
                 store = stack.enter_context(OracleStore(args.data_dir / "oracle.sqlite3"))
                 client = stack.enter_context(ScryfallClient(args.data_dir / "responses.sqlite3"))
                 if not store.ready:
@@ -407,6 +443,8 @@ def main(argv: list[str] | None = None) -> int:
                 OracleStore(args.data_dir / "oracle.sqlite3") as store,
                 ScryfallClient(args.data_dir / "responses.sqlite3") as client,
             ):
+                if hasattr(model, "report"):
+                    stack.callback(model.report)
                 if not store.ready:
                     raise ValueError("Run download-oracle before using the LLM pipeline")
                 reviewer = None
@@ -491,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
             error["status"] = exc.status
         print(json.dumps({"valid": False, "errors": [error]}))
         return 2
+    finally:
+        logger.removeHandler(progress)
 
 
 if __name__ == "__main__":

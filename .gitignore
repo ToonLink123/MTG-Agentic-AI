@@ -8,3 +8,9 @@ htmlcov/
 build/
 dist/
 .cache/
+.claude/settings.local.json*
+trajector-doctor-*.tar.gz
+trajector-doctor-*/
+.env
+.claude/
+.empryo/

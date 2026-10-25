@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from itertools import zip_longest
@@ -15,6 +16,8 @@ from .schema import QUERY_SCHEMA, ROLES, SchemaError
 from .scryfall import ScryfallClient
 from .spec import DeckSpec, ground_spec
 from .validator import card_errors
+
+log = logging.getLogger(__name__)
 
 BASIC_LANDS = {
     "W": "Plains",
@@ -87,6 +90,7 @@ def generate_queries(spec: DeckSpec, model: JSONModel) -> list[CardQuery]:
         },
         {"role": "user", "content": json.dumps(spec.to_dict())},
     ]
+    log.info("discovery: planning card searches")
     raw = request_json(model, messages, QUERY_SCHEMA)["queries"]
     # Small deterministic anchors make explicit themes survive an incomplete model plan.
     themes = " ".join(spec.themes + spec.mechanics).lower()
@@ -225,7 +229,8 @@ def build_candidate_pool(
     buckets: list[list[str]] = []
     diagnostics: list[dict[str, Any]] = []
     normalized_queries: list[CardQuery] = []
-    for query in queries:
+    for number, query in enumerate(queries, 1):
+        log.info("discovery: search %d/%d (%s)", number, len(queries), query.role)
         if query.role not in ROLES:
             raise ValueError("Unknown discovery role")
         # Callers may supply their own plans. Always enforce the filters here too.
@@ -299,6 +304,7 @@ def build_candidate_pool(
             if key is not None and key not in selected_set and len(selected) < limit:
                 selected.append(key)
                 selected_set.add(key)
+    log.info("discovery: %d candidates", len(selected))
     return CandidatePool(
         spec, [candidates[key] for key in selected], normalized_queries, diagnostics
     )

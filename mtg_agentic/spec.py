@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -12,6 +13,8 @@ from .oracle import OracleStore
 from .schema import SPEC_SCHEMA, SchemaError, validate_json
 from .scryfall import ScryfallClient
 from .validator import can_be_commander, card_errors
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,7 @@ def intake(
         },
         {"role": "user", "content": json.dumps({"request": request, "commander_card": fetched})},
     ]
+    log.info("intake: turning the request into a deck spec")
     spec = DeckSpec.from_dict(request_json(model, messages, SPEC_SCHEMA))
     # Ensure the response cannot silently switch the requested commander.
     if name_key(spec.commander) != name_key(fetched["name"]):

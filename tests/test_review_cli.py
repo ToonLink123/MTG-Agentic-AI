@@ -31,7 +31,7 @@ class ReviewCliTests(unittest.TestCase):
     def run_cli(self, *args):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            code = main(["--data-dir", str(self.path), *args])
+            code = main(["--quiet", "--data-dir", str(self.path), *args])
         return code, json.loads(output.getvalue())
 
     @patch("mtg_agentic.__main__._reviewer")

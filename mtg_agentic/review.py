@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .brackets import BracketChecker
@@ -10,6 +11,8 @@ from .llm import JSONModel
 from .oracle import OracleStore
 from .rules import RulesStore
 from .scryfall import ScryfallClient
+
+log = logging.getLogger(__name__)
 
 
 class DeckReviewer:
@@ -29,8 +32,10 @@ class DeckReviewer:
         return self.brackets.game_changer_list["names"]
 
     def check(self, cards: dict[str, int], commander: str, bracket: int) -> dict[str, Any]:
+        log.info("review: bracket check")
         bracket_report = self.brackets.check(cards, commander, bracket)
         all_names = list(dict.fromkeys([commander, *cards]))
+        log.info("review: rulings for %d cards", len(all_names))
         ingestion = self.rules.ingest_deck(all_names, self.store, self.client)
         records = [self.store.get_card(n) for n in all_names]
         proliferators = [
@@ -98,6 +103,12 @@ class DeckReviewer:
                     }
                 )
             else:
+                log.info(
+                    "review: rules question %d/%d (%s)",
+                    i + 1,
+                    min(len(jobs), 20),
+                    " + ".join(n.split(",")[0] for n in names),
+                )
                 interactions.append(self.rules.check_interaction(names, question, self.model))
         errors = []
         if bracket_report["verdict"] != "fits":

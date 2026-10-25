@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from typing import Any
 
@@ -16,6 +17,8 @@ from .schema import DRAFT_SCHEMA, TARGET_ROLES, SchemaError
 from .scryfall import CardNotFound, ScryfallClient
 from .spec import DeckSpec, ground_spec, intake
 from .validator import validate_deck
+
+log = logging.getLogger(__name__)
 
 
 def draft_deck(
@@ -117,6 +120,7 @@ def draft_deck(
             return None
 
     for attempt in range(max_repairs + 1):
+        log.info("draft: attempt %d/%d", attempt + 1, max_repairs + 1)
         errors: list[dict[str, Any]] = []
         spells: Counter[str] = Counter()
         role_counts = {role: 0 for role in TARGET_ROLES}
@@ -212,6 +216,11 @@ def draft_deck(
         validation["errors"] = errors
         validation["valid"] = not errors
         attempts.append({"attempt": attempt + 1, "errors": errors, "review": review})
+        log.info(
+            "draft: attempt %d %s",
+            attempt + 1,
+            f"has {len(errors)} problem(s)" if errors else "passed",
+        )
         last = {
             "version": 1,
             "valid": not errors,

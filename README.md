@@ -87,6 +87,9 @@ Model flags, available on each LLM command:
 - `--model qwen2.5:7b`, default `MTG_LLM_MODEL` or `qwen2.5:7b`.
 - `--llm-url http://localhost:11434`, or `MTG_LLM_BASE_URL`.
 - `--context-size 65536`, the default requested Ollama context.
+- `--provider ollama`, `openai-compatible`, or `claude`, or `MTG_LLM_PROVIDER`.
+- `--effort high`, Claude reasoning effort from `low` to `max` (claude provider only).
+- `--quiet`, placed before the command, hides the progress shown on stderr.
 - `--llm-timeout 300`, seconds per call.
 - `--pool-limit 350` on `discover`/`build`, hard maximum 400.
 - `--repairs 3` on `draft`/`build`, from 0 to 3.
@@ -188,6 +191,47 @@ It must support Chat Completions with JSON-schema `response_format`. You can als
 set `MTG_LLM_PROVIDER=openai-compatible`. An explicit model and key are required;
 the app never silently falls back to a paid provider. Keys are not stored in
 specs, pools, drafts, or cache files. Non-local model endpoints require HTTPS.
+
+### Claude provider
+
+`--provider claude` runs inference on Claude through the official Anthropic SDK
+instead of a local model:
+
+```powershell
+pip install -e ".[claude]"
+# Put CLAUDE_API=sk-ant-... in the git-ignored .env file, or set CLAUDE_API in the environment.
+python -m mtg_agentic build --provider claude --commander "Jodah, Archmage Eternal" --request "Myojin tribal" --output .cache/jodah-claude.json
+```
+
+The model defaults to `claude-haiku-5-5`; pass `--model` for another Claude model,
+such as `claude-opus-5-5`. The `CLAUDE_API` environment variable wins over `.env`,
+which is read from the current directory. `--effort` (default `high`) trades depth
+for cost and latency. Responses use Claude's JSON-schema structured outputs and are
+still validated locally; structured outputs cannot enforce length or range limits,
+so a response that breaks one gets a single corrective retry. Opus, Sonnet 5.5 and
+Fable requests opt into server-side fallback, so a safety-classifier decline is
+retried on Anthropic's recommended model; Haiku 5.5 has no fallback, so a decline is
+reported as an error. Claude has no `temperature 0`, so runs are not deterministic.
+Rules embeddings stay local: review commands still use Ollama unless you pass
+`--embedding-backend hash` or `--skip-review`.
+
+LLM commands report progress on stderr while stdout stays JSON: each pipeline stage,
+a live line per Claude call showing its reasoning summary or output size, each
+call's token use and cache reads, and run totals at the end. Put `--quiet` before
+the command to hide it.
+
+Requests use 5-minute prompt caching. A repair or retry resends the candidate pool
+unchanged, so the pool is read from cache when the next attempt starts within five
+minutes of the previous one. Haiku 5.5 bills prompts over 100K tokens at a higher
+rate, so a Haiku prompt that reaches 95K tokens is compacted before it is sent, with
+no model pass (`mtg_agentic/compaction.py`). Older turns shrink first, largest first,
+by dropping their middle: the first two thirds and the last third are kept, never
+below 1,000 characters. The newest turn shrinks only if that is not enough. Cuts are
+reused on later requests, so the cached prefix stays the same. Size is checked with
+the free token-count endpoint, and only for prompts long enough to possibly cross.
+The default draft prompt is about 52K tokens (about 59K at `--pool-limit 400`), so
+compaction does not fire at the current limits; the progress output reports any
+compaction and flags any call over 100K.
 
 ### Python API
 
