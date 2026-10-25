@@ -1,0 +1,12 @@
+{
+  "commander": "Jodah, Archmage Eternal",
+  "color_identity": "WUBRG",
+  "bracket": 3,
+  "themes": ["myojin tribal", "divinity counters"],
+  "mechanics": ["proliferate", "counters"],
+  "win_conditions": ["myojin combat damage", "alternate wincons"],
+  "playstyle": "midrange value",
+  "must_include": [],
+  "exclude": [],
+  "role_targets": {"ramp": 10, "draw": 10, "removal": 8, "wipes": 3, "lands": 36}
+}

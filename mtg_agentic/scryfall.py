@@ -11,13 +11,14 @@ import time
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-from .cards import Card, trim_card
+from .cards import Card, trim_card, validation_card
 from .oracle import DEFAULT_DATA_DIR, OracleStore
 
 API_URL = "https://api.scryfall.com"
@@ -186,26 +187,46 @@ class ScryfallClient:
                 raise ScryfallError("Scryfall omitted the next page URL")
             self._api_url(url)
 
-    def search_cards(self, query: str) -> list[Card]:
+    def search_cards(
+        self, query: str, *, max_results: int | None = None, order: str | None = None
+    ) -> list[Card]:
         """Return all search pages, with no images, prices, print data, or other noise."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("Search query must be nonempty")
-        url = f"{API_URL}/cards/search?{urlencode({'q': query, 'unique': 'cards'})}"
+        if max_results is not None and (type(max_results) is not int or max_results < 1):
+            raise ValueError("max_results must be a positive integer")
+        if order is not None and order not in {"name", "edhrec"}:
+            raise ValueError("Unsupported search ordering")
+        params = {"q": query, "unique": "cards"}
+        if order is not None:
+            params["order"] = order
+        url = f"{API_URL}/cards/search?{urlencode(params)}"
         try:
             first = self._json(url)
         except CardNotFound:
             return []
-        return [trim_card(card) for card in self._pages(url, first)]
+        pages = self._pages(url, first)
+        selected = pages if max_results is None else islice(pages, max_results)
+        return [trim_card(card) for card in selected]
 
-    def get_card(self, name: str) -> Card:
-        """Try exact first; fuzzy fallback is for discovery, never deck validation."""
+    def _named_card(self, name: str, *, fuzzy: bool) -> Card:
         if not isinstance(name, str) or not name.strip():
             raise ValueError("Card name must be nonempty")
         try:
             card = self._json(f"{API_URL}/cards/named?{urlencode({'exact': name})}")
         except CardNotFound:
+            if not fuzzy:
+                raise
             card = self._json(f"{API_URL}/cards/named?{urlencode({'fuzzy': name})}")
-        return trim_card(card)
+        return card
+
+    def get_card(self, name: str, *, fuzzy: bool = True) -> Card:
+        """Exact first; disable fuzzy fallback when verifying generated names."""
+        return trim_card(self._named_card(name, fuzzy=fuzzy))
+
+    def get_card_record(self, name: str) -> Card:
+        """Exact-only rule fields for indexing newly verified cards, never LLM context."""
+        return validation_card(self._named_card(name, fuzzy=False))
 
     def get_rulings(self, card_id: str) -> list[dict[str, Any]]:
         if not isinstance(card_id, str) or not card_id.strip():

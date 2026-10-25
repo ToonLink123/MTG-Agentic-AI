@@ -1,0 +1,132 @@
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock
+
+from mtg_agentic.oracle import OracleStore
+from mtg_agentic.pipeline import draft_deck
+from mtg_agentic.review import DeckReviewer
+from mtg_agentic.schema import SchemaError
+from tests.fixtures import card
+from tests.pipeline_fixtures import JODAH, FakeCards, FakeModel, draft, make_pool, records
+
+
+class ReviewTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = OracleStore(Path(temp.name) / "oracle.sqlite3")
+        self.addCleanup(self.store.close)
+        self.store.import_cards(records())
+        self.client = FakeCards(records())
+
+    def test_bracket_and_rules_errors_drive_bounded_repair_without_resending_all_evidence(self):
+        reviewer = Mock()
+        reviewer.game_changer_names = []
+        failed = {
+            "status": "needs_revision",
+            "errors": [{"error": "bracket_review", "detail": "mass land denial"}],
+            "bracket": {"reasons": ["Remove land denial"]},
+            "interactions": [
+                {
+                    "status": "unsupported",
+                    "cards": ["Spell 0"],
+                    "question": "Does it work?",
+                    "claims": [],
+                    "evidence": ["A very large retrieval payload"],
+                }
+            ],
+        }
+        reviewer.check.side_effect = [failed, {"status": "passed", "errors": []}]
+        model = FakeModel(draft(), draft())
+        result = draft_deck(
+            make_pool(self.store), model, self.client, self.store, reviewer=reviewer
+        )
+        self.assertTrue(result["valid"])
+        self.assertTrue(result["review_passed"])
+        self.assertEqual(len(result["attempts"]), 2)
+        feedback = json.loads(model.calls[1][0][-1]["content"])
+        self.assertEqual(feedback["review"]["bracket_reasons"], ["Remove land denial"])
+        self.assertEqual(feedback["review"]["interactions"][0]["status"], "unsupported")
+        self.assertNotIn("large retrieval", json.dumps(feedback))
+
+    def test_illegal_drafts_do_not_spend_review_calls(self):
+        reviewer = Mock()
+        reviewer.game_changer_names = []
+        result = draft_deck(
+            make_pool(self.store),
+            FakeModel(draft(62)),
+            self.client,
+            self.store,
+            reviewer=reviewer,
+            max_repairs=0,
+        )
+        self.assertFalse(result["valid"])
+        reviewer.check.assert_not_called()
+
+    def test_invalid_safety_json_enters_repair_and_exhaustion_is_invalid(self):
+        reviewer = Mock()
+        reviewer.game_changer_names = []
+        reviewer.check.side_effect = SchemaError([{"error": "schema", "detail": "Wrong type"}])
+        result = draft_deck(
+            make_pool(self.store),
+            FakeModel(draft()),
+            self.client,
+            self.store,
+            reviewer=reviewer,
+            max_repairs=0,
+        )
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["validation"]["errors"][0]["error"], "review_schema")
+
+    def test_library_call_without_reviewer_is_explicitly_unreviewed(self):
+        result = draft_deck(make_pool(self.store), FakeModel(draft()), self.client, self.store)
+        self.assertTrue(result["valid"])
+        self.assertFalse(result["review_passed"])
+        self.assertEqual(result["review"]["status"], "not_run")
+
+    def service(self):
+        bracket = Mock()
+        bracket.game_changer_list = {"names": []}
+        bracket.check.return_value = {"verdict": "fits", "reasons": [], "spellbook": {"combos": []}}
+        rules = Mock()
+        rules.ingest_deck.return_value = {"count": 3}
+        rules.check_interaction.return_value = {"status": "supported", "claims": []}
+        return DeckReviewer(bracket, rules, Mock(), self.store, self.client)
+
+    def test_jodah_myojin_proliferate_engine_and_all_deck_rulings_are_checked(self):
+        self.store.add_verified_card(card("Myojin Test", text="Enters with a divinity counter."))
+        self.store.add_verified_card(card("Proliferator", text="Proliferate."))
+        service = self.service()
+        result = service.check({"Myojin Test": 1, "Proliferator": 1}, JODAH["name"], 3)
+        self.assertEqual(result["status"], "passed")
+        service.rules.ingest_deck.assert_called_once_with(
+            [JODAH["name"], "Myojin Test", "Proliferator"], self.store, self.client
+        )
+        names, question, _ = service.rules.check_interaction.call_args.args
+        self.assertEqual(names, [JODAH["name"], "Myojin Test", "Proliferator"])
+        self.assertIn("casting from hand", question)
+        self.assertIn("none is already present", question)
+
+    def test_flagged_combos_are_checked_and_unsupported_claims_require_revision(self):
+        service = self.service()
+        service.brackets.check.return_value["spellbook"]["combos"] = [
+            {
+                "cards": ["Spell 0", "Spell 1"],
+                "prerequisites": ["both untapped"],
+                "uses": [],
+                "steps": "Loop",
+                "results": ["Infinite mana"],
+            }
+        ]
+        service.rules.check_interaction.return_value = {
+            "status": "unsupported",
+            "cards": ["Spell 0", "Spell 1"],
+            "question": "Loop?",
+            "claims": [],
+        }
+        result = service.check({"Spell 0": 1, "Spell 1": 1}, JODAH["name"], 3)
+        self.assertEqual(result["status"], "needs_revision")
+        self.assertEqual(result["errors"][0]["error"], "interaction_review")
+        self.assertIn("both untapped", service.rules.check_interaction.call_args.args[1])

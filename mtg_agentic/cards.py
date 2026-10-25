@@ -34,9 +34,16 @@ def validation_card(card: Card) -> Card:
     result.update(
         oracle_id=card.get("oracle_id", card["id"]),
         layout=card.get("layout", "normal"),
+        cmc=card.get("cmc"),
+        produced_mana=card.get("produced_mana"),
+        power=card.get("power"),
+        toughness=card.get("toughness"),
         legalities={"commander": card.get("legalities", {}).get("commander", "not_legal")},
         card_faces=[
-            {key: face.get(key, "") for key in ("name", "type_line", "oracle_text")}
+            {
+                key: face.get(key, "")
+                for key in ("name", "type_line", "oracle_text", "mana_cost", "power", "toughness")
+            }
             for face in card.get("card_faces", [])
         ],
     )

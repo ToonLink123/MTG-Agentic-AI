@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "name": "forge-2.0.15-c14-c15",
+  "forge_release": "2.0.15",
+  "opponents": [
+    {
+      "path": "res/quest/precons/Built from Scratch.dck",
+      "sha256": "4919ac567601143d3783893e54c5b117502de567616a5bf4d2168ed9f423be4f"
+    },
+    {
+      "path": "res/quest/precons/Plunder the Graves.dck",
+      "sha256": "4640b78c09464d8133cafdfd49cbfdbdcca40f7547c039f6195bfd53bb65d20a"
+    },
+    {
+      "path": "res/quest/precons/Swell the Host.dck",
+      "sha256": "24d63312906c6437426b73aa6c73ab499fd198c35df85e4cf4e902f8b48100f2"
+    }
+  ]
+}

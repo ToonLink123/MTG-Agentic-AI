@@ -7,6 +7,7 @@ import json
 import sqlite3
 from collections.abc import Iterable, Iterator
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -138,6 +139,64 @@ class OracleStore:
         ).fetchone()
         return json.loads(row[0]) if row else None
 
+    def _index_card(self, raw: Card) -> bool:
+        if not isinstance(raw, dict) or raw.get("object", "card") != "card":
+            raise ValueError("Oracle records must be card objects")
+        if raw.get("layout") in {"token", "double_faced_token", "emblem", "art_series"}:
+            return False
+        if (
+            not isinstance(raw.get("id"), str)
+            or not isinstance(raw.get("name"), str)
+            or not raw["name"].strip()
+            or not isinstance(raw.get("color_identity"), list)
+            or any(
+                not isinstance(color, str) or color not in {"W", "U", "B", "R", "G"}
+                for color in raw["color_identity"]
+            )
+        ):
+            raise ValueError("Oracle record is missing a valid ID, name, or color identity")
+        card = validation_card(raw)
+        key = card["oracle_id"] or card["id"]
+        self._db.execute("INSERT OR REPLACE INTO cards VALUES (?, ?)", (key, json.dumps(card)))
+        canonical_name = name_key(card["name"])
+        aliases = {canonical_name}
+        faces = card["card_faces"]
+        if faces:
+            aliases.add(name_key(faces[0]["name"]))
+            if card["layout"] in {"split", "adventure", "flip"}:
+                aliases.update(name_key(face["name"]) for face in faces)
+        for alias in aliases:
+            existing = self.get_card(alias)
+            if (
+                existing is None
+                or (
+                    card["legalities"]["commander"] == "legal"
+                    and existing["legalities"]["commander"] != "legal"
+                )
+                or (alias == canonical_name and name_key(existing["name"]) != canonical_name)
+            ):
+                self._db.execute("INSERT OR REPLACE INTO names VALUES (?, ?)", (alias, key))
+        return True
+
+    def add_verified_card(self, card: Card) -> None:
+        """Persist an exact API-verified record without replacing the bulk snapshot."""
+        if not self.ready:
+            raise ValueError("Import an Oracle snapshot before adding verified cards")
+        with self._db:
+            if not self._index_card(card):
+                raise ValueError("Cannot index a token as a verified card")
+            metadata = self.metadata
+            verified = metadata.get("verified_cards", {})
+            verified[card["name"]] = datetime.now(timezone.utc).isoformat()
+            self._db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES ('verified_cards', ?)",
+                (json.dumps(verified),),
+            )
+            count = self._db.execute("SELECT COUNT(*) FROM cards").fetchone()[0]
+            self._db.execute(
+                "INSERT OR REPLACE INTO metadata VALUES ('card_count', ?)", (json.dumps(count),)
+            )
+
     def import_cards(self, cards: Iterable[Card], *, metadata: dict[str, Any] | None = None) -> int:
         """Replace a snapshot transactionally; failed imports preserve the old data."""
         count = 0
@@ -146,47 +205,7 @@ class OracleStore:
             self._db.execute("DELETE FROM cards")
             self._db.execute("DELETE FROM metadata")
             for raw in cards:
-                if not isinstance(raw, dict) or raw.get("object", "card") != "card":
-                    raise ValueError("Oracle records must be card objects")
-                # Tokens/emblems can share real card names. Never let them shadow playable cards.
-                if raw.get("layout") in {"token", "double_faced_token", "emblem", "art_series"}:
-                    continue
-                if (
-                    not isinstance(raw.get("id"), str)
-                    or not isinstance(raw.get("name"), str)
-                    or not raw["name"].strip()
-                    or not isinstance(raw.get("color_identity"), list)
-                    or any(
-                        color not in {"W", "U", "B", "R", "G"} for color in raw["color_identity"]
-                    )
-                ):
-                    raise ValueError("Oracle record is missing a valid ID, name, or color identity")
-                card = validation_card(raw)
-                key = card["oracle_id"] or card["id"]
-                self._db.execute(
-                    "INSERT OR REPLACE INTO cards VALUES (?, ?)", (key, json.dumps(card))
-                )
-                canonical_name = name_key(card["name"])
-                aliases = {canonical_name}
-                faces = card["card_faces"]
-                if faces:
-                    aliases.add(name_key(faces[0]["name"]))
-                    if card["layout"] in {"split", "adventure", "flip"}:
-                        aliases.update(name_key(face["name"]) for face in faces)
-                for alias in aliases:
-                    existing = self.get_card(alias)
-                    if (
-                        existing is None
-                        or (
-                            card["legalities"]["commander"] == "legal"
-                            and existing["legalities"]["commander"] != "legal"
-                        )
-                        or (
-                            alias == canonical_name and name_key(existing["name"]) != canonical_name
-                        )
-                    ):
-                        self._db.execute("INSERT OR REPLACE INTO names VALUES (?, ?)", (alias, key))
-                count += 1
+                count += int(self._index_card(raw))
             if count == 0:
                 raise ValueError("Oracle snapshot contains no cards")
             info = dict(metadata or {})

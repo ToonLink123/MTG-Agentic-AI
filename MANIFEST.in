@@ -1,2 +1,3 @@
 recursive-include tests *.py
+recursive-include tests/fixtures_forge *.log *.md
 recursive-include examples *.json

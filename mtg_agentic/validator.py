@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -93,7 +93,7 @@ _NUMBER_WORDS = {
 }
 
 
-def _copy_limit(card: Card) -> int | None:
+def copy_limit(card: Card) -> int | None:
     if "Basic" in card["type_line"].split("—")[0].split():
         return None
     # Read exceptions from Oracle text, not a hardcoded list of card names.
@@ -116,11 +116,20 @@ def _copy_limit(card: Card) -> int | None:
     return 1
 
 
-def _can_be_commander(card: Card) -> bool:
+def can_be_commander(card: Card) -> bool:
     faces = card["card_faces"]
     front = faces[0] if faces else card
     types = front["type_line"].split("—")[0].split()
-    if "Legendary" in types and "Creature" in types:
+    subtypes = front["type_line"].split("—", 1)[-1].split()
+    if "Legendary" in types and (
+        "Creature" in types
+        or "Vehicle" in subtypes
+        or (
+            "Spacecraft" in subtypes
+            and front.get("power") not in {None, ""}
+            and front.get("toughness") not in {None, ""}
+        )
+    ):
         return True
     # Grist is a creature in the command zone by its characteristic-defining ability.
     if card["name"] == "Grist, the Hunger Tide":
@@ -138,12 +147,32 @@ def _colors(colors: set[str]) -> str:
     return "".join(color for color in "WUBRG" if color in colors) or "colorless"
 
 
+def card_errors(card: Card, commander_colors: set[str] | None) -> list[dict[str, Any]]:
+    """Shared legality/color checks for validation, discovery, and verified additions."""
+    errors: list[dict[str, Any]] = []
+    legality = card.get("legalities", {}).get("commander", "not_legal")
+    if legality != "legal":
+        errors.append({"error": "commander_legality", "card": card["name"], "detail": legality})
+    if commander_colors is not None:
+        outside = set(card["color_identity"]) - commander_colors
+        if outside:
+            errors.append(
+                {
+                    "error": "color_identity",
+                    "card": card["name"],
+                    "detail": f"{_colors(outside)} outside {_colors(commander_colors)}",
+                }
+            )
+    return errors
+
+
 def validate_deck(
     decklist: Decklist,
     commander: str,
     store: OracleStore,
     *,
     bracket: int = 3,
+    game_changers: Collection[str] | None = None,
 ) -> dict[str, Any]:
     """Validate 99 maindeck cards plus one separately supplied commander.
 
@@ -207,7 +236,7 @@ def validate_deck(
     if leader:
         report["commander"] = leader["name"]
         report["color_identity"] = [color for color in "WUBRG" if color in leader["color_identity"]]
-        if not _can_be_commander(leader):
+        if not can_be_commander(leader):
             errors.append(
                 {
                     "error": "commander_type",
@@ -227,11 +256,12 @@ def validate_deck(
         resolve(entry.name, entry.quantity)
 
     commander_colors = set(leader["color_identity"]) if leader else None
-    game_changers: list[str] = []
+    live_game_changers = {name_key(n) for n in game_changers} if game_changers is not None else None
+    found_game_changers: list[str] = []
     game_changer_count = 0
     for key, card in cards.items():
         quantity = quantities[key]
-        limit = _copy_limit(card)
+        limit = copy_limit(card)
         if limit is not None and quantity > limit:
             errors.append(
                 {
@@ -240,22 +270,15 @@ def validate_deck(
                     "detail": f"{quantity} copies; maximum {limit}",
                 }
             )
-        legality = card["legalities"]["commander"]
-        if legality != "legal":
-            errors.append({"error": "commander_legality", "card": card["name"], "detail": legality})
-        outside = set(card["color_identity"]) - (commander_colors or set())
-        if commander_colors is not None and outside:
-            errors.append(
-                {
-                    "error": "color_identity",
-                    "card": card["name"],
-                    "detail": f"{_colors(outside)} outside {_colors(commander_colors)}",
-                }
-            )
-        if card["game_changer"]:
-            game_changers.append(card["name"])
+        errors.extend(card_errors(card, commander_colors))
+        if (
+            name_key(card["name"]) in live_game_changers
+            if live_game_changers is not None
+            else card["game_changer"]
+        ):
+            found_game_changers.append(card["name"])
             game_changer_count += quantity
-    report["game_changers"] = game_changers
+    report["game_changers"] = found_game_changers
     report["game_changer_count"] = game_changer_count
     if bracket_valid:
         limit = {1: 0, 2: 0, 3: 3, 4: None, 5: None}[bracket]

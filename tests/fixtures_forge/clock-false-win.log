@@ -1,0 +1,12 @@
+Stopping slow match as draw
+java.lang.InterruptedException
+	at java.base/java.util.concurrent.FutureTask.awaitDone(FutureTask.java:482)
+Game Outcome: Match Duration 0m : 44s
+Game Outcome: Turn 28
+Game Outcome: Ai(1)-Agentic Jodah Smoke has won because all opponents have lost
+Game Outcome: Ai(2)-Built from Scratch has won because all opponents have lost
+Game Outcome: Ai(3)-Plunder the Graves has lost because life total reached 0
+Game Outcome: Ai(4)-Swell the Host has lost because life total reached 0
+Match Result: Ai(1)-Agentic Jodah Smoke: 1 Ai(2)-Built from Scratch: 1 Ai(3)-Plunder the Graves: 0 Ai(4)-Swell the Host: 0
+
+Game Result: Game 2 ended in 45010 ms. Ai(1)-Agentic Jodah Smoke has won!
