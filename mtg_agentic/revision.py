@@ -15,6 +15,8 @@ from .forge_metrics import summarize, wilson
 from .forge_runner import ForgeSimulator
 from .llm import JSONModel, request_json
 from .oracle import OracleStore
+from .playability import validate_playability
+from .roles import protection_features
 from .provenance import repository_state
 from .review import DeckReviewer
 from .schema import NAME_SCHEMA, object_schema
@@ -91,19 +93,21 @@ def _gate(deck, pool, store, reviewer, *, baseline=None):
         and not any(deck["cards"].get(n, 0) > 0 for n in pool.spec.exclude)
     )
     counts = _theme_counts(deck, pool)
+    playability = validate_playability(deck["cards"], pool.spec, store)
     theme_ok = baseline is None or all(
         counts[role] >= count for role, count in _theme_counts(baseline, pool).items()
     )
     # Never accept a saved review flag as authorization. Re-check the actual cards.
     review = (
         reviewer.check(deck["cards"], deck["commander"], pool.spec.bracket)
-        if validation["valid"] and policy_ok and theme_ok
+        if validation["valid"] and playability["valid"] and policy_ok and theme_ok
         else None
     )
     passed = (
         policy_ok
         and theme_ok
         and validation["valid"]
+        and playability["valid"]
         and review is not None
         and review.get("status") == "passed"
         and review.get("bracket", {}).get("verdict") == "fits"
@@ -112,6 +116,7 @@ def _gate(deck, pool, store, reviewer, *, baseline=None):
         "passed": passed,
         "policy_pass": policy_ok,
         "validation": validation,
+        "playability": playability,
         "review": review,
         "theme_package_preserved": theme_ok,
         "theme_role_counts": counts,

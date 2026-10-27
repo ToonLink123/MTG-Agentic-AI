@@ -25,6 +25,7 @@ from .forge_runner import ForgeSimulator
 from .llm import LLMError, OllamaClient, OpenAICompatibleClient
 from .oracle import DEFAULT_DATA_DIR, OracleStore
 from .pipeline import build_deck, discover, draft_deck
+from .playability import spec_for_deck, validate_playability
 from .review import DeckReviewer
 from .revision import revise_deck
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore
@@ -204,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("deck", type=Path, help="JSON deck or plain-text maindeck")
     validate.add_argument("--commander", help="Required for text decks")
     validate.add_argument("--bracket", type=int, choices=range(1, 6))
+    validate.add_argument("--playability", action="store_true", help="Also check mana and roles (automatic for JSON artifacts containing a spec)")
     commands.add_parser("spec-schema", help="Print the fixed intake JSON schema")
     intake_cmd = commands.add_parser("intake", help="Ground preferences in fetched commander text")
     intake_cmd.add_argument("--commander", required=True)
@@ -372,15 +374,18 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "review-deck":
                     deck = _deck_json(args.deck)
                     bracket = args.bracket if args.bracket is not None else deck.get("bracket", 3)
-                    result = reviewer.check(deck["cards"], deck["commander"], bracket)
-                    result["validation"] = validate_deck(
+                    validation = validate_deck(
                         deck["cards"],
                         deck["commander"],
                         store,
                         bracket=bracket,
                         game_changers=reviewer.game_changer_names,
                     )
-                    result["valid"] = result["status"] == "passed" and result["validation"]["valid"]
+                    playability = validate_playability(deck["cards"], spec_for_deck(deck, store, bracket=bracket), store)
+                    result = reviewer.check(deck["cards"], deck["commander"], bracket) if validation["valid"] and playability["valid"] else {"status": "needs_revision", "errors": validation["errors"] + playability["errors"]}
+                    result["validation"] = validation
+                    result["playability"] = playability
+                    result["valid"] = result["status"] == "passed" and validation["valid"] and playability["valid"]
                 else:
                     simulation_runner = None
                     sim_config = None
@@ -479,6 +484,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1 if result.get("valid") is False else 0
         if args.command == "validate":
             contents = args.deck.read_text(encoding="utf-8-sig")
+            deck = None
             if args.deck.suffix.lower() == ".json":
                 deck = json.loads(contents)
                 if not isinstance(deck, dict):
@@ -494,6 +500,16 @@ def main(argv: list[str] | None = None) -> int:
                 decklist = contents
             with OracleStore(args.data_dir / "oracle.sqlite3") as store:
                 result = validate_deck(decklist, commander, store, bracket=bracket)
+                result["scope"] = "Commander legality only, not playability or safety approval"
+                if result["valid"] and (args.playability or (deck and "spec" in deck)):
+                    actual = {"commander": commander, "bracket": bracket, "cards": result["cards"]}
+                    if deck and "spec" in deck:
+                        actual["spec"] = deck["spec"]
+                    playability = validate_playability(actual["cards"], spec_for_deck(actual, store, bracket=bracket), store)
+                    result["playability"] = playability
+                    result["errors"].extend(playability["errors"])
+                    result["valid"] = not result["errors"]
+                    result["scope"] = "Commander legality and playability; safety review is separate"
             _emit(result)
             return 0 if result["valid"] else 1
         with ScryfallClient(args.data_dir / "responses.sqlite3") as client:

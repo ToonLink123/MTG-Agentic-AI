@@ -170,8 +170,20 @@ lands are pinned; eligible multicolor lands address source deficits, and basic
 lands fill the remaining slots. Nonbasics remain singleton, exclusions apply,
 and optional Game Changer lands respect the remaining bracket allowance.
 
+Discovery reserves locally verified original duals, shock lands, and fetch lands,
+without relying on the model's queries. Allocation also checks these options for
+older saved pools. Untapped duals outrank otherwise equivalent tapped lands;
+shock lands are recognized as able to enter untapped. These choices do not use
+prices or ownership, so exclude expensive cards when needed.
+
+Land-search targets are checked against the actual deck's Oracle land types.
+Nature's Lore can find a Forest-typed dual or shock land, but not Command Tower;
+basic-land searches cannot find nonbasic duals. Allocation retains matching
+targets before filling the remaining slots. Fetches only count the colors their
+actual targets can supply, and a search without a matching target fails validation.
+
 The report contains weighted pips, source targets, potential sources, and
-warnings. It uses front-face costs and available pool lands. It is a simple
+warnings. It uses front-face costs, pool lands, and local premium-land options. It is a simple
 heuristic, **not an exact Frank Karsten probability model**, an optimized mana
 base, or a simulation. Fetch/conditional lands are only potential sources;
 untapped timing, all activation restrictions, snow requirements, and affordability

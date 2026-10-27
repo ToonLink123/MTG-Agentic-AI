@@ -75,6 +75,9 @@ def score_case(case: dict[str, Any], deck: dict[str, Any], store: OracleStore) -
     # Independent legality check; never trust the generated artifact's valid flag.
     gc = bracket.get("game_changer_list", {}).get("names")
     validation = validate_deck(cards, commander, store, bracket=case["bracket"], game_changers=gc)
+    from .playability import spec_for_deck, validate_playability
+
+    playability = validate_playability(cards, spec_for_deck(deck, store), store)
     themes = []
     poison_sources = []
     for n, q in cards.items():
@@ -115,8 +118,10 @@ def score_case(case: dict[str, Any], deck: dict[str, Any], store: OracleStore) -
         "poison_sources": sorted(set(poison_sources)),
         "review_pass": review.get("status") == "passed",
         "validation": validation,
+        "playability": playability,
         "passed": bool(
             validation["valid"]
+            and playability["valid"]
             and commander_correct
             and bracket_correct
             and theme_pass

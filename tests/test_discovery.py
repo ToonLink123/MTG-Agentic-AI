@@ -13,6 +13,7 @@ from mtg_agentic.discovery import (
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.schema import SchemaError
 from tests.fixtures import card
+from tests.land_fixtures import fixing_lands
 from tests.pipeline_fixtures import FakeCards, FakeModel, make_spec, records
 
 
@@ -103,6 +104,37 @@ class DiscoveryTests(unittest.TestCase):
         for limit in (0, 401, True):
             with self.assertRaises(ValueError):
                 build_candidate_pool(make_spec(), [], FakeCards([]), self.store, limit=limit)
+
+    def test_premium_lands_are_reserved_without_model_queries_or_live_results(self):
+        self.store.import_cards([*self.records, *fixing_lands()])
+        client = FakeCards([])
+        pool = build_candidate_pool(make_spec(), [], client, self.store)
+        names = {c.card["name"] for c in pool.cards}
+        self.assertTrue(
+            {"Tropical Island", "Breeding Pool", "Misty Rainforest", "Flooded Strand"} <= names
+        )
+        self.assertEqual(client.search_calls, [])
+        self.assertTrue(all("lands" in c.roles for c in pool.cards))
+        self.assertEqual(CandidatePool.from_dict(pool.to_dict(), self.store).to_dict(), pool.to_dict())
+
+    def test_premium_reservation_does_not_crowd_out_nonlands_in_small_pools(self):
+        self.store.import_cards([*self.records, *fixing_lands()])
+        pool = build_candidate_pool(
+            make_spec(), [CardQuery("theme", "a")], FakeCards(self.records),
+            self.store, limit=70,
+        )
+        self.assertEqual(len(pool.cards), 70)
+        self.assertEqual(sum(c.card["name"].startswith("Spell ") for c in pool.cards), 63)
+
+    def test_local_premium_discovery_filters_off_color_and_excluded_cards(self):
+        leader = card("Green Leader", colors="G", types="Legendary Creature — Elf")
+        self.store.import_cards([*self.records, *fixing_lands(), leader])
+        spec = make_spec(
+            commander=leader["name"], color_identity="G", exclude=["Misty Rainforest"]
+        )
+        pool = build_candidate_pool(spec, [], FakeCards([]), self.store)
+        names = {c.card["name"] for c in pool.cards}
+        self.assertFalse({"Tropical Island", "Breeding Pool", "Misty Rainforest"} & names)
 
     def test_lower_brackets_filter_game_changers(self):
         changer = card("Changer", changer=True)

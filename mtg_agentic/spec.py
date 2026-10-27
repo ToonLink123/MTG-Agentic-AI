@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -29,9 +31,19 @@ class DeckSpec:
     must_include: list[str]
     exclude: list[str]
     role_targets: dict[str, int]
+    commander_dependency: str = "medium"
 
     @classmethod
     def from_dict(cls, data: Any) -> DeckSpec:
+        # Migrate version-1 saved specs, not provider responses (which use SPEC_SCHEMA).
+        data = deepcopy(data)
+        if isinstance(data, dict):
+            values = [data.get("themes"), data.get("win_conditions")]
+            themes = " ".join(s for v in values if isinstance(v, list) for s in v if isinstance(s, str))
+            data.setdefault("commander_dependency", "high" if re.search(r"equipment|voltron|commander.damage", themes, re.I) else "medium")
+            if isinstance(data.get("role_targets"), dict):
+                data["role_targets"].setdefault("creatures", 15)
+                data["role_targets"].setdefault("protection", 6 if data["commander_dependency"] == "high" else 4)
         validate_json(data, SPEC_SCHEMA)
         result = cls(**json.loads(json.dumps(data)))
         errors: list[dict[str, Any]] = []
@@ -100,6 +112,7 @@ def ground_spec(spec: DeckSpec, store: OracleStore, commander: Card | None = Non
         raise SchemaError(errors)
     grounded = spec.to_dict()
     grounded.update(constraints)
+    grounded["role_targets"]["protection"] = max(6 if spec.commander_dependency == "high" else 4, grounded["role_targets"]["protection"])
     return DeckSpec.from_dict(grounded)
 
 
@@ -125,7 +138,12 @@ def intake(
                 "Infer themes/mechanics from the request and actual Oracle text, not invented abilities. "
                 "Do not invent must_include cards. Leave unspecified include/exclude lists empty. "
                 "Default bracket 3, playstyle midrange value, and role targets "
-                "ramp=10, draw=10, removal=8, wipes=3, lands=36 unless requested otherwise. "
+                "ramp=10, draw=10, removal=8, wipes=3, lands=36, creatures=15. "
+                "Set commander_dependency=high for equipment/Voltron, commander damage, or a plan "
+                "that depends on repeatedly keeping the commander in play; low if expendable, "
+                "otherwise medium. Protection target is at least 6 for high dependency, 4 otherwise. "
+                "Protection must include 3 (high) or 2 independent non-equipment instant-speed pieces "
+                "and at least two mechanisms (static, instant-speed, recursion). "
                 "Return JSON only. Schema: " + json.dumps(SPEC_SCHEMA)
             ),
         },

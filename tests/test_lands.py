@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mtg_agentic.discovery import Candidate
+from mtg_agentic.discovery import Candidate, eligible
 from mtg_agentic.lands import (
     allocate_sources,
     calculate_land_base,
@@ -11,8 +11,11 @@ from mtg_agentic.lands import (
     mana_demand,
 )
 from mtg_agentic.oracle import OracleStore
+from mtg_agentic.pipeline import draft_deck
+from mtg_agentic.schema import DRAFT_ROLES
 from tests.fixtures import card
-from tests.pipeline_fixtures import make_pool, make_spec, records
+from tests.land_fixtures import fixing_lands, land_tutors
+from tests.pipeline_fixtures import FakeCards, FakeModel, make_pool, make_spec, records
 
 
 class LandTests(unittest.TestCase):
@@ -41,15 +44,15 @@ class LandTests(unittest.TestCase):
                 self.assertTrue(all(value >= 1 for value in allocation.values()))
         self.assertGreater(allocate_sources({"W": 5, "U": 1}, 36)["W"], 18)
 
-    def test_sources_use_produced_mana_and_legacy_text_without_activation_costs(self):
+    def test_sources_without_a_deck_do_not_assume_filters_or_fetch_targets(self):
         self.assertEqual(land_sources(card("Dual", types="Land — Plains Island"), "WU"), {"W", "U"})
         self.assertEqual(
             land_sources(card("Tower", types="Land", produced_mana=list("WUBRG")), "WU"), {"W", "U"}
         )
         filter_land = card("Filter", types="Land", text="{R}, {T}: Add {W}{U}.")
-        self.assertEqual(land_sources(filter_land, "WUR"), {"W", "U"})
+        self.assertEqual(land_sources(filter_land, "WUR"), set())
         fetch = card("Fetch", types="Land", text="Search your library for a Forest or Island card.")
-        self.assertEqual(land_sources(fetch, "WUBRG"), {"G", "U"})
+        self.assertEqual(land_sources(fetch, "WUBRG"), set())
 
     def test_front_face_defines_land_slot_not_a_land_back_face(self):
         modal = card(
@@ -69,7 +72,8 @@ class LandTests(unittest.TestCase):
         first = calculate_land_base(spells, spec, pool, self.store)
         self.assertEqual(first, calculate_land_base(spells, spec, pool, self.store))
         self.assertEqual(first["land_count"], 36)
-        self.assertEqual(first["errors"], [])
+        # Thirty-six basics cannot supply ten sources of each of five colors.
+        self.assertEqual({error["error"] for error in first["errors"]}, {"mana_sources"})
         self.assertEqual(sum(first["cards"].values()), 36)
         self.assertTrue(all(first["source_counts"].get(c, 0) > 0 for c in "WUBRG"))
         self.assertNotIn("Wastes", first["cards"])
@@ -119,3 +123,106 @@ class LandTests(unittest.TestCase):
         for total in (-1, True):
             with self.assertRaises(ValueError):
                 allocate_sources({"W": 1}, total)
+
+    def test_saved_pool_is_supplemented_with_real_duals_shocks_and_fetches(self):
+        self.store.import_cards([*self.records, *fixing_lands()])
+        spec = make_spec()
+        result = calculate_land_base({}, spec, make_pool(self.store, spec), self.store)
+        self.assertTrue(
+            {"Tropical Island", "Breeding Pool", "Misty Rainforest", "Flooded Strand"}
+            <= result["cards"].keys()
+        )
+        self.assertEqual(result["land_count"], 36)
+        for name in ("Tropical Island", "Breeding Pool", "Misty Rainforest"):
+            self.assertEqual(result["cards"][name], 1)
+        self.assertNotIn("Simic Guildgate", result["cards"])
+
+    def test_land_tutor_targets_are_pinned_even_when_basic_forest_is_excluded(self):
+        self.store.import_cards([*self.records, *fixing_lands(), *land_tutors()])
+        spec = make_spec(exclude=["Forest"])
+        result = calculate_land_base(
+            {"Nature's Lore": 1}, spec, make_pool(self.store, spec), self.store
+        )
+        targets = result["mana_validation"]["search_targets"]["Nature's Lore"]
+        self.assertTrue(targets)
+        self.assertTrue(set(targets) <= {"Tropical Island", "Breeding Pool"})
+        self.assertNotIn("Forest", result["cards"])
+        self.assertEqual(result["land_count"], 36)
+
+    def test_missing_tutor_targets_remain_an_explicit_error(self):
+        self.store.import_cards([*self.records, *land_tutors()])
+        spec = make_spec(exclude=["Forest"])
+        result = calculate_land_base(
+            {"Nature's Lore": 1}, spec, make_pool(self.store, spec), self.store
+        )
+        self.assertIn(
+            "land_search_without_targets", {error["error"] for error in result["errors"]}
+        )
+
+    def test_optional_premium_lands_still_respect_exclusions_and_brackets(self):
+        lands = [
+            dict(c, game_changer=True) if c["name"] == "Breeding Pool" else c
+            for c in fixing_lands()
+        ]
+        self.store.import_cards([*self.records, *lands])
+        spec = make_spec(bracket=2, exclude=["Tropical Island", "Misty Rainforest"])
+        result = calculate_land_base({}, spec, make_pool(self.store, spec), self.store)
+        self.assertFalse(
+            {"Tropical Island", "Breeding Pool", "Misty Rainforest"} & result["cards"].keys()
+        )
+
+    def test_shock_land_is_preferred_over_an_always_tapped_dual(self):
+        leader = card("Simic Leader", colors="UG", types="Legendary Creature — Elf")
+        self.store.import_cards([*self.records, *fixing_lands(), leader])
+        spec = make_spec(
+            commander=leader["name"], color_identity="UG",
+            exclude=["Tropical Island", "Misty Rainforest", "Flooded Strand", "Command Tower"],
+            role_targets={"ramp": 10, "draw": 10, "removal": 8, "wipes": 3, "lands": 3},
+        )
+        pool = make_pool(self.store, spec)
+        pool.cards.append(Candidate(self.store.get_card("Simic Guildgate"), {"lands"}))
+        result = calculate_land_base({}, spec, pool, self.store)
+        self.assertEqual(result["land_count"], 3)
+        self.assertIn("Breeding Pool", result["cards"])
+        self.assertNotIn("Simic Guildgate", result["cards"])
+
+    def test_draft_repairs_land_dependencies_without_an_llm_land_selection(self):
+        leader = card("Simic Leader", colors="UG", types="Legendary Creature — Elf")
+        spells = []
+        for n in range(70):
+            types, text = "Artifact", ""
+            if n < 15:
+                types = "Creature — Elf"
+                text = ("Draw a card. Create a Treasure token. Destroy target artifact. "
+                        "Your commander has hexproof.")
+            elif n < 17:
+                types, text = "Instant", "Target creature gains indestructible until end of turn."
+            elif n < 20:
+                types, text = "Sorcery", "Destroy all creatures."
+            spells.append(card(
+                f"Spell {n}", colors="G", types=types, text=text, mana_cost="{1}{G}", cmc=2
+            ))
+        data = [*self.records[:7], leader, *spells, *fixing_lands(), *land_tutors()]
+        self.store.import_cards(data)
+        spec = make_spec(
+            commander=leader["name"], color_identity="UG",
+            must_include=["Nature's Lore"],
+        )
+        pool = make_pool(self.store, spec)
+        pool.cards = [c for c in pool.cards if eligible(c.card, spec)]
+        pool.cards.append(Candidate(self.store.get_card("Nature's Lore"), {"ramp"}))
+        # A saved pool deliberately has no premium lands, and the model picks none.
+        buckets = {role: [] for role in DRAFT_ROLES}
+        model = FakeModel({"commander": leader["name"], "buckets": buckets})
+        client = FakeCards(data)
+        result = draft_deck(pool, model, client, self.store, max_repairs=0)
+        self.assertTrue(result["valid"], result["validation"]["errors"])
+        self.assertEqual(sum(result["cards"].values()), 99)
+        self.assertEqual(result["land_base"]["land_count"], 36)
+        self.assertTrue(
+            result["land_base"]["mana_validation"]["search_targets"]["Nature's Lore"]
+        )
+        self.assertIn("Breeding Pool", result["cards"])
+        self.assertIn("Misty Rainforest", result["cards"])
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(client.get_calls, [])

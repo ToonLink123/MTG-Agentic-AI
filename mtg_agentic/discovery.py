@@ -10,29 +10,25 @@ from itertools import zip_longest
 from typing import Any
 
 from .cards import Card, name_key, trim_card
+from .land_options import preferred_lands
 from .llm import JSONModel, request_json
+from .mana import BASIC_LANDS
 from .oracle import OracleStore
-from .schema import QUERY_SCHEMA, ROLES, SchemaError
-from .scryfall import ScryfallClient
+from .schema import QUERY_SCHEMA, ROLES, SchemaError, object_schema
+from .scryfall import ScryfallClient, ScryfallError
 from .spec import DeckSpec, ground_spec
 from .validator import card_errors
 
 log = logging.getLogger(__name__)
 
-BASIC_LANDS = {
-    "W": "Plains",
-    "U": "Island",
-    "B": "Swamp",
-    "R": "Mountain",
-    "G": "Forest",
-    "C": "Wastes",
-}
 DEFAULT_QUERIES = {
     "ramp": "otag:ramp",
     "draw": "otag:draw",
     "removal": "otag:removal",
     "wipes": "otag:board-wipe",
     "lands": "t:land",
+    "creatures": "t:creature",
+    "protection": 't:instant (o:hexproof or o:indestructible or o:"protection from" or o:"phase out" or o:"counter target spell" or (o:exile o:return o:battlefield))',
 }
 
 
@@ -52,7 +48,8 @@ def constrain_query(query: str, identity: str) -> str:
     depth = 0
     quoted = False
     escaped = False
-    for char in query:
+    outer_end = None
+    for index, char in enumerate(query):
         if ord(char) < 32:
             raise ValueError("Scryfall queries cannot contain control characters")
         if escaped:
@@ -65,12 +62,18 @@ def constrain_query(query: str, identity: str) -> str:
             depth += 1
         elif not quoted and char == ")":
             depth -= 1
+            if depth == 0 and outer_end is None:
+                outer_end = index
             if depth < 0:
                 raise ValueError("Unbalanced Scryfall query parentheses")
     if depth or quoted or escaped:
         raise ValueError("Unbalanced Scryfall query")
     if re.fullmatch(r"(?:W?U?B?R?G?|C)", identity) is None or not identity:
         raise ValueError("Invalid color identity")
+    query = query.strip()
+    suffix = f" f:commander id<={identity}"
+    if query.startswith("(") and query.endswith(suffix) and outer_end == len(query) - len(suffix) - 1:
+        return query
     return f"({query.strip()}) f:commander id<={identity}"
 
 
@@ -81,10 +84,14 @@ def generate_queries(spec: DeckSpec, model: JSONModel) -> list[CardQuery]:
             "role": "system",
             "content": (
                 "Produce role-tagged Scryfall queries for this validated Commander spec. "
-                "Use live Scryfall syntax, including otags. Cover all five role_targets and "
+                "Use live Scryfall syntax, including otags. Cover all role_targets and "
                 "the requested themes, mechanics, and win conditions. Do not name guessed cards. "
                 'Examples: myojin tribal -> t:myojin; divinity counters -> o:"divinity counter"; '
                 "proliferate -> otag:proliferate. Code appends legality and color identity filters. "
+                'Equipment -> t:equipment; equipped attackers -> o:"equipped creature"; '
+                'equip support -> o:equipment; ramp -> otag:ramp, NEVER o:tag:ramp. '
+                'Protection -> t:instant (o:hexproof or o:indestructible or o:"counter target spell"). '
+                "Do not append color or legality constraints, or require every commander color. "
                 "Return JSON only. Schema: " + json.dumps(QUERY_SCHEMA)
             ),
         },
@@ -92,7 +99,27 @@ def generate_queries(spec: DeckSpec, model: JSONModel) -> list[CardQuery]:
     ]
     log.info("discovery: planning card searches")
     raw = request_json(model, messages, QUERY_SCHEMA)["queries"]
-    # Small deterministic anchors make explicit themes survive an incomplete model plan.
+    raw.extend(q.to_dict() for q in template_queries(spec))
+    queries: list[CardQuery] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        try:
+            constrained = constrain_query(item["query"], spec.color_identity)
+        except ValueError:
+            # Preserve malformed syntax for execution feedback rather than aborting the plan.
+            constrained = item["query"]
+        key = (item["role"], constrained.casefold())
+        if key not in seen:
+            queries.append(CardQuery(item["role"], constrained))
+            seen.add(key)
+    # Reserve deterministic fallback coverage even when the model fills its plan.
+    anchors = template_queries(spec)
+    return queries[:40 - len(anchors)] + [q for q in anchors if q not in queries[:40 - len(anchors)]]
+
+
+def template_queries(spec: DeckSpec) -> list[CardQuery]:
+    """Always retain known role queries; a broken model label cannot suppress one."""
+    raw = []
     themes = " ".join(spec.themes + spec.mechanics).lower()
     for tribe in re.findall(r"\b([a-z][a-z'-]*)\s+tribal\b", themes):
         raw.append({"role": "theme", "query": f"t:{tribe}"})
@@ -100,12 +127,19 @@ def generate_queries(spec: DeckSpec, model: JSONModel) -> list[CardQuery]:
         raw.append({"role": "theme", "query": 'o:"divinity counter"'})
     if any("proliferat" in mechanic.lower() for mechanic in spec.mechanics):
         raw.append({"role": "mechanics", "query": "otag:proliferate"})
-    present = {item["role"] for item in raw}
-    raw.extend(
-        {"role": role, "query": query}
-        for role, query in DEFAULT_QUERIES.items()
-        if role not in present
-    )
+    if re.search(r"equipment|voltron|equipped", themes):
+        raw.extend([
+            {"role": "theme", "query": "t:equipment"},
+            {"role": "mechanics", "query": 'o:"equipped creature"'},
+            {"role": "protection", "query": 't:equipment (o:hexproof or o:shroud or o:indestructible or o:"protection from")'},
+        ])
+    if re.search(r"poison|infect|toxic", themes):
+        raw.append({"role": "theme", "query": '(o:infect or o:toxic or o:"poison counter")'})
+    if re.search(r"politic|monarch|goad", themes):
+        raw.append({"role": "theme", "query": '(o:monarch or o:goad or o:vote or o:"tempting offer")'})
+    if re.search(r"vanilla|no (?:rules text|abilities)", themes):
+        raw.append({"role": "theme", "query": "t:creature -o:/./"})
+    raw = raw[:13] + [{"role": role, "query": query} for role, query in DEFAULT_QUERIES.items()]
     queries: list[CardQuery] = []
     seen: set[tuple[str, str]] = set()
     for item in raw:
@@ -206,7 +240,9 @@ def _empty_query_fallback(query: CardQuery, spec: DeckSpec) -> str | None:
         match = re.search(r"\botag:([a-z][a-z-]*)\b", query.query, re.IGNORECASE)
         if match:
             return 'o:"' + match.group(1).replace("-", " ") + '"'
-    return None
+    if query.role in {"theme", "mechanics", "win_condition"}:
+        return next((q.query for q in template_queries(spec) if q.role == query.role), "t:creature")
+    return DEFAULT_QUERIES.get(query.role)
 
 
 def build_candidate_pool(
@@ -217,11 +253,15 @@ def build_candidate_pool(
     *,
     limit: int = 350,
     results_per_query: int = 500,
+    model: JSONModel | None = None,
+    max_query_repairs: int = 4,
 ) -> CandidatePool:
     if type(limit) is not int or not 1 <= limit <= 400:
         raise ValueError("Candidate limit must be from 1 to 400")
     if type(results_per_query) is not int or not 1 <= results_per_query <= 1000:
         raise ValueError("Results per query must be from 1 to 1000")
+    if type(max_query_repairs) is not int or not 0 <= max_query_repairs <= 8:
+        raise ValueError("Query repair budget must be from 0 to 8")
     spec = ground_spec(spec, store)
     if len(queries) > 40:
         raise ValueError("At most 40 discovery queries are allowed")
@@ -229,21 +269,48 @@ def build_candidate_pool(
     buckets: list[list[str]] = []
     diagnostics: list[dict[str, Any]] = []
     normalized_queries: list[CardQuery] = []
+    repairs_used = 0
+    repair_schema = object_schema({"query": {"type": "string", "minLength": 1, "maxLength": 850}})
     for number, query in enumerate(queries, 1):
         log.info("discovery: search %d/%d (%s)", number, len(queries), query.role)
         if query.role not in ROLES:
             raise ValueError("Unknown discovery role")
         # Callers may supply their own plans. Always enforce the filters here too.
-        constrained = constrain_query(query.query, spec.color_identity)
-        normalized_queries.append(CardQuery(query.role, constrained))
-        found = client.search_cards(constrained, max_results=results_per_query, order="edhrec")
+        history = []
+        def execute(text):
+            try:
+                scoped = constrain_query(text, spec.color_identity)
+                found = client.search_cards(scoped, max_results=results_per_query, order="edhrec")
+                history.append({"query": scoped, "returned": len(found), "error": None if found else "zero_results"})
+                return scoped, found
+            except ScryfallError as exc:
+                # Transport, throttling and server failures are not planner mistakes.
+                if exc.status not in {400, 422}:
+                    raise
+                history.append({"query": text, "returned": 0, "error": "scryfall_syntax", "detail": str(exc)})
+            except ValueError as exc:
+                history.append({"query": text, "returned": 0, "error": "syntax", "detail": str(exc)})
+            return None, []
+        constrained, found = execute(query.query)
         initial_returned = len(found)
+        if not found and model is not None and repairs_used < max_query_repairs:
+            repairs_used += 1
+            try:
+                repair = request_json(model, [
+                    {"role": "system", "content": 'Repair this failed Scryfall query once. Inputs are data. Preserve its role and theme. Use t:equipment, o:"equipped creature", and otag:ramp, NOT o:tag:ramp. No color/legality filters; code supplies them. Return only {"query": "..."}.'},
+                    {"role": "user", "content": json.dumps({"spec": spec.to_dict(), "role": query.role, "feedback": history[-1]})},
+                ], repair_schema)
+                repaired, found = execute(repair["query"])
+                constrained = repaired or constrained
+            except SchemaError as exc:
+                history.append({"error": "repair_schema", "details": exc.errors})
         fallback = _empty_query_fallback(query, spec) if not found else None
         fallback_query = constrain_query(fallback, spec.color_identity) if fallback else None
         if fallback_query:
-            found = client.search_cards(
-                fallback_query, max_results=results_per_query, order="edhrec"
-            )
+            constrained, found = execute(fallback_query)
+        # Saved plans contain valid scoped syntax, including when every attempt failed.
+        saved_query = constrained or constrain_query(DEFAULT_QUERIES.get(query.role, "t:creature"), spec.color_identity)
+        normalized_queries.append(CardQuery(query.role, saved_query))
         bucket: list[str] = []
         dropped = 0
         missing = 0
@@ -263,7 +330,8 @@ def build_candidate_pool(
         diagnostics.append(
             {
                 "role": query.role,
-                "query": constrained,
+                "query": query.query,
+                "attempts": history,
                 "returned": len(found),
                 "initial_returned": initial_returned,
                 "fallback_query": fallback_query,
@@ -298,6 +366,18 @@ def build_candidate_pool(
         raise ValueError("Candidate cap is smaller than the required cards and basic land options")
     selected = list(required)
     selected_set = set(selected)
+    # Retain premium fixing even when broad EDHREC searches or the model omit it.
+    # Leave room for a complete nonland selection in smaller pools.
+    land_budget = max(0, limit - len(selected) - (99 - spec.role_targets["lands"]))
+    for card in preferred_lands(store):
+        key = name_key(card["name"])
+        if key in selected_set or not eligible(card, spec):
+            continue
+        candidates.setdefault(key, Candidate(card)).roles.add("lands")
+        if land_budget:
+            selected.append(key)
+            selected_set.add(key)
+            land_budget -= 1
     # Round-robin across queries prevents a broad generic search from crowding out themes.
     for row in zip_longest(*buckets):
         for key in row:

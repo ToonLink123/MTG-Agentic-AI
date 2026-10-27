@@ -14,10 +14,13 @@ ROLES = (
     "draw",
     "removal",
     "wipes",
+    "creatures",
+    "protection",
     "lands",
     "support",
 )
-TARGET_ROLES = ("ramp", "draw", "removal", "wipes", "lands")
+TARGET_ROLES = ("ramp", "draw", "removal", "wipes", "lands", "creatures", "protection")
+DRAFT_ROLES = ("ramp", "draw", "removal", "wipes", "creatures", "protection", "theme", "support")
 
 
 def object_schema(properties: dict[str, Any]) -> dict[str, Any]:
@@ -49,6 +52,7 @@ SPEC_SCHEMA = object_schema(
         "mechanics": STRING_LIST,
         "win_conditions": STRING_LIST,
         "playstyle": NAME_SCHEMA,
+        "commander_dependency": {"type": "string", "enum": ["low", "medium", "high"]},
         "must_include": STRING_LIST,
         "exclude": STRING_LIST,
         "role_targets": object_schema(
@@ -74,16 +78,10 @@ QUERY_SCHEMA = object_schema(
 DRAFT_SCHEMA = object_schema(
     {
         "commander": NAME_SCHEMA,
-        "cards": {
-            "type": "array",
-            "maxItems": 99,
-            "items": object_schema(
-                {
-                    "name": NAME_SCHEMA,
-                    "quantity": {"type": "integer", "minimum": 1, "maximum": 99},
-                }
-            ),
-        },
+        "buckets": object_schema({
+            role: {"type": "array", "items": NAME_SCHEMA, "maxItems": 63, "uniqueItems": True}
+            for role in DRAFT_ROLES
+        }),
     }
 )
 
