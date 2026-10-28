@@ -10,6 +10,8 @@ from mtg_agentic.brackets import (
     BracketChecker,
     SpellbookClient,
     assessment_schema,
+    bracket_rules,
+    destroys_multiple_opponent_lands,
     deterministic_signals,
     game_changers,
 )
@@ -162,6 +164,110 @@ class BracketTests(unittest.TestCase):
         result = checker.check({"Spell 0": 1}, JODAH["name"], 3)
         self.assertEqual(result["verdict"], "fits")
         self.assertEqual(len(checker.model.calls), 1)
+
+    def test_custom_modes_require_bracket_three_and_a_known_mode(self):
+        for bracket, mode in ((2, "unrestricted"), (4, "limited-land-destruction"), (3, "typo")):
+            with self.subTest(bracket=bracket, mode=mode), self.assertRaises(ValueError):
+                bracket_rules(bracket, mode)
+
+    def test_unrestricted_ignores_land_denial_and_early_or_unknown_combo_risk(self):
+        self.store.add_verified_card(card("Armageddon", text="Destroy all lands."))
+        self.store.add_verified_card(card("Denial", text="Destroy two target lands."))
+        for likelihood in ("likely", "unknown"):
+            answer = assessment(combo_reviews=[
+                {"id": "combo", "early_likelihood": likelihood, "reason": "Combo setup"}
+            ])
+            checker = self.checker(answer, spellbook_page([variant()], next_="more"))
+            result = checker.check(
+                {"Armageddon": 1, "Denial": 1, "Spell 0": 1, "Spell 1": 1},
+                JODAH["name"], 3, bracket3_mode="unrestricted",
+            )
+            self.assertEqual(result["verdict"], "fits", result["reasons"])
+            self.assertTrue(result["signals"]["mass_land_denial"])
+            self.assertFalse(result["warnings"])
+            payload = json.loads(checker.model.calls[0][0][1]["content"])
+            self.assertFalse(payload["selected_rules"]["two_card_combos_restricted"])
+            self.assertEqual(result["bracket3_mode"], "unrestricted")
+
+    def test_unrestricted_retains_game_changer_and_extra_turn_chain_restrictions(self):
+        result = self.checker().check(
+            {"Spell 69": 4}, JODAH["name"], 3, bracket3_mode="unrestricted",
+        )
+        self.assertTrue(any("Game Changers" in e for e in result["errors"]))
+        answer = assessment(
+            combo_reviews=[{"id": "combo", "early_likelihood": "unlikely", "reason": "Late"}]
+        )
+        loop = variant(produces=[{"feature": {"name": "Infinite turns"}}])
+        result = self.checker(answer, spellbook_page([loop])).check(
+            {"Spell 0": 1, "Spell 1": 1}, JODAH["name"], 3, bracket3_mode="unrestricted",
+        )
+        self.assertTrue(any("extra-turn" in e for e in result["errors"]))
+
+    def test_multiple_opponent_land_destruction_patterns(self):
+        cases = [
+            ("Destroy all lands.", True),
+            ("Destroy up to two target lands.", True),
+            ("Destroy X target lands.", True),
+            ("Destroy three target noncreature permanents.", True),
+            ("Destroy up to three target artifacts, creatures, enchantments, and/or lands.", True),
+            ("Destroy all nonbasic lands. Each player may search for basic land cards.", True),
+            ("Destroy target land and all other lands with the same name as that land.", True),
+            ("Destroy all nonland permanents and all lands.", True),
+            ("Destroy two target lands you control and two target lands an opponent controls.", True),
+            ("Each opponent sacrifices two lands.", True),
+            ("Destroy target land.", False),
+            ("Destroy target artifact, target creature, and target land.", False),
+            ("Destroy all creatures.", False),
+            ("Destroy two target nonland permanents.", False),
+            ("Destroy all lands you control.", False),
+            ("Destroy two target lands controlled by different players.", False),
+            ("Each opponent sacrifices a land.", False),
+            ("Sacrifice two untapped lands. {T}: Add {C}{C}{C}{C}.", False),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                value = destroys_multiple_opponent_lands(validation_card(card("Test", text=text)))
+                self.assertEqual(value, expected)
+
+    def test_limited_destruction_fails_closed_even_with_replacement_lands_and_llm_approval(self):
+        for text in (
+            "Destroy two target lands.",
+            "Destroy all nonbasic lands. For each land destroyed, its controller may "
+            "search for a basic land card.",
+            "Destroy three target noncreature permanents.",
+        ):
+            with self.subTest(text=text):
+                self.store.add_verified_card(card("Restricted", text=text))
+                result = self.checker().check(
+                    {"Restricted": 1}, JODAH["name"], 3,
+                    bracket3_mode="limited-land-destruction",
+                )
+                self.assertEqual(result["verdict"], "mismatch")
+                self.assertTrue(any("more than one land" in e for e in result["errors"]))
+
+    def test_limited_mode_allows_scorched_ruins_and_single_land_removal(self):
+        self.store.add_verified_card(card(
+            "Scorched Ruins", types="Land",
+            text="If Scorched Ruins would enter, sacrifice two untapped lands instead. "
+            "{T}: Add {C}{C}{C}{C}.",
+        ))
+        self.store.add_verified_card(card("Single", text="Destroy target land."))
+        result = self.checker().check(
+            {"Scorched Ruins": 1, "Single": 1}, JODAH["name"], 3,
+            bracket3_mode="limited-land-destruction",
+        )
+        self.assertEqual(result["verdict"], "fits")
+
+    def test_limited_mode_still_rejects_early_two_card_combos(self):
+        answer = assessment(combo_reviews=[
+            {"id": "combo", "early_likelihood": "likely", "reason": "Fast setup"}
+        ])
+        result = self.checker(answer, spellbook_page([variant()])).check(
+            {"Spell 0": 1, "Spell 1": 1}, JODAH["name"], 3,
+            bracket3_mode="limited-land-destruction",
+        )
+        self.assertEqual(result["verdict"], "mismatch")
+        self.assertTrue(any("early" in e for e in result["errors"]))
 
     def test_fetch_land_sacrifice_and_untap_are_not_land_denial(self):
         self.store.add_verified_card(card(

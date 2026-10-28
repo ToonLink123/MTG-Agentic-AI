@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from . import prompts
+from .brackets import land_denial_forbidden
 from .cards import Card, name_key
 from .llm import JSONModel, request_json
 from .oracle import OracleStore
@@ -33,12 +34,14 @@ class DeckSpec:
     exclude: list[str]
     role_targets: dict[str, int]
     commander_dependency: str = "medium"
+    bracket3_mode: str = "standard"
 
     @classmethod
     def from_dict(cls, data: Any) -> DeckSpec:
         # Migrate version-1 saved specs, not provider responses (which use SPEC_SCHEMA).
         data = deepcopy(data)
         if isinstance(data, dict):
+            data.setdefault("bracket3_mode", "standard")
             values = [data.get("themes"), data.get("win_conditions")]
             themes = " ".join(s for v in values if isinstance(v, list) for s in v if isinstance(s, str))
             data.setdefault("commander_dependency", "high" if re.search(r"equipment|voltron|commander.damage", themes, re.I) else "medium")
@@ -48,6 +51,8 @@ class DeckSpec:
         validate_json(data, SPEC_SCHEMA)
         result = cls(**json.loads(json.dumps(data)))
         errors: list[dict[str, Any]] = []
+        if result.bracket != 3 and result.bracket3_mode != "standard":
+            errors.append({"error": "spec", "detail": "Custom Bracket 3 modes require bracket 3"})
         for field in ("themes", "mechanics", "win_conditions", "must_include", "exclude"):
             values = getattr(result, field)
             if len({name_key(value) for value in values}) != len(values):
@@ -85,6 +90,8 @@ def ground_spec(spec: DeckSpec, store: OracleStore, commander: Card | None = Non
                 {"error": "spec_identity", "detail": f"Commander identity must be {identity}"}
             )
         errors.extend(card_errors(leader, set(leader["color_identity"])))
+        if land_denial_forbidden(leader, spec.bracket, spec.bracket3_mode):
+            errors.append({"error": "spec_commander", "detail": "Commander violates the selected land-denial rules"})
         if not can_be_commander(leader) or leader["name"] in {
             "The Prismatic Piper",
             "Faceless One",
@@ -109,6 +116,11 @@ def ground_spec(spec: DeckSpec, store: OracleStore, commander: Card | None = Non
             constraints[field].append(card["name"])
             if field == "must_include":
                 errors.extend(card_errors(card, set(spec.color_identity) - {"C"}))
+                if land_denial_forbidden(card, spec.bracket, spec.bracket3_mode):
+                    errors.append({
+                        "error": "must_include", "card": name,
+                        "detail": "Required card violates the selected land-denial rules",
+                    })
     if errors:
         raise SchemaError(errors)
     grounded = spec.to_dict()
@@ -118,7 +130,8 @@ def ground_spec(spec: DeckSpec, store: OracleStore, commander: Card | None = Non
 
 
 def intake(
-    request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore
+    request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore,
+    *, bracket3_mode: str | None = None,
 ) -> DeckSpec:
     if not isinstance(request, str) or not request.strip() or len(request) > 8000:
         raise ValueError("Intake request must contain 1 to 8000 characters")
@@ -133,10 +146,15 @@ def intake(
             "role": "system",
             "content": prompts.INTAKE + json.dumps(SPEC_SCHEMA),
         },
-        {"role": "user", "content": json.dumps({"request": request, "commander_card": fetched})},
+        {"role": "user", "content": json.dumps({
+            "request": request, "commander_card": fetched, "bracket3_mode": bracket3_mode,
+        })},
     ]
     log.info("intake: turning the request into a deck spec")
-    spec = DeckSpec.from_dict(request_json(model, messages, SPEC_SCHEMA))
+    data = request_json(model, messages, SPEC_SCHEMA)
+    if bracket3_mode is not None:
+        data["bracket3_mode"] = bracket3_mode
+    spec = DeckSpec.from_dict(data)
     # Ensure the response cannot silently switch the requested commander.
     if name_key(spec.commander) != name_key(fetched["name"]):
         raise SchemaError(

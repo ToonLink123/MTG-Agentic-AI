@@ -85,7 +85,9 @@ def draft_deck(pool: CandidatePool, model: JSONModel, client: ScryfallClient, st
         review = {"status": "not_run", "errors": []}
         if not errors and reviewer:
             try:
-                review = reviewer.check(cards, spec.commander, spec.bracket)
+                review = reviewer.check(
+                    cards, spec.commander, spec.bracket, bracket3_mode=spec.bracket3_mode
+                )
             except SchemaError as exc:
                 review = {"status": "needs_revision", "errors": [{"error": "review_schema", "detail": "Safety model returned invalid grounded JSON", "schema_errors": exc.errors}]}
             errors.extend(review["errors"])
@@ -98,6 +100,7 @@ def draft_deck(pool: CandidatePool, model: JSONModel, client: ScryfallClient, st
         )
         last = {
             "version": 1, "valid": not errors, "commander": spec.commander, "bracket": spec.bracket,
+            "bracket3_mode": spec.bracket3_mode,
             "cards": cards, "spec": spec.to_dict(), "role_counts": playability["roles"]["role_counts"],
             "protection": playability["roles"]["protection"], "playability": playability,
             "assembly": assembly, "land_base": land_base, "validation": validation,
@@ -139,13 +142,13 @@ def discover(spec: DeckSpec, model: JSONModel, client: ScryfallClient, store: Or
     return pool
 
 
-def draft_from_request(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None) -> dict[str, Any]:
-    spec = intake(request, commander, model, client, store)
+def draft_from_request(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, bracket3_mode: str | None = None) -> dict[str, Any]:
+    spec = intake(request, commander, model, client, store, bracket3_mode=bracket3_mode)
     pool = discover(spec, model, client, store, pool_limit=pool_limit)
     return draft_deck(pool, model, client, store, max_repairs=max_repairs, reviewer=reviewer)
 
 
-def build_deck(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, simulator=None, pods=(), games: int = 10, seed: int = 20261025) -> dict[str, Any]:
+def build_deck(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, simulator=None, pods=(), games: int = 10, seed: int = 20261025, bracket3_mode: str | None = None) -> dict[str, Any]:
     """A completed build requires safety review and at least ten games per pod."""
     if reviewer is None or simulator is None or not 1 <= len(pods) <= 3:
         raise ValueError("A build requires a safety reviewer, Forge simulator and one to three opponent pods; use draft for an untested list")
@@ -156,6 +159,7 @@ def build_deck(request: str, commander: str, model: JSONModel, client: ScryfallC
     deck = draft_from_request(
         request, commander, model, client, store,
         pool_limit=pool_limit, max_repairs=max_repairs, reviewer=reviewer,
+        bracket3_mode=bracket3_mode,
     )
     report = {
         "status": "blocked_by_gates", "required_games_per_pod": games,

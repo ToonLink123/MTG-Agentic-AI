@@ -144,6 +144,35 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertNotIn("Changer", {candidate.card["name"] for candidate in pool.cards})
 
+    def test_house_rule_modes_filter_and_reload_the_correct_cards(self):
+        data = [
+            card("Armageddon", text="Destroy all lands."),
+            card("Multi", text="Destroy two target lands."),
+            card("Single", text="Destroy target land."),
+            card("Scorched Ruins", types="Land", text="Sacrifice two untapped lands. {T}: Add {C}{C}{C}{C}."),
+        ]
+        for raw in data:
+            self.store.add_verified_card(raw)
+        for mode in ("unrestricted", "limited-land-destruction"):
+            with self.subTest(mode=mode):
+                pool = build_candidate_pool(
+                    make_spec(bracket3_mode=mode), [CardQuery("theme", "a")],
+                    FakeCards(data), self.store,
+                )
+                names = {c.card["name"] for c in pool.cards}
+                self.assertTrue({"Single", "Scorched Ruins"} <= names)
+                self.assertEqual("Armageddon" in names, mode == "unrestricted")
+                self.assertEqual("Multi" in names, mode == "unrestricted")
+                self.assertEqual(CandidatePool.from_dict(pool.to_dict(), self.store).spec.bracket3_mode, mode)
+
+    def test_limited_mode_cannot_require_a_forbidden_card(self):
+        self.store.add_verified_card(card("Multi", text="Destroy two target lands."))
+        with self.assertRaises(SchemaError):
+            build_candidate_pool(
+                make_spec(bracket3_mode="limited-land-destruction", must_include=["Multi"]),
+                [], FakeCards([]), self.store,
+            )
+
 
     def test_brackets_one_to_three_never_pool_mass_land_denial(self):
         rage = card("Land Reset Myojin", types="Legendary Creature — Spirit", text="Destroy all lands.")

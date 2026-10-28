@@ -88,6 +88,18 @@ class LandTests(unittest.TestCase):
         self.assertEqual(result["cards"]["Test Dual"], 1)
         self.assertEqual(result["land_count"], 36)
 
+    def test_limited_land_destruction_mode_can_generate_required_scorched_ruins(self):
+        raw = card(
+            "Scorched Ruins", types="Land", produced_mana=["C"],
+            text="If Scorched Ruins would enter, sacrifice two untapped lands instead. "
+                 "{T}: Add {C}{C}{C}{C}.",
+        )
+        self.store.add_verified_card(raw)
+        spec = make_spec(bracket3_mode="limited-land-destruction", must_include=["Scorched Ruins"])
+        result = calculate_land_base({}, spec, make_pool(self.store, spec), self.store)
+        self.assertEqual(result["cards"]["Scorched Ruins"], 1)
+        self.assertEqual(result["land_count"], 36)
+
     def test_land_selection_does_not_spend_used_game_changer_budget(self):
         changed = [
             dict(raw, game_changer=True)

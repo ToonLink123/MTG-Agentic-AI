@@ -9,7 +9,15 @@ from mtg_agentic.pipeline import draft_deck
 from mtg_agentic.review import DeckReviewer
 from mtg_agentic.schema import SchemaError
 from tests.fixtures import card
-from tests.pipeline_fixtures import JODAH, FakeCards, FakeModel, draft, make_pool, playable_records
+from tests.pipeline_fixtures import (
+    JODAH,
+    FakeCards,
+    FakeModel,
+    draft,
+    make_pool,
+    make_spec,
+    playable_records,
+)
 
 
 class ReviewTests(unittest.TestCase):
@@ -86,6 +94,24 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertFalse(result["review_passed"])
         self.assertEqual(result["review"]["status"], "not_run")
+
+    def test_custom_mode_flows_from_pool_to_draft_and_reviewer(self):
+        reviewer = Mock()
+        reviewer.game_changer_names = []
+        reviewer.check.return_value = {"status": "passed", "errors": []}
+        result = draft_deck(
+            make_pool(self.store, make_spec(bracket3_mode="unrestricted")),
+            FakeModel(draft()), self.client, self.store, reviewer=reviewer,
+        )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["bracket3_mode"], "unrestricted")
+        self.assertEqual(result["spec"]["bracket3_mode"], "unrestricted")
+        self.assertEqual(reviewer.check.call_args.kwargs["bracket3_mode"], "unrestricted")
+
+    def test_reviewer_passes_mode_to_bracket_checker(self):
+        service = self.service()
+        service.check({"Spell 0": 1}, JODAH["name"], 3, bracket3_mode="unrestricted")
+        self.assertEqual(service.brackets.check.call_args.kwargs["bracket3_mode"], "unrestricted")
 
     def service(self):
         bracket = Mock()

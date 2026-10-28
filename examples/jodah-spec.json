@@ -2,6 +2,7 @@
   "commander": "Jodah, Archmage Eternal",
   "color_identity": "WUBRG",
   "bracket": 3,
+  "bracket3_mode": "standard",
   "themes": ["myojin tribal", "divinity counters"],
   "mechanics": ["proliferate", "counters"],
   "win_conditions": ["myojin combat damage", "alternate wincons"],

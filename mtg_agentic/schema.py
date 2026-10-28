@@ -33,6 +33,7 @@ def object_schema(properties: dict[str, Any]) -> dict[str, Any]:
 
 
 NAME_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 200}
+BRACKET3_MODES = ("standard", "unrestricted", "limited-land-destruction")
 STRING_LIST = {
     "type": "array",
     "items": NAME_SCHEMA,
@@ -48,6 +49,7 @@ SPEC_SCHEMA = object_schema(
             "pattern": r"^(?:W?U?B?R?G?|C)$",
         },
         "bracket": {"type": "integer", "minimum": 1, "maximum": 5},
+        "bracket3_mode": {"type": "string", "enum": list(BRACKET3_MODES)},
         "themes": STRING_LIST,
         "mechanics": STRING_LIST,
         "win_conditions": STRING_LIST,

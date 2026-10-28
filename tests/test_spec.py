@@ -27,6 +27,28 @@ class SpecTests(unittest.TestCase):
         self.assertEqual(DeckSpec.from_dict(data).to_dict(), make_spec().to_dict())
         self.assertEqual(ground_spec(make_spec(), self.store), make_spec())
 
+    def test_old_specs_default_to_standard_and_custom_modes_roundtrip(self):
+        data = make_spec().to_dict()
+        data.pop("bracket3_mode")
+        self.assertEqual(DeckSpec.from_dict(data).bracket3_mode, "standard")
+        for mode in ("unrestricted", "limited-land-destruction"):
+            spec = make_spec(bracket3_mode=mode)
+            self.assertEqual(DeckSpec.from_dict(spec.to_dict()), spec)
+            with self.assertRaises(SchemaError):
+                make_spec(bracket=2, bracket3_mode=mode)
+        with self.assertRaises(SchemaError):
+            make_spec(bracket3_mode="unknown")
+
+    def test_explicit_intake_mode_overrides_model_and_is_in_payload(self):
+        model = FakeModel(make_spec().to_dict())
+        spec = intake(
+            "Myojin", JODAH["name"], model, FakeCards(self.records), self.store,
+            bracket3_mode="unrestricted",
+        )
+        self.assertEqual(spec.bracket3_mode, "unrestricted")
+        payload = json.loads(model.calls[0][0][1]["content"])
+        self.assertEqual(payload["bracket3_mode"], "unrestricted")
+
     def test_missing_extra_and_wrong_types_are_rejected(self):
         original = make_spec().to_dict()
         mutations = []

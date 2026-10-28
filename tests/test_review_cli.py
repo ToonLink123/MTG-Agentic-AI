@@ -61,6 +61,42 @@ class ReviewCliTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "uncertain")
         self.assertEqual(checker.return_value.check.call_args.args[-1], 2)
 
+    @patch("mtg_agentic.__main__.BracketChecker")
+    @patch("mtg_agentic.__main__._make_model")
+    def test_bracket_check_uses_saved_mode_and_explicit_override(self, model, checker):
+        checker.return_value.check.return_value = {"verdict": "fits"}
+        self.deck.write_text(json.dumps(playable_deck(
+            spec={"bracket3_mode": "unrestricted"}
+        )))
+        code, _ = self.run_cli("bracket-check", str(self.deck))
+        self.assertEqual(code, 0)
+        self.assertEqual(checker.return_value.check.call_args.kwargs["bracket3_mode"], "unrestricted")
+        code, _ = self.run_cli(
+            "bracket-check", str(self.deck), "--bracket3-mode", "limited-land-destruction"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            checker.return_value.check.call_args.kwargs["bracket3_mode"],
+            "limited-land-destruction",
+        )
+        code, result = self.run_cli("bracket-check", str(self.deck), "--bracket", "2")
+        self.assertEqual(code, 2)
+        self.assertIn("require bracket 3", result["errors"][0]["detail"])
+
+    @patch("mtg_agentic.__main__._reviewer")
+    @patch("mtg_agentic.__main__._make_model")
+    def test_review_deck_uses_selected_mode(self, model, reviewer):
+        reviewer.return_value.game_changer_names = []
+        reviewer.return_value.check.return_value = {"status": "passed", "errors": []}
+        code, _ = self.run_cli(
+            "review-deck", str(self.deck), "--bracket3-mode", "limited-land-destruction"
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            reviewer.return_value.check.call_args.kwargs["bracket3_mode"],
+            "limited-land-destruction",
+        )
+
     @patch("mtg_agentic.__main__._reviewer")
     @patch("mtg_agentic.__main__._make_model")
     def test_review_deck_includes_independent_validation(self, model, reviewer):

@@ -10,7 +10,7 @@ from itertools import zip_longest
 from typing import Any
 
 from . import prompts
-from .brackets import is_mass_land_denial
+from .brackets import land_denial_forbidden
 from .cards import Card, name_key, trim_card
 from .land_options import preferred_lands
 from .llm import JSONModel, request_json
@@ -217,8 +217,7 @@ def eligible(card: Card, spec: DeckSpec) -> bool:
         and name_key(card["name"]) not in {name_key(n) for n in spec.exclude}
         and not card_errors(card, set(spec.color_identity) - {"C"})
         and not (spec.bracket < 3 and card["game_changer"])
-        # Brackets 1-3 reject mass land denial outright, so it can never help a draft pass.
-        and not (spec.bracket <= 3 and is_mass_land_denial(card))
+        and not land_denial_forbidden(card, spec.bracket, spec.bracket3_mode)
     )
 
 

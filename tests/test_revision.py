@@ -10,7 +10,7 @@ from mtg_agentic.forge_config import OpponentPod
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.revision import apply_swaps, compare, gate_invariant, revise_deck
 from tests.fixtures import card
-from tests.pipeline_fixtures import FakeModel, make_pool, playable_deck, playable_records
+from tests.pipeline_fixtures import FakeModel, make_pool, make_spec, playable_deck, playable_records
 
 
 def metrics(wins=10, count=50):
@@ -97,6 +97,25 @@ class RevisionTests(unittest.TestCase):
         for stage in ("baseline", "proposal", "gates", "deck", "candidate", "decision"):
             self.assertTrue((root / f"0001-{stage}.json").exists())
         self.assertEqual(json.loads((root / "report.json").read_text())["accepted_revisions"], 1)
+
+    def test_revision_retains_selected_house_rules(self):
+        self.pool.spec = make_spec(bracket3_mode="unrestricted")
+        self.deck["bracket3_mode"] = "unrestricted"
+        report, _ = self.run_revision(metrics(5), metrics(40))
+        self.assertTrue(report["gate_invariant_passed"])
+        self.assertEqual(report["deck"]["bracket3_mode"], "unrestricted")
+        self.assertTrue(all(
+            call.kwargs["bracket3_mode"] == "unrestricted"
+            for call in self.reviewer.check.call_args_list
+        ))
+
+    def test_revision_cannot_switch_house_rules(self):
+        self.pool.spec = make_spec(bracket3_mode="limited-land-destruction")
+        self.deck["bracket3_mode"] = "unrestricted"
+        report, _ = self.run_revision()
+        self.assertEqual(report["stop_reason"], "initial_gates_failed")
+        self.reviewer.check.assert_not_called()
+        self.simulator.simulate.assert_not_called()
 
     def test_small_noisy_gain_reverted_and_plateau_stops(self):
         report, _ = self.run_revision(metrics(10), metrics(12))

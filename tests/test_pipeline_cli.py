@@ -82,11 +82,14 @@ class PipelineCliTests(unittest.TestCase):
         ):
             status, report = self.run_cli(
                 "build", "--commander", JODAH["name"], "--request", "Myojin",
+                "--bracket3-mode", "unrestricted",
                 "--forge-home", str(self.path), "--pod", str(self.path / "pod.json"),
                 model=FakeModel(make_spec().to_dict(), {"queries": [{"role": "theme", "query": "t:myojin"}]}, draft()),
             )
         self.assertEqual(status, 0, report)
         self.assertTrue(report["build_passed"])
+        self.assertEqual(report["bracket3_mode"], "unrestricted")
+        self.assertEqual(reviewer.check.call_args.kwargs["bracket3_mode"], "unrestricted")
         self.assertEqual(report["simulation"]["status"], "completed")
         self.assertEqual(simulator.simulate.call_args.args[2], 10)
         reviewer.check.assert_called_once()
@@ -110,6 +113,16 @@ class PipelineCliTests(unittest.TestCase):
         status, result = self.run_cli(*args)
         self.assertEqual(status, 2)
         self.assertEqual(output.read_bytes(), before)
+
+    def test_intake_accepts_both_bracket_three_modes(self):
+        for mode in ("unrestricted", "limited-land-destruction"):
+            with self.subTest(mode=mode):
+                status, result = self.run_cli(
+                    "intake", "--commander", JODAH["name"], "--request", "Myojin",
+                    "--bracket3-mode", mode, model=FakeModel(make_spec().to_dict()),
+                )
+                self.assertEqual(status, 0)
+                self.assertEqual(result["bracket3_mode"], mode)
 
     def test_draft_artifact_can_be_passed_to_existing_validator(self):
         pool_file = self.path / "pool.json"

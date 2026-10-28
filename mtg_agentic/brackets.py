@@ -11,10 +11,10 @@ from urllib.parse import urlencode
 
 from . import prompts
 from .cards import Card, name_key, trim_card
-from .lands import is_land
 from .llm import JSONModel, request_json
+from .mana import is_land
 from .oracle import OracleStore
-from .schema import NAME_SCHEMA, STRING_LIST, SchemaError, object_schema
+from .schema import BRACKET3_MODES, NAME_SCHEMA, STRING_LIST, SchemaError, object_schema
 from .scryfall import ScryfallClient
 from .sources import SourceCache, SourceError
 
@@ -247,6 +247,71 @@ def is_mass_land_denial(card: Card) -> bool:
     return name_key(card["name"]) in _MLD_NAMES or bool(_LAND_RESET.search(text) and not replaces)
 
 
+def bracket_rules(bracket: int, bracket3_mode: str = "standard") -> dict[str, Any]:
+    """Explicit house rules override only the selected parts of the published policy."""
+    if type(bracket) is not int or bracket not in range(1, 6):
+        raise ValueError("Bracket must be from 1 to 5")
+    if bracket3_mode not in BRACKET3_MODES:
+        raise ValueError("Unknown Bracket 3 mode")
+    if bracket != 3 and bracket3_mode != "standard":
+        raise ValueError("Custom Bracket 3 modes require bracket 3")
+    return {
+        "bracket3_mode": bracket3_mode,
+        "house_rules": bracket3_mode != "standard",
+        "mass_land_denial_restricted": bracket <= 3 and bracket3_mode != "unrestricted",
+        "two_card_combos_restricted": bracket <= 3 and bracket3_mode != "unrestricted",
+        "opponent_land_destruction_limit": 1 if bracket3_mode == "limited-land-destruction" else None,
+        "land_exception": "Scorched Ruins" if bracket3_mode == "limited-land-destruction" else None,
+        "extra_turn_chaining_restricted": bracket <= 3,
+    }
+
+
+_LAND_OBJECT = r"(?:lands?|plains|islands?|swamps?|mountains?|forests?|permanents?)\b"
+_MULTIPLE = r"(?:two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|[2-9]\d*|1\d+|x|any number of)"
+
+
+def destroys_multiple_opponent_lands(card: Card) -> bool:
+    """Oracle heuristic for one effect hitting multiple lands belonging to one opponent."""
+    if name_key(card["name"]) == name_key("Scorched Ruins"):
+        return False
+    text = card["oracle_text"].casefold()
+    for clause in re.split(r"[.\n•]", text):
+        for effect in re.finditer(r"\bdestroy\b[^.\n]*", clause):
+            words = effect.group()
+            # Nonland permanents and effects restricted to our own lands cannot qualify.
+            if "nonland" in words and not re.search(
+                r"\b(?:lands?|plains|islands?|swamps?|mountains?|forests?)\b", words
+            ):
+                continue
+            if (re.search(r"\b(?:lands?|permanents?) (?:that )?you control\b", words)
+                    and not re.search(r"\bopponents?\b", words)):
+                continue
+            if re.search(r"\b(?:controlled by different players|each controlled by a different player)\b", words):
+                continue
+            if re.search(
+                rf"\bdestroy (?:all|each)\b[^.\n]*\b{_LAND_OBJECT}|"
+                rf"\bdestroy (?:up to )?{_MULTIPLE}\b[^.\n]*\b{_LAND_OBJECT}|"
+                rf"\bdestroy\b[^.\n]*\ball (?:other )?{_LAND_OBJECT}|"
+                r"\bdestroy (?:those|these|the chosen) lands\b", words
+            ):
+                return True
+        if re.search(
+            rf"\b(?:each|target) (?:player|opponent)\b[^.\n]*"
+            rf"sacrifices? (?:{_MULTIPLE}|all)\b[^.\n]*\b{_LAND_OBJECT}", clause
+        ):
+            return True
+    return False
+
+
+def land_denial_forbidden(card: Card, bracket: int, bracket3_mode: str = "standard") -> bool:
+    rules = bracket_rules(bracket, bracket3_mode)
+    return bool(
+        (rules["mass_land_denial_restricted"] and is_mass_land_denial(card))
+        or (rules["opponent_land_destruction_limit"] is not None
+            and destroys_multiple_opponent_lands(card))
+    )
+
+
 def deterministic_signals(cards: list[tuple[Card, int]], gc_names: list[str]) -> dict[str, Any]:
     gc = {name_key(n) for n in gc_names}
     signals: dict[str, Any] = {
@@ -255,6 +320,7 @@ def deterministic_signals(cards: list[tuple[Card, int]], gc_names: list[str]) ->
             "game_changers",
             "mass_land_denial",
             "land_denial_candidates",
+            "multiple_opponent_land_destruction",
             "extra_turns",
             "tutors_cheap",
             "tutors_expensive",
@@ -272,6 +338,8 @@ def deterministic_signals(cards: list[tuple[Card, int]], gc_names: list[str]) ->
             curve[str(int(mv)) if isinstance(mv, (int, float)) else "unknown"] += quantity
         if name_key(name) in gc:
             signals["game_changers"].append(item)
+        if destroys_multiple_opponent_lands(c):
+            signals["multiple_opponent_land_destruction"].append(item)
         land_reset = _LAND_RESET.search(text)
         if is_mass_land_denial(c):
             signals["mass_land_denial"].append(item)
@@ -330,9 +398,11 @@ class BracketChecker:
         self.spellbook = spellbook or SpellbookClient(cache)
         self.game_changer_list = game_changers(client, cache)
 
-    def check(self, cards: dict[str, int], commander: str, bracket: int) -> dict[str, Any]:
-        if type(bracket) is not int or bracket not in range(1, 6):
-            raise ValueError("Bracket must be from 1 to 5")
+    def check(
+        self, cards: dict[str, int], commander: str, bracket: int,
+        *, bracket3_mode: str = "standard",
+    ) -> dict[str, Any]:
+        rules = bracket_rules(bracket, bracket3_mode)
         resolved = []
         quantities: Counter[str] = Counter(cards)
         quantities[commander] += 1
@@ -359,15 +429,21 @@ class BracketChecker:
         limit = POLICY["game_changer_limits"][bracket]
         if limit is not None and signals["counts"]["game_changers"] > limit:
             errors.append(f"Game Changers exceed Bracket {bracket}'s limit of {limit}.")
-        if bracket <= 3 and signals["mass_land_denial"]:
+        if rules["mass_land_denial_restricted"] and signals["mass_land_denial"]:
             errors.append("Remove mass land denial for Brackets 1–3.")
+        if (rules["opponent_land_destruction_limit"] is not None
+                and signals["multiple_opponent_land_destruction"]):
+            errors.append(
+                "Remove cards that can destroy more than one land controlled by one opponent; "
+                "Scorched Ruins is allowed."
+            )
         if bracket == 1 and signals["extra_turns"]:
             errors.append("Bracket 1 does not include extra-turn cards.")
         if bracket <= 3 and signals["known_extra_turn_chain_ids"]:
             errors.append("Known Spellbook extra-turn loop conflicts with Brackets 1–3.")
-        if not combos["complete"]:
+        if not combos["complete"] and bracket3_mode != "unrestricted":
             warnings.append("Spellbook search truncated; absence of a combo is not established.")
-        if signals["land_denial_candidates"]:
+        if bracket3_mode != "unrestricted" and signals["land_denial_candidates"]:
             warnings.append("Review possible land-denial effects in context.")
         assessment = request_json(
             self.model,
@@ -382,6 +458,7 @@ class BracketChecker:
                         {
                             "target_bracket": bracket,
                             "policy": POLICY,
+                            "selected_rules": rules,
                             "signals": signals,
                             "commander": commander,
                             "cards": [{"quantity": q, **trim_card(c)} for c, q in resolved],
@@ -416,7 +493,7 @@ class BracketChecker:
             warnings.append(
                 "Known two-card infinite/winning combo present; remove or review intent."
             )
-        if bracket == 3 and any(
+        if bracket == 3 and rules["two_card_combos_restricted"] and any(
             r["id"] in dangerous and r["early_likelihood"] == "likely" for r in reviews
         ):
             errors.append("LLM flags a known two-card combo as frequently early; remove or revise.")
@@ -433,13 +510,15 @@ class BracketChecker:
         if bracket == 5:
             warnings.append("A decklist alone does not establish cEDH metagame intent.")
         uncertain = bool(warnings) or assessment["fit"] == "uncertain"
-        if bracket <= 3 and any(
+        if rules["two_card_combos_restricted"] and any(
             r["id"] in dangerous and r["early_likelihood"] == "unknown" for r in reviews
         ):
             uncertain = True
         return {
             "verdict": "mismatch" if errors else "uncertain" if uncertain else "fits",
             "target_bracket": bracket,
+            "bracket3_mode": bracket3_mode,
+            "selected_rules": rules,
             "policy": POLICY,
             "game_changer_list": self.game_changer_list,
             "signals": signals,

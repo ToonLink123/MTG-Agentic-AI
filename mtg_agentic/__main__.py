@@ -12,7 +12,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from .brackets import BracketChecker
+from .brackets import BracketChecker, bracket_rules
 from .discovery import CandidatePool
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .evaluation import evaluation_history, run_evaluation
@@ -31,7 +31,7 @@ from .playability import spec_for_deck, validate_playability
 from .review import DeckReviewer
 from .revision import revise_deck
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore
-from .schema import SPEC_SCHEMA, SchemaError, load_json
+from .schema import BRACKET3_MODES, SPEC_SCHEMA, SchemaError, load_json
 from .scryfall import ScryfallClient, ScryfallError
 from .sources import SourceCache, SourceError
 from .spec import DeckSpec, intake
@@ -54,6 +54,23 @@ def _model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output", type=Path, help="Save JSON to a NEW file; existing files are never overwritten"
     )
+
+
+def _bracket3_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--bracket3-mode", choices=BRACKET3_MODES,
+        help="Bracket 3 house rules: unrestricted ignores land-denial/two-card combo limits; "
+        "limited-land-destruction keeps combo limits and bans destroying multiple lands "
+        "controlled by one opponent (Scorched Ruins allowed). Default: saved mode or standard.",
+    )
+
+
+def _deck_mode(deck: dict[str, Any], bracket: int, override: str | None) -> str:
+    mode = override if override is not None else deck.get(
+        "bracket3_mode", deck.get("spec", {}).get("bracket3_mode", "standard")
+    )
+    bracket_rules(bracket, mode)
+    return mode
 
 
 def _make_model(args: argparse.Namespace):
@@ -241,6 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     intake_cmd = commands.add_parser("intake", help="Ground preferences in fetched commander text")
     intake_cmd.add_argument("--commander", required=True)
     intake_cmd.add_argument("--request", required=True)
+    _bracket3_options(intake_cmd)
     _model_options(intake_cmd)
     discover_cmd = commands.add_parser(
         "discover", help="Generate live queries and save a tagged pool"
@@ -265,6 +283,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     build_cmd.add_argument("--commander", required=True)
     build_cmd.add_argument("--request", required=True)
+    _bracket3_options(build_cmd)
     build_cmd.add_argument("--pool-limit", type=int, default=350)
     build_cmd.add_argument("--repairs", type=int, choices=range(4), default=3)
     _simulation_options(build_cmd, required=True)
@@ -279,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
         cmd = commands.add_parser(name, help="Assess a JSON deck; review-deck also checks rules")
         cmd.add_argument("deck", type=Path)
         cmd.add_argument("--bracket", type=int, choices=range(1, 6))
+        _bracket3_options(cmd)
         _model_options(cmd)
         _embedding_options(cmd)
     interaction = commands.add_parser("check-interaction", help="Require rule/ruling citations")
@@ -385,8 +405,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "bracket-check":
                     deck = _deck_json(args.deck)
                     bracket = args.bracket if args.bracket is not None else deck.get("bracket", 3)
+                    mode = _deck_mode(deck, bracket, args.bracket3_mode)
                     result = BracketChecker(store, client, sources, model).check(
-                        deck["cards"], deck["commander"], bracket
+                        deck["cards"], deck["commander"], bracket, bracket3_mode=mode
                     )
                     _emit(result, args.output)
                     return 0 if result["verdict"] == "fits" else 1
@@ -429,6 +450,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "review-deck":
                     deck = _deck_json(args.deck)
                     bracket = args.bracket if args.bracket is not None else deck.get("bracket", 3)
+                    mode = _deck_mode(deck, bracket, args.bracket3_mode)
                     validation = validate_deck(
                         deck["cards"],
                         deck["commander"],
@@ -436,8 +458,8 @@ def main(argv: list[str] | None = None) -> int:
                         bracket=bracket,
                         game_changers=reviewer.game_changer_names,
                     )
-                    playability = validate_playability(deck["cards"], spec_for_deck(deck, store, bracket=bracket), store)
-                    result = reviewer.check(deck["cards"], deck["commander"], bracket) if validation["valid"] and playability["valid"] else {"status": "needs_revision", "errors": validation["errors"] + playability["errors"]}
+                    playability = validate_playability(deck["cards"], spec_for_deck(deck, store, bracket=bracket, bracket3_mode=mode), store)
+                    result = reviewer.check(deck["cards"], deck["commander"], bracket, bracket3_mode=mode) if validation["valid"] and playability["valid"] else {"status": "needs_revision", "errors": validation["errors"] + playability["errors"]}
                     result["validation"] = validation
                     result["playability"] = playability
                     result["valid"] = result["status"] == "passed" and validation["valid"] and playability["valid"]
@@ -516,7 +538,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.command == "build" or (args.command == "draft" and not args.skip_review):
                     reviewer = _reviewer(args, stack, store, client, model)
                 if args.command == "intake":
-                    result = intake(args.request, args.commander, model, client, store).to_dict()
+                    result = intake(
+                        args.request, args.commander, model, client, store,
+                        bracket3_mode=args.bracket3_mode,
+                    ).to_dict()
                 elif args.command == "discover":
                     spec = DeckSpec.from_dict(load_json(args.spec.read_text(encoding="utf-8-sig")))
                     result = discover(
@@ -543,6 +568,7 @@ def main(argv: list[str] | None = None) -> int:
                         pods=pods,
                         games=args.games,
                         seed=args.seed,
+                        bracket3_mode=args.bracket3_mode,
                     )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0

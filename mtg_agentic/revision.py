@@ -89,6 +89,8 @@ def _gate(deck, pool, store, reviewer, *, baseline=None):
     policy_ok = (
         deck["commander"] == pool.spec.commander
         and deck.get("bracket", 3) == pool.spec.bracket
+        and deck.get("bracket3_mode", deck.get("spec", {}).get("bracket3_mode", "standard"))
+        == pool.spec.bracket3_mode
         and all(deck["cards"].get(n, 0) > 0 for n in pool.spec.must_include)
         and not any(deck["cards"].get(n, 0) > 0 for n in pool.spec.exclude)
     )
@@ -99,7 +101,10 @@ def _gate(deck, pool, store, reviewer, *, baseline=None):
     )
     # Never accept a saved review flag as authorization. Re-check the actual cards.
     review = (
-        reviewer.check(deck["cards"], deck["commander"], pool.spec.bracket)
+        reviewer.check(
+            deck["cards"], deck["commander"], pool.spec.bracket,
+            bracket3_mode=pool.spec.bracket3_mode,
+        )
         if validation["valid"] and playability["valid"] and policy_ok and theme_ok
         else None
     )

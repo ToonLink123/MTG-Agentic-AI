@@ -31,9 +31,12 @@ class DeckReviewer:
     def game_changer_names(self) -> list[str]:
         return self.brackets.game_changer_list["names"]
 
-    def check(self, cards: dict[str, int], commander: str, bracket: int) -> dict[str, Any]:
+    def check(
+        self, cards: dict[str, int], commander: str, bracket: int,
+        *, bracket3_mode: str = "standard",
+    ) -> dict[str, Any]:
         log.info("review: bracket check")
-        bracket_report = self.brackets.check(cards, commander, bracket)
+        bracket_report = self.brackets.check(cards, commander, bracket, bracket3_mode=bracket3_mode)
         all_names = list(dict.fromkeys([commander, *cards]))
         log.info("review: rulings for %d cards", len(all_names))
         ingestion = self.rules.ingest_deck(all_names, self.store, self.client)

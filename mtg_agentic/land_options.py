@@ -3,6 +3,7 @@
 import re
 from collections.abc import Iterable
 
+from .brackets import land_denial_forbidden
 from .cards import Card, name_key
 from .mana import BASIC_LANDS, front, is_land, search_selectors
 from .oracle import OracleStore
@@ -70,6 +71,7 @@ def mana_land_options(
             and name_key(card["name"]) not in excluded
             and not card_errors(card, set(spec.color_identity) - {"C"})
             and not (spec.bracket < 3 and card["game_changer"])
+            and not land_denial_forbidden(card, spec.bracket, spec.bracket3_mode)
         ):
             result[card["name"]] = card
     return result

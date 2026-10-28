@@ -102,10 +102,36 @@ prompt-size estimate rejects oversized prompts before Ollama can silently
 truncate them; increase context or rebuild a smaller pool if that happens.
 Long draft calls can take minutes on CPU.
 
+### Bracket 3 house-rule options
+
+Select either option with `--bracket3-mode` on `intake` or `build`:
+
+- `unrestricted`: Bracket 3 without land-denial or two-card combo restrictions.
+- `limited-land-destruction`: standard Bracket 3 combo and land-denial restrictions,
+  plus no card that can destroy more than one land controlled by the same opponent.
+  This includes optional/multi-target effects and effects that replace destroyed lands.
+  **Scorched Ruins is allowed**, since it sacrifices your own lands and produces mana.
+  Single-land removal remains allowed.
+
+Both options retain the three-Game-Changer cap, win-speed guidance, and the restriction
+on extra-turn chaining. These are house rules, not official Bracket 3 certification.
+Omitting the option keeps `standard` rules. Existing saved specs default to `standard`.
+
+```powershell
+python -m mtg_agentic intake --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal" --bracket3-mode unrestricted --output .cache/unrestricted-spec.json
+python -m mtg_agentic intake --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal" --bracket3-mode limited-land-destruction --output .cache/limited-spec.json
+```
+
+The `bracket3_mode` field is saved in the spec, pool, deck, and bracket report, so
+discovery, land generation, drafting, and revision retain the selected rules.
+`bracket-check` and `review-deck` use the saved mode, or accept `--bracket3-mode`
+to override it. Custom modes are valid only with bracket 3. Detection uses named cards
+and Oracle-text heuristics plus model review, not a complete rules-engine proof.
+
 ### Data contracts and safety checks
 
 `SPEC_SCHEMA` in `mtg_agentic/schema.py` is the fixed JSON contract. It requires
-exactly the requested fields: commander, color_identity, bracket, themes,
+exactly the requested fields: commander, color_identity, bracket, bracket3_mode, themes,
 mechanics, win_conditions, playstyle, commander_dependency, must_include,
 exclude, and role_targets.
 Color identity uses WUBRG order, or `C` for colorless. All seven role targets are
@@ -118,8 +144,8 @@ revision. Each one is a step-by-step guide for small local models: what the inpu
 are, numbered steps in order, a self-check, then the output format. Code still
 enforces every rule in them. The bracket assessment also gets a per-deck schema,
 so constrained decoding can only cite deck cards and must review each Spellbook
-combo ID exactly once. Brackets 1-3 keep mass land denial (such as "destroy all
-lands") out of the candidate pool, since the bracket check rejects it anyway.
+combo ID exactly once. Standard Brackets 1-3 keep mass land denial (such as "destroy all
+lands") out of the candidate pool. House-rule modes use their selected restrictions.
 
 Intake fetches the commander's actual trimmed Oracle text with an exact
 `get_card` lookup before prompting. The response cannot change the commander or

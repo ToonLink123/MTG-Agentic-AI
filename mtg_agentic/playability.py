@@ -5,7 +5,7 @@ from .roles import validate_roles
 from .spec import DeckSpec, ground_spec
 
 
-def spec_for_deck(deck, store, *, bracket=None):
+def spec_for_deck(deck, store, *, bracket=None, bracket3_mode=None):
     """Saved specs retain dependency policy; bare decks receive conservative defaults."""
     commander = deck["commander"]
     leader = store.get_card(commander)
@@ -29,6 +29,10 @@ def spec_for_deck(deck, store, *, bracket=None):
             "must_include": [], "exclude": [], "commander_dependency": "medium",
             "role_targets": {"ramp": 10, "draw": 8, "removal": 8, "wipes": 0, "lands": lands, "creatures": 15, "protection": 4},
         }
+    data["bracket3_mode"] = (
+        bracket3_mode if bracket3_mode is not None
+        else deck.get("bracket3_mode", data.get("bracket3_mode", "standard"))
+    )
     return ground_spec(DeckSpec.from_dict(data), store)
 
 
