@@ -13,6 +13,28 @@ from .roles import oracle_roles, protection_features, role_policy
 from .schema import DRAFT_SCHEMA
 
 
+def theme_priority(card: dict[str, Any], spec) -> int:
+    """Prioritize the requested Myojin engine, not generic counter/token payoffs."""
+    requested = " ".join(spec.themes + spec.mechanics + spec.win_conditions).lower()
+    if "myojin" not in requested:
+        return 0
+    text = card["oracle_text"].lower()
+    if card["name"].startswith("Myojin "):
+        return 3
+    if re.search(r"proliferate|divinity counter", text):
+        return 2
+    if re.search(r"put an? indestructible counter on (?:each|target|another)\b", text):
+        return 2
+    if "+1/+1" not in text and re.search(r"counters?.*(?:twice|instead)", text):
+        return 2
+    if (
+        ("token" in text and "token" not in requested)
+        or ("+1/+1 counter" in text and "+1/+1" not in requested)
+    ):
+        return -1
+    return 0
+
+
 def selection_schema(pool: CandidatePool) -> dict[str, Any]:
     schema = copy.deepcopy(DRAFT_SCHEMA)
     schema["properties"]["commander"] = {"type": "string", "enum": [pool.spec.commander]}
@@ -29,6 +51,7 @@ def assemble_nonlands(pool: CandidatePool, selections: dict[str, list[str]], *, 
     candidates = {c.card["name"]: c for c in pool.cards if not is_land(c.card)}
     roles = {n: oracle_roles(c.card, c.roles) for n, c in candidates.items()}
     features = {n: protection_features(c.card) for n, c in candidates.items()}
+    theme_ranks = {n: theme_priority(c.card, spec) for n, c in candidates.items()}
     preferences = list(dict.fromkeys(n for names in selections.values() for n in names))
     ranks = {n: len(preferences) - i for i, n in enumerate(preferences)}
     policy = role_policy(spec)
@@ -74,7 +97,7 @@ def assemble_nonlands(pool: CandidatePool, selections: dict[str, list[str]], *, 
             instant = features[name]["instant_independent"] and instant_count < policy["independent_instants"]
             mechanism = len(mechanisms) < policy["protection_mechanisms"] and bool(set(features[name]["mechanisms"]) - mechanisms)
             equipment = equipment_theme and equipment_count < 15 and "Equipment" in candidates[name].card["type_line"].split()
-            return (-int(instant), -int(mechanism), -deficit, -int(equipment), -ranks.get(name, 0), -int("theme" in roles[name]), name)
+            return (-int(instant), -int(mechanism), -deficit, -int(equipment), -theme_ranks[name], -ranks.get(name, 0), -int("theme" in roles[name]), name)
         best = min(available, key=score)
         add(best)
         equipment_count += "Equipment" in candidates[best].card["type_line"].split()

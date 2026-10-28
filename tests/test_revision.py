@@ -5,10 +5,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from mtg_agentic.discovery import Candidate
 from mtg_agentic.forge_config import OpponentPod
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.revision import apply_swaps, compare, gate_invariant, revise_deck
-from tests.pipeline_fixtures import JODAH, FakeModel, make_pool, records
+from tests.fixtures import card
+from tests.pipeline_fixtures import FakeModel, make_pool, playable_deck, playable_records
 
 
 def metrics(wins=10, count=50):
@@ -39,9 +41,9 @@ class RevisionTests(unittest.TestCase):
         self.path = Path(temp.name)
         self.store = OracleStore(self.path / "oracle.sqlite3")
         self.addCleanup(self.store.close)
-        self.store.import_cards(records())
+        self.store.import_cards(playable_records())
         self.pool = make_pool(self.store)
-        self.deck = {"commander": JODAH["name"], "bracket": 3, "cards": {"Plains": 99}}
+        self.deck = playable_deck()
         self.proposal = {
             "issues": [
                 {
@@ -51,7 +53,7 @@ class RevisionTests(unittest.TestCase):
                 }
             ],
             "swaps": [
-                {"remove": "Plains", "add": "Spell 0", "reason": "Test one additional spell."}
+                {"remove": "Spell 62", "add": "Spell 69", "reason": "Test another spell."}
             ],
         }
         self.reviewer = Mock()
@@ -83,7 +85,8 @@ class RevisionTests(unittest.TestCase):
         report, _ = self.run_revision(metrics(5), metrics(40))
         self.assertEqual(report["accepted_revisions"], 1)
         self.assertTrue(report["gate_invariant_passed"])
-        self.assertEqual(report["deck"]["cards"]["Spell 0"], 1)
+        self.assertEqual(report["deck"]["cards"]["Spell 69"], 1)
+        self.assertNotIn("Spell 62", report["deck"]["cards"])
         self.assertEqual(self.reviewer.check.call_count, 2)
         self.assertEqual(self.simulator.simulate.call_count, 2)
         self.assertEqual(
@@ -114,7 +117,7 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual(len(model.calls), 0)
 
     def test_illegal_revision_never_reaches_reviewer_or_candidate_simulation(self):
-        self.proposal["swaps"][0]["add"] = "Plains"  # no-op is prohibited
+        self.proposal["swaps"][0]["add"] = "Spell 62"  # no-op is prohibited
         report, _ = self.run_revision(metrics())
         self.assertEqual(report["iterations"][0]["reason"], "revision_gates_failed")
         self.assertEqual(self.simulator.simulate.call_count, 1)
@@ -127,12 +130,28 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual(self.simulator.simulate.call_count, 1)
 
     def test_theme_package_cannot_be_traded_away_for_simulator_wins(self):
-        self.deck["cards"] = {"Plains": 98, "Spell 0": 1}
-        self.proposal["swaps"][0].update(remove="Spell 0", add="Plains")
+        self.store.add_verified_card(card("Off-theme Spell", mana_cost="{2}"))
+        self.pool.cards.append(Candidate(self.store.get_card("Off-theme Spell"), {"support"}))
+        self.proposal["swaps"][0]["add"] = "Off-theme Spell"
         report, _ = self.run_revision(metrics())
         self.assertEqual(report["iterations"][0]["reason"], "revision_gates_failed")
         self.assertEqual(self.simulator.simulate.call_count, 1)
         self.assertEqual(self.reviewer.check.call_count, 1)
+        gates = json.loads(
+            (Path(report["artifact_dir"]) / "0001-gates.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(gates["validation"]["valid"])
+        self.assertTrue(gates["playability"]["valid"])
+        self.assertFalse(gates["theme_package_preserved"])
+
+    def test_unplayable_baseline_never_reaches_reviewer_or_simulator(self):
+        self.deck["cards"] = {"Plains": 99}
+        report, model = self.run_revision()
+        self.assertEqual(report["stop_reason"], "initial_gates_failed")
+        self.assertFalse(report["deck"]["valid"])
+        self.reviewer.check.assert_not_called()
+        self.simulator.simulate.assert_not_called()
+        self.assertEqual(model.calls, [])
 
     def test_unreliable_simulator_stops_before_model_diagnosis(self):
         report, model = self.run_revision(metrics(count=40))

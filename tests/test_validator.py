@@ -77,9 +77,16 @@ class ValidatorTests(unittest.TestCase):
             with self.subTest(deck=deck):
                 report = self.validate(deck)
                 self.assertTrue(report["valid"], report)
+                self.assertEqual(report["cards"], {"Plains": 98, "Sol Ring": 1})
         self.assertTrue(
             DeckValidator(self.store).validate({"Plains": 99}, "Test Commander")["valid"]
         )
+
+    def test_report_has_canonical_maindeck_counts_without_the_commander(self):
+        report = self.validate({" plains ": 98, "PLAINS": 1}, commander="test commander")
+        self.assertTrue(report["valid"], report)
+        self.assertEqual(report["commander"], "Test Commander")
+        self.assertEqual(report["cards"], {"Plains": 99})
 
     def test_card_count_too_small_and_too_large(self):
         for quantity in (98, 100):

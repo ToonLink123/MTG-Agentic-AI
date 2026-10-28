@@ -9,7 +9,7 @@ from mtg_agentic.pipeline import draft_deck
 from mtg_agentic.review import DeckReviewer
 from mtg_agentic.schema import SchemaError
 from tests.fixtures import card
-from tests.pipeline_fixtures import JODAH, FakeCards, FakeModel, draft, make_pool, records
+from tests.pipeline_fixtures import JODAH, FakeCards, FakeModel, draft, make_pool, playable_records
 
 
 class ReviewTests(unittest.TestCase):
@@ -18,8 +18,8 @@ class ReviewTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.store = OracleStore(Path(temp.name) / "oracle.sqlite3")
         self.addCleanup(self.store.close)
-        self.store.import_cards(records())
-        self.client = FakeCards(records())
+        self.store.import_cards(playable_records())
+        self.client = FakeCards(playable_records())
 
     def test_bracket_and_rules_errors_drive_bounded_repair_without_resending_all_evidence(self):
         reviewer = Mock()
@@ -50,13 +50,14 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(feedback["review"]["bracket_reasons"], ["Remove land denial"])
         self.assertEqual(feedback["review"]["interactions"][0]["status"], "unsupported")
         self.assertNotIn("large retrieval", json.dumps(feedback))
+        self.assertIn("large retrieval", json.dumps(result["attempts"][0]["review"]))
 
     def test_illegal_drafts_do_not_spend_review_calls(self):
         reviewer = Mock()
         reviewer.game_changer_names = []
         result = draft_deck(
             make_pool(self.store),
-            FakeModel(draft(62)),
+            FakeModel(draft(commander="Other Commander")),
             self.client,
             self.store,
             reviewer=reviewer,
@@ -130,3 +131,16 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_revision")
         self.assertEqual(result["errors"][0]["error"], "interaction_review")
         self.assertIn("both untapped", service.rules.check_interaction.call_args.args[1])
+
+    def test_new_myojin_review_uses_indestructible_not_divinity_counters(self):
+        self.store.add_verified_card(card(
+            "Myojin of Blooming Dawn",
+            text="Myojin of Blooming Dawn enters with an indestructible counter "
+                 "on it if you cast it from your hand.",
+        ))
+        self.store.add_verified_card(card("Proliferator", text="Proliferate."))
+        service = self.service()
+        service.check({"Myojin of Blooming Dawn": 1, "Proliferator": 1}, JODAH["name"], 3)
+        question = service.rules.check_interaction.call_args.args[1]
+        self.assertIn("indestructible counter", question)
+        self.assertNotIn("divinity counter", question)

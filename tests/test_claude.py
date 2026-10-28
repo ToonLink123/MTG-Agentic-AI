@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 from mtg_agentic import claude
 from mtg_agentic.__main__ import _claude_api_key
 from mtg_agentic.llm import LLMError, request_json
-from mtg_agentic.schema import SPEC_SCHEMA
-from tests.pipeline_fixtures import make_spec
+from mtg_agentic.schema import DRAFT_SCHEMA, SPEC_SCHEMA, SchemaError
+from tests.pipeline_fixtures import draft, make_spec
 
 
 def text(value):
@@ -103,6 +103,25 @@ class ClaudeTests(unittest.TestCase):
             reply(text('{"par'), SimpleNamespace(type="fallback"), text(json.dumps(SPEC)))
         )
         self.assertEqual(client.complete_json([], SPEC_SCHEMA), SPEC)
+
+    def test_large_repeated_bucket_enums_are_wire_only_and_checked_after_retry(self):
+        import copy
+
+        schema = copy.deepcopy(DRAFT_SCHEMA)
+        names = [f"Spell {n}" for n in range(350)]
+        for bucket in schema["properties"]["buckets"]["properties"].values():
+            bucket["items"] = {"type": "string", "enum": names}
+        invalid = draft()
+        invalid["buckets"]["support"] = ["Invented Card"]
+        client, stream = fake_client(
+            reply(text(json.dumps(invalid))), reply(text(json.dumps(invalid))),
+        )
+        with self.assertRaises(SchemaError):
+            client.complete_json([], schema)
+        sent = stream.call_args.kwargs["output_config"]["format"]["schema"]
+        self.assertNotIn("enum", sent["properties"]["buckets"]["properties"]["support"]["items"])
+        self.assertEqual(schema["properties"]["buckets"]["properties"]["support"]["items"]["enum"], names)
+        self.assertEqual(stream.call_count, 2)
 
     def test_refusal_and_truncation_are_errors(self):
         for stop_reason in ("refusal", "max_tokens"):

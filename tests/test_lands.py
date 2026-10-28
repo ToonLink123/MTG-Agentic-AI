@@ -187,7 +187,9 @@ class LandTests(unittest.TestCase):
         self.assertNotIn("Simic Guildgate", result["cards"])
 
     def test_draft_repairs_land_dependencies_without_an_llm_land_selection(self):
-        leader = card("Simic Leader", colors="UG", types="Legendary Creature — Elf")
+        leader = card(
+            "Simic Leader", colors="UG", types="Legendary Creature — Elf", mana_cost="{G}{U}"
+        )
         spells = []
         for n in range(70):
             types, text = "Artifact", ""

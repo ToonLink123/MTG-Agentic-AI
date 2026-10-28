@@ -253,7 +253,11 @@ def deterministic_signals(cards: list[tuple[Card, int]], gc_names: list[str]) ->
         if name_key(name) in _MLD_NAMES or (land_reset and not replaces):
             signals["mass_land_denial"].append(item)
         elif land_reset or re.search(
-            r"(?:lands.*(?:untap|produce)|sacrifices? .*lands|destroy .*lands)", text
+            r"\b(?:lands|plains|islands|swamps|mountains|forests)\b[^.\n]*"
+            r"(?:can't|cannot|don't|do not)[^.\n]*(?:untap|produce)|"
+            r"\b(?:each|target) (?:player|opponent)\b[^.\n]*sacrifices?[^.\n]*\blands?\b|"
+            r"\bdestroy (?:all |each |(?:up to )?(?:two|three|four|five|\d+) target )"
+            r"[^.\n]*\blands?\b", text
         ):
             signals["land_denial_candidates"].append(item)
         if re.search(r"(?:extra|additional) turns?\b", text):

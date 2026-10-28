@@ -22,9 +22,10 @@ from .forge_cli import run_command as run_forge_command
 from .forge_config import OpponentPod
 from .forge_metrics import summarize
 from .forge_runner import ForgeSimulator
+from .lands import generate_mana_base, is_land
 from .llm import LLMError, OllamaClient, OpenAICompatibleClient
 from .oracle import DEFAULT_DATA_DIR, OracleStore
-from .pipeline import build_deck, discover, draft_deck
+from .pipeline import build_deck, discover, draft_deck, draft_from_request
 from .playability import spec_for_deck, validate_playability
 from .review import DeckReviewer
 from .revision import revise_deck
@@ -206,6 +207,12 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--commander", help="Required for text decks")
     validate.add_argument("--bracket", type=int, choices=range(1, 6))
     validate.add_argument("--playability", action="store_true", help="Also check mana and roles (automatic for JSON artifacts containing a spec)")
+    mana_base = commands.add_parser(
+        "mana-base", help="Generate only lands from a finished spell list, without an LLM or HTTP"
+    )
+    mana_base.add_argument("deck", type=Path, help="JSON with commander, cards, and optional spec")
+    mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec)")
+    mana_base.add_argument("--output", type=Path, help="Write the mana-base report to a NEW file")
     commands.add_parser("spec-schema", help="Print the fixed intake JSON schema")
     intake_cmd = commands.add_parser("intake", help="Ground preferences in fetched commander text")
     intake_cmd.add_argument("--commander", required=True)
@@ -230,13 +237,13 @@ def main(argv: list[str] | None = None) -> int:
     _embedding_options(draft_cmd)
     _model_options(draft_cmd)
     build_cmd = commands.add_parser(
-        "build", help="Run intake -> discovery -> draft (no simulation)"
+        "build", help="Draft, pass safety reviews, then complete at least 10 Forge games per pod"
     )
     build_cmd.add_argument("--commander", required=True)
     build_cmd.add_argument("--request", required=True)
     build_cmd.add_argument("--pool-limit", type=int, default=350)
     build_cmd.add_argument("--repairs", type=int, choices=range(4), default=3)
-    build_cmd.add_argument("--skip-review", action="store_true")
+    _simulation_options(build_cmd, required=True)
     _embedding_options(build_cmd)
     _model_options(build_cmd)
     download_rules = commands.add_parser(
@@ -299,6 +306,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "spec-schema":
             _emit(SPEC_SCHEMA)
             return 0
+        if args.command == "mana-base":
+            if args.output is not None and args.output.exists():
+                raise ValueError("Output already exists; choose a new filename")
+            with OracleStore(args.data_dir / "oracle.sqlite3") as store:
+                if not store.ready:
+                    raise ValueError("Run download-oracle first")
+                deck = _deck_json(args.deck)
+                data = spec_for_deck(deck, store).to_dict()
+                if args.lands is not None or "spec" not in deck:
+                    data["role_targets"]["lands"] = args.lands if args.lands is not None else 36
+                spells, land_names = {}, []
+                for name, quantity in deck["cards"].items():
+                    card = store.get_card(name)
+                    if card is None or type(quantity) is not int or quantity <= 0:
+                        raise ValueError("Deck cards must have known names and positive integer quantities")
+                    if is_land(card):
+                        land_names.append(card["name"])
+                    else:
+                        spells[card["name"]] = spells.get(card["name"], 0) + quantity
+                result = generate_mana_base(
+                    spells, DeckSpec.from_dict(data), store, candidate_names=land_names
+                )
+                _emit(result, args.output)
+                return 0 if result["valid"] else 1
         if args.command == "evaluation-history":
             _emit(evaluation_history(args.runs_dir))
             return 0
@@ -411,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
                     elif args.pod:
                         raise ValueError("--pod requires --forge-home")
                     result = run_evaluation(
-                        lambda case: build_deck(
+                        lambda case: draft_from_request(
                             case["request"],
                             case["commander"],
                             model,
@@ -453,7 +484,12 @@ def main(argv: list[str] | None = None) -> int:
                 if not store.ready:
                     raise ValueError("Run download-oracle before using the LLM pipeline")
                 reviewer = None
-                if args.command in {"draft", "build"} and not args.skip_review:
+                simulator, pods = (None, [])
+                if args.command == "build":
+                    if args.games < 10:
+                        raise ValueError("A build requires at least 10 games per opponent pod")
+                    simulator, pods = _simulation(args, store)
+                if args.command == "build" or (args.command == "draft" and not args.skip_review):
                     reviewer = _reviewer(args, stack, store, client, model)
                 if args.command == "intake":
                     result = intake(args.request, args.commander, model, client, store).to_dict()
@@ -479,6 +515,10 @@ def main(argv: list[str] | None = None) -> int:
                         pool_limit=args.pool_limit,
                         max_repairs=args.repairs,
                         reviewer=reviewer,
+                        simulator=simulator,
+                        pods=pods,
+                        games=args.games,
+                        seed=args.seed,
                     )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
@@ -502,7 +542,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = validate_deck(decklist, commander, store, bracket=bracket)
                 result["scope"] = "Commander legality only, not playability or safety approval"
                 if result["valid"] and (args.playability or (deck and "spec" in deck)):
-                    actual = {"commander": commander, "bracket": bracket, "cards": result["cards"]}
+                    actual = {"commander": result["commander"], "bracket": bracket, "cards": result["cards"]}
                     if deck and "spec" in deck:
                         actual["spec"] = deck["spec"]
                     playability = validate_playability(actual["cards"], spec_for_deck(actual, store, bracket=bracket), store)

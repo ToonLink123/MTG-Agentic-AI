@@ -45,12 +45,14 @@ class DeckReviewer:
         jobs: list[tuple[list[str], str]] = []
         jodah = name_key(commander) == name_key("Jodah, Archmage Eternal")
         for name in myojin:
+            card = next(c for c in records if c and c["name"] == name)
+            counter = "indestructible" if "indestructible counter" in card["oracle_text"].lower() else "divinity"
             involved = ([commander] if jodah else []) + [name] + proliferators[:1]
             jobs.append(
                 (
                     involved,
                     (
-                        f"For {name}, identify exactly when it enters with a divinity counter. "
+                        f"For {name}, identify exactly when it enters with a {counter} counter. "
                         + (
                             "Does paying Jodah's alternate cost while casting from hand preserve that "
                             "condition, and does casting from another zone or putting it onto the "
@@ -59,7 +61,7 @@ class DeckReviewer:
                             else ""
                         )
                         + (
-                            "Can proliferate add a divinity counter if none is already present, "
+                            f"Can proliferate add a {counter} counter if none is already present, "
                             "and can it add another while one remains? "
                             if proliferators
                             else ""

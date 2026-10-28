@@ -136,6 +136,8 @@ def intake(
                 "Copy commander name and color identity from it; never guess Oracle abilities. "
                 "Use WUBRG order, or C for colorless. One commander only. "
                 "Infer themes/mechanics from the request and actual Oracle text, not invented abilities. "
+                "Do not add secondary token, +1/+1-counter, poison, or other strategies unless requested. "
+                "A thematic card's incidental output is not permission to broaden the user's win conditions. "
                 "Do not invent must_include cards. Leave unspecified include/exclude lists empty. "
                 "Default bracket 3, playstyle midrange value, and role targets "
                 "ramp=10, draw=10, removal=8, wipes=3, lands=36, creatures=15. "

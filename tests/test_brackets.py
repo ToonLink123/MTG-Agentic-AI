@@ -148,6 +148,38 @@ class BracketTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "fits")
         self.assertEqual(len(checker.model.calls), 1)
 
+    def test_fetch_land_sacrifice_and_untap_are_not_land_denial(self):
+        self.store.add_verified_card(card(
+            "Fabled Passage", types="Land",
+            text="{T}, Sacrifice this land: Search your library for a basic land card, "
+                 "put it onto the battlefield tapped, then shuffle. Then if you control "
+                 "four or more lands, untap that land.",
+        ))
+        report = self.checker().check({"Fabled Passage": 1}, JODAH["name"], 3)
+        self.assertEqual(report["signals"]["land_denial_candidates"], [])
+        self.assertEqual(report["verdict"], "fits")
+
+    def test_real_opponent_land_sacrifice_and_untap_locks_remain_candidates(self):
+        for text in (
+            "Each opponent sacrifices two lands.",
+            "Lands your opponents control don't untap during their untap steps.",
+            "Destroy up to two target lands.",
+        ):
+            with self.subTest(text=text):
+                report = deterministic_signals([(validation_card(card("Denial", text=text)), 1)], [])
+                self.assertEqual(len(report["land_denial_candidates"]), 1)
+
+    def test_single_target_land_removal_is_not_mass_land_denial(self):
+        self.store.add_verified_card(card(
+            "Boseiju, Who Endures", types="Legendary Land",
+            text="Channel — {1}{G}, Discard this card: Destroy target artifact, enchantment, "
+                 "or nonbasic land an opponent controls. That player may search their library "
+                 "for a land card with a basic land type and put it onto the battlefield.",
+        ))
+        report = self.checker().check({"Boseiju, Who Endures": 1}, JODAH["name"], 3)
+        self.assertEqual(report["signals"]["land_denial_candidates"], [])
+        self.assertEqual(report["verdict"], "fits")
+
     def test_fresh_list_overrides_snapshot_and_counts_commander(self):
         self.client.search_cards.return_value = [{"name": JODAH["name"]}]
         result = self.checker(assessment(estimated_bracket=2)).check(

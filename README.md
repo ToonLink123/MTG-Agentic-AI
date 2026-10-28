@@ -2,7 +2,7 @@
 
 Scryfall-backed discovery, local-LLM deck drafting, and deterministic Commander
 validation, with bracket review and citation-required interaction checks.
-Optional local Forge simulation adds measured outcomes and gated revisions.
+Completed builds require local Forge gameplay runs; untested drafting remains separate.
 Python 3.10+, no runtime dependencies. Ollama runs locally without an API key;
 the legality validator and land allocation never use an LLM.
 
@@ -74,7 +74,7 @@ To skip intake while testing discovery, use the checked-in
 `examples/jodah-spec.json` as `--spec`. For the complete pipeline in one command:
 
 ```powershell
-python -m mtg_agentic build --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal with divinity counters and proliferate" --output .cache/jodah-build.json
+python -m mtg_agentic build --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal with divinity counters and proliferate" --forge-home .cache/forge-2.0.15/app --pod examples/forge-pod.json --output .cache/jodah-build.json
 ```
 
 `--output` writes UTF-8 JSON to a **new** file and prints a small summary. Existing
@@ -104,8 +104,9 @@ Long draft calls can take minutes on CPU.
 
 `SPEC_SCHEMA` in `mtg_agentic/schema.py` is the fixed JSON contract. It requires
 exactly the requested fields: commander, color_identity, bracket, themes,
-mechanics, win_conditions, playstyle, must_include, exclude, and role_targets.
-Color identity uses WUBRG order, or `C` for colorless. All five role targets are
+mechanics, win_conditions, playstyle, commander_dependency, must_include,
+exclude, and role_targets.
+Color identity uses WUBRG order, or `C` for colorless. All seven role targets are
 required integers from 0 to 99. Missing/extra fields, wrong types, duplicate
 keys, invalid identities, and conflicting constraints are rejected in code.
 
@@ -135,46 +136,92 @@ bounded to 500 results by default, sorted by EDHREC; diagnostics disclose when
 that limit is reached. Saved pools contain only trimmed fields plus role tags
 and are rechecked against the local store when loaded.
 
-The model selects `99 - role_targets.lands` **nonland** cards. Code supplies the
+The model selects **nonland** preferences in role buckets. Code deduplicates
+overlapping choices, pads or trims to `99 - role_targets.lands`, and supplies the
 commander and land base. It then checks:
 
 1. Strict draft JSON shape and exact commander.
-2. Every nonland is in the pool or passes exact `get_card(..., fuzzy=False)`.
-   A different/fuzzy name is rejected, never silently substituted. Exact new
-   cards are indexed locally with rule fields before validation. Outside-pool
-   lookups are capped at 12 for the entire loop and provide no role credit.
+2. Every selected name is an exact nonland name from the locally rechecked pool.
+   Unknown, outside-pool, excluded and land names fail the selection schema;
+   drafting never performs HTTP lookups to verify a new model-proposed card.
 3. All existing deck-validator checks.
-4. Required/excluded cards and minimum role counts. A card with several tags can
-   count toward several roles; the land count is exact.
+4. Required/excluded cards and Oracle-grounded minimum role counts. A card with
+   several actual functions can count toward several roles; query tags alone
+   do not grant functional-role credit. The land count is exact.
 
-Errors go back to the model as JSON, with the previous draft, for up to **three
+Errors go back to the model as JSON, with the previous buckets and compact
+safety-review findings (not full retrieved evidence), for up to **three
 repairs after the initial draft**. Exhaustion returns `valid: false`, the last
 deck, and all errors, not an unverified success. Drafts include attempt history,
-role counts, query diagnostics, verification records, and land-base details.
+role counts, query diagnostics, complete review records, and land-base details.
 They can also be passed directly to the existing `validate` command.
 
 CLI `draft`/`build` now also run bracket and rules safety reviews by default.
 Uncertain, mismatched, unsupported or contradicted findings enter the repair loop.
-`--skip-review` explicitly opts out and leaves `review.status: "not_run"` and
+On `draft` only, `--skip-review` explicitly opts out and leaves `review.status: "not_run"` and
 `review_passed: false`. First-time rules embedding and interaction calls can take
 several minutes on CPU. `validate` remains a narrower offline snapshot check; it
 does not rerun safety review. Library functions retain injectable, network-free
-defaults: pass a `DeckReviewer` to enable reviews, as shown below.
+drafts: pass a `DeckReviewer` to enable reviews, as shown below.
+
+`build` cannot skip safety reviews. It requires `--forge-home` and one to three
+pinned `--pod` configs, and completes 10 games per pod by default (`--games` may
+increase this, but cannot be below 10). A build succeeds only after all safety
+gates pass and every requested game completes cleanly. Timeouts, unsupported
+cards, engine errors, and missing configuration are not successes. Reports retain
+the parsed metrics and raw-log artifact directory for each pod. Ten games are a
+smoke test, not evidence of competitive strength. Library `build_deck` likewise
+requires a reviewer, simulator and opponent pods; `draft_from_request` is the
+explicit intake/discovery/draft-only helper.
+
+Myojin support is ranked for the requested counter/proliferate engine rather than
+generic token or +1/+1-counter payoffs. Those secondary packages are not inferred
+merely from a Myojin's incidental outputs; explicitly requested packages remain allowed.
 
 ### Deterministic land base
 
-Code counts colored/colorless mana pips, weights mana-value-2-or-less spells
-three times and mana-value-3/4 spells twice, includes the commander, and splits
-hybrid demand. Largest-remainder allocation sets color-source targets. Required
-lands are pinned; eligible multicolor lands address source deficits, and basic
-lands fill the remaining slots. Nonbasics remain singleton, exclusions apply,
-and optional Game Changer lands respect the remaining bracket allowance.
+Mana-base generation is a separate, deterministic stage after nonland assembly.
+It needs no LLM, HTTP calls, or candidate pool. The draft pipeline runs it
+automatically; to generate only a mana base from a JSON spell list or saved deck:
 
-Discovery reserves locally verified original duals, shock lands, and fetch lands,
-without relying on the model's queries. Allocation also checks these options for
-older saved pools. Untapped duals outrank otherwise equivalent tapped lands;
-shock lands are recognized as able to enter untapped. These choices do not use
-prices or ownership, so exclude expensive cards when needed.
+```powershell
+python -m mtg_agentic mana-base spells.json --lands 36 --output .cache/mana-base.json
+```
+
+Input uses `{"commander": "Commander Name", "cards": {"Spell Name": 1}}`.
+An optional saved `spec` preserves inclusions, exclusions, bracket and land count.
+Without a spec, the default is 36 lands; `--lands` overrides either default.
+Existing lands are options for rebuilding, not fixed quantities. Output is a
+separate lands-only report; the input file is never changed. In Python, call
+`generate_mana_base(spells, spec, store)` with a `DeckSpec` and local `OracleStore`.
+
+Code counts colored/colorless casting pips from the nonlands and commander,
+plus recognized activated and alternate costs. Mana-value-2-or-less spells
+receive three times the weight and mana-value-3/4 spells twice. Hybrid demand
+is split; Phyrexian and two-generic hybrid pips receive reduced weight. Generic
+costs such as `{3}` do not create a need for explicit `{C}` sources.
+Largest-remainder allocation sets color-source targets.
+
+- **Multicolor demand:** eligible rainbow lands such as Command Tower, duals,
+  shocks and fetches address color-source deficits. Basics fill the remaining
+  slots, favoring the colors with heavier pip demand.
+  With three or more demanded colors, each color's source target is at least
+  half the land count, rather than stopping at the legality/playability floor.
+- **Monocolor demand:** prefer basics and up to four utility lands. Optional
+  colored utility must match the demanded color; colorless utility is allowed
+  when enough colored sources remain. Rainbow lands are not added for fixing.
+- **Colorless demand:** use Wastes and eligible colorless utility.
+
+Unused commander-identity colors do not create demand. If no casting or
+recognized ability pips exist, the commander identity supplies a fallback.
+Required lands are pinned, even when they override the optional-land preference.
+Nonbasics remain singleton, exclusions apply, and optional Game Changer lands
+respect the remaining bracket allowance.
+
+The generator loads locally verified premium and utility options independently
+of discovery or saved-pool coverage. Untapped duals outrank otherwise equivalent
+tapped lands; shock lands are recognized as able to enter untapped. These
+choices do not use prices or ownership, so exclude expensive cards when needed.
 
 Land-search targets are checked against the actual deck's Oracle land types.
 Nature's Lore can find a Forest-typed dual or shock land, but not Command Tower;
@@ -182,8 +229,10 @@ basic-land searches cannot find nonbasic duals. Allocation retains matching
 targets before filling the remaining slots. Fetches only count the colors their
 actual targets can supply, and a search without a matching target fails validation.
 
-The report contains weighted pips, source targets, potential sources, and
-warnings. It uses front-face costs, pool lands, and local premium-land options. It is a simple
+The report contains raw and weighted pips, demand shares, the mono/multicolor/
+colorless strategy, land-selection reasons, source targets, potential sources,
+and warnings. It uses front-face costs and recognized Oracle cost patterns, not
+every possible alternative way to play a card. It is a simple
 heuristic, **not an exact Frank Karsten probability model**, an optimized mana
 base, or a simulation. Fetch/conditional lands are only potential sources;
 untapped timing, all activation restrictions, snow requirements, and affordability
@@ -195,7 +244,7 @@ Ollama is always the default. To explicitly use a compatible hosted API later:
 
 ```powershell
 # Set MTG_LLM_API_KEY securely in your environment, not in a checked-in file.
-python -m mtg_agentic build --provider openai-compatible --model YOUR_MODEL --commander "Jodah, Archmage Eternal" --request "Myojin tribal"
+python -m mtg_agentic build --provider openai-compatible --model YOUR_MODEL --commander "Jodah, Archmage Eternal" --request "Myojin tribal" --forge-home .cache/forge-2.0.15/app --pod examples/forge-pod.json
 ```
 
 Use `--llm-url https://your-provider.example/v1` for another compatible endpoint.
@@ -212,7 +261,7 @@ instead of a local model:
 ```powershell
 pip install -e ".[claude]"
 # Put CLAUDE_API=sk-ant-... in the git-ignored .env file, or set CLAUDE_API in the environment.
-python -m mtg_agentic build --provider claude --commander "Jodah, Archmage Eternal" --request "Myojin tribal" --output .cache/jodah-claude.json
+python -m mtg_agentic build --provider claude --commander "Jodah, Archmage Eternal" --request "Myojin tribal" --forge-home .cache/forge-2.0.15/app --pod examples/forge-pod.json --output .cache/jodah-claude.json
 ```
 
 The model defaults to `claude-haiku-5-5`; pass `--model` for another Claude model,
@@ -225,7 +274,7 @@ Fable requests opt into server-side fallback, so a safety-classifier decline is
 retried on Anthropic's recommended model; Haiku 5.5 has no fallback, so a decline is
 reported as an error. Claude has no `temperature 0`, so runs are not deterministic.
 Rules embeddings stay local: review commands still use Ollama unless you pass
-`--embedding-backend hash` or `--skip-review`.
+`--embedding-backend hash` (or `--skip-review` for an explicitly untested `draft`).
 
 LLM commands report progress on stderr while stdout stays JSON: each pipeline stage,
 a live line per Claude call showing its reasoning summary or output size, each

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import shutil
@@ -21,6 +22,19 @@ except ImportError:  # Optional dependency; only this provider needs it.
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 # Haiku 5.5 bills prompts above this size on its higher rate card.
 HAIKU_TIER_TOKENS = 100_000
+
+
+def _wire_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Avoid compiling the same large card-name enum into every role bucket."""
+    result = copy.deepcopy(schema)
+    buckets = result.get("properties", {}).get("buckets", {}).get("properties", {})
+    for bucket in buckets.values():
+        if "enum" in bucket.get("items", {}):
+            bucket["items"] = {
+                "type": "string",
+                "description": "An exact nonland card name from the supplied candidate pool; checked locally.",
+            }
+    return result
 
 
 class ClaudeClient:
@@ -73,7 +87,9 @@ class ClaudeClient:
                     }
                 ),
             }
-            return load_json(self._ask([*messages, retry], schema))
+            result = load_json(self._ask([*messages, retry], schema))
+            validate_json(result, schema)
+            return result
 
     def _ask(self, messages: list[Message], schema: dict[str, Any]) -> str:
         # Leading system messages become the system prompt; the rest are conversation turns.
@@ -83,7 +99,7 @@ class ClaudeClient:
         output_config = {
             "effort": self.effort,
             # Unsupported constraints move into descriptions; they are validated locally.
-            "format": {"type": "json_schema", "schema": anthropic.transform_schema(schema)},
+            "format": {"type": "json_schema", "schema": anthropic.transform_schema(_wire_schema(schema))},
         }
         fallback = (
             {"betas": ["server-side-fallback-2026-07-01"], "extra_body": {"fallbacks": "default"}}

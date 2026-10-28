@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from mtg_agentic.__main__ import main
 from mtg_agentic.oracle import OracleStore
-from tests.pipeline_fixtures import FakeModel, draft, make_pool, records
+from tests.pipeline_fixtures import FakeModel, draft, make_pool, playable_deck, playable_records
 
 
 class ReviewCliTests(unittest.TestCase):
@@ -17,16 +17,12 @@ class ReviewCliTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.path = Path(temp.name)
         with OracleStore(self.path / "oracle.sqlite3") as store:
-            store.import_cards(records())
+            store.import_cards(playable_records())
             self.pool = make_pool(store).to_dict()
         self.pool_path = self.path / "pool.json"
         self.pool_path.write_text(json.dumps(self.pool))
         self.deck = self.path / "deck.json"
-        self.deck.write_text(
-            json.dumps(
-                {"commander": "Jodah, Archmage Eternal", "cards": {"Plains": 99}, "bracket": 3}
-            )
-        )
+        self.deck.write_text(json.dumps(playable_deck()))
 
     def run_cli(self, *args):
         output = io.StringIO()
@@ -73,6 +69,20 @@ class ReviewCliTests(unittest.TestCase):
         code, result = self.run_cli("review-deck", str(self.deck))
         self.assertEqual(code, 0)
         self.assertTrue(result["validation"]["valid"])
+        self.assertTrue(result["playability"]["valid"])
+        reviewer.return_value.check.assert_called_once()
+
+    @patch("mtg_agentic.__main__._reviewer")
+    @patch("mtg_agentic.__main__._make_model")
+    def test_unplayable_deck_cannot_reach_safety_review(self, model, reviewer):
+        reviewer.return_value.game_changer_names = []
+        self.deck.write_text(json.dumps(playable_deck(cards={"Plains": 99})))
+        code, result = self.run_cli("review-deck", str(self.deck))
+        self.assertEqual(code, 1)
+        self.assertTrue(result["validation"]["valid"])
+        self.assertFalse(result["playability"]["valid"])
+        self.assertFalse(result["valid"])
+        reviewer.return_value.check.assert_not_called()
 
     @patch("mtg_agentic.__main__.RulesStore")
     @patch("mtg_agentic.__main__._make_model")

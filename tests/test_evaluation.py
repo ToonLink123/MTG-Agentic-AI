@@ -7,7 +7,8 @@ from unittest.mock import Mock
 
 from mtg_agentic.evaluation import CASES, evaluation_history, run_evaluation, score_case
 from mtg_agentic.oracle import OracleStore
-from tests.fixtures import WASTES, card
+from tests.fixtures import card
+from tests.pipeline_fixtures import playable_deck, playable_records
 
 
 class EvaluationTests(unittest.TestCase):
@@ -17,7 +18,7 @@ class EvaluationTests(unittest.TestCase):
         self.path = Path(temp.name)
         self.store = OracleStore(self.path / "oracle.sqlite3")
         self.addCleanup(self.store.close)
-        data, self.decks = [WASTES], {}
+        data, self.decks = playable_records(), {}
         for case in CASES:
             commander = card(case["commander"], types="Legendary Creature — Human", colors="WUBRG")
             data.append(commander)
@@ -33,11 +34,15 @@ class EvaluationTests(unittest.TestCase):
                     n, text = f"Vanilla Test {i}", ""
                 names.append(n)
                 data.append(card(n, types="Creature — Spirit", text=text))
+            cards = playable_deck()["cards"]
+            for number in range(55, 63):
+                del cards[f"Spell {number}"]
+            cards.update(dict.fromkeys(names, 1))
             self.decks[case["id"]] = {
                 "valid": True,
                 "bracket": case["bracket"],
                 "commander": case["commander"],
-                "cards": {**dict.fromkeys(names, 1), "Wastes": 91},
+                "cards": cards,
                 "review": {
                     "status": "passed",
                     "bracket": {
@@ -62,7 +67,7 @@ class EvaluationTests(unittest.TestCase):
 
     def test_claimed_validity_is_independently_rechecked(self):
         deck = self.runner(CASES[0])
-        deck["cards"]["Wastes"] -= 1
+        deck["cards"]["Plains"] -= 1
         result = score_case(CASES[0], deck, self.store)
         self.assertFalse(result["validator_pass"])
         self.assertFalse(result["passed"])
@@ -70,12 +75,12 @@ class EvaluationTests(unittest.TestCase):
     def test_theme_shortfall_and_missing_poison_seed_sources_fail(self):
         deck = self.runner(CASES[0])
         del deck["cards"]["Myojin Test 7"]
-        deck["cards"]["Wastes"] += 1
+        deck["cards"]["Spell 62"] = 1
         result = score_case(CASES[0], deck, self.store)
         self.assertFalse(result["theme_pass"])
         self.assertEqual(result["theme_count"], 7)
         for n in self.decks["poison"]["cards"]:
-            if n != "Wastes":
+            if n.startswith("Poison Test "):
                 self.store.add_verified_card(card(n, text="Proliferate."))
         result = score_case(CASES[1], self.runner(CASES[1]), self.store)
         self.assertEqual(result["theme_count"], 8)

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from mtg_agentic.cards import trim_card
 from mtg_agentic.oracle import OracleStore
-from mtg_agentic.pipeline import build_deck, draft_deck
+from mtg_agentic.pipeline import draft_deck, draft_from_request
 from tests.fixtures import card
 from tests.pipeline_fixtures import (
     JODAH,
@@ -15,7 +15,7 @@ from tests.pipeline_fixtures import (
     draft,
     make_pool,
     make_spec,
-    records,
+    playable_records,
 )
 
 
@@ -25,7 +25,7 @@ class PipelineTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.store = OracleStore(Path(self.directory.name) / "oracle.sqlite3")
         self.addCleanup(self.store.close)
-        self.records = records()
+        self.records = playable_records()
         self.store.import_cards(self.records)
         self.client = FakeCards(self.records)
 
@@ -51,13 +51,13 @@ class PipelineTests(unittest.TestCase):
 
     def test_unknown_names_fail_immediately_then_json_errors_drive_repair(self):
         bad = draft()
-        bad["cards"][-1]["name"] = "Invented Card"
+        bad["buckets"]["support"][-1] = "Invented Card"
         model = FakeModel(bad, draft())
         result = self.run_draft(model)
         self.assertTrue(result["valid"], result)
         repair = json.loads(model.calls[1][0][-1]["content"])
-        self.assertIn("unknown_card", {error["error"] for error in repair["errors"]})
-        self.assertEqual(self.client.get_calls, [("Invented Card", False)])
+        self.assertIn("schema", {error["error"] for error in repair["errors"]})
+        self.assertEqual(self.client.get_calls, [])
         self.assertEqual(len(result["attempts"]), 2)
 
     def test_schema_errors_also_get_repair(self):
@@ -65,102 +65,129 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(result["valid"], result)
         self.assertIn("schema", {error["error"] for error in result["attempts"][0]["errors"]})
 
-    def test_known_out_of_pool_cards_require_exact_get_card(self):
+    def test_known_out_of_pool_cards_are_rejected_without_http(self):
         extra = card("Outside Pool", colors="U", mana_cost="{U}")
         self.store.import_cards([*self.records, extra])
         self.client = FakeCards([*self.records, extra])
         chosen = draft()
-        chosen["cards"][-1]["name"] = extra["name"]
-        result = self.run_draft(FakeModel(chosen))
-        self.assertTrue(result["valid"], result)
-        self.assertEqual(self.client.get_calls, [("Outside Pool", False)])
-        self.assertEqual(result["verified_additions"], ["Outside Pool"])
+        chosen["buckets"]["support"][-1] = extra["name"]
+        result = self.run_draft(FakeModel(chosen), max_repairs=0)
+        self.assertFalse(result["valid"])
+        self.assertIn("schema", {error["error"] for error in result["validation"]["errors"]})
+        self.assertEqual(self.client.get_calls, [])
+        self.assertEqual(result["verified_additions"], [])
 
-    def test_new_exact_api_card_is_persisted_before_local_validation(self):
+    def test_new_api_card_cannot_bypass_pool_or_modify_local_snapshot(self):
         extra = card("New Real Card", colors="U", mana_cost="{U}")
         self.client = FakeCards([*self.records, extra])
         chosen = draft()
-        chosen["cards"][-1]["name"] = extra["name"]
-        result = self.run_draft(FakeModel(chosen))
-        self.assertTrue(result["valid"], result)
-        self.assertIsNotNone(self.store.get_card(extra["name"]))
-        self.assertIn(extra["name"], self.store.metadata["verified_cards"])
+        chosen["buckets"]["support"][-1] = extra["name"]
+        result = self.run_draft(FakeModel(chosen), max_repairs=0)
+        self.assertFalse(result["valid"])
+        self.assertIsNone(self.store.get_card(extra["name"]))
+        self.assertEqual(self.client.get_calls, [])
 
     def test_fuzzy_or_different_named_api_response_never_silently_replaces_invention(self):
         bad = draft()
-        bad["cards"][-1]["name"] = "Invented Card"
-        with patch.object(self.client, "get_card", return_value=trim_card(self.records[7])):
+        bad["buckets"]["support"][-1] = "Invented Card"
+        with patch.object(self.client, "get_card", return_value=trim_card(self.records[7])) as get:
             result = self.run_draft(FakeModel(bad), max_repairs=0)
+        get.assert_not_called()
         self.assertFalse(result["valid"])
-        self.assertIn("unknown_card", {error["error"] for error in result["validation"]["errors"]})
+        self.assertIn("schema", {error["error"] for error in result["validation"]["errors"]})
         self.assertIsNone(self.store.get_card("Invented Card"))
 
     def test_exclusions_and_required_cards_are_enforced(self):
-        for spec, error in (
-            (make_spec(must_include=["Spell 69"]), "must_include"),
-            (make_spec(exclude=["Spell 69"]), "excluded_card"),
-        ):
-            pool = make_pool(self.store, spec)
-            if error == "excluded_card":
-                pool.cards = [
-                    candidate for candidate in pool.cards if candidate.card["name"] != "Spell 69"
-                ]
-                chosen = draft()
-                chosen["cards"][-1]["name"] = "Spell 69"
-            else:
-                chosen = draft()
-            result = self.run_draft(FakeModel(chosen), pool=pool, max_repairs=0)
-            self.assertIn(error, {e["error"] for e in result["validation"]["errors"]})
+        pool = make_pool(self.store, make_spec(must_include=["Spell 69"]))
+        result = self.run_draft(FakeModel(draft()), pool=pool, max_repairs=0)
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["cards"]["Spell 69"], 1)
+        pool = make_pool(self.store, make_spec(exclude=["Spell 69"]))
+        pool.cards = [c for c in pool.cards if c.card["name"] != "Spell 69"]
+        chosen = draft()
+        chosen["buckets"]["support"][-1] = "Spell 69"
+        result = self.run_draft(FakeModel(chosen), pool=pool, max_repairs=0)
+        self.assertFalse(result["valid"])
+        self.assertIn("schema", {e["error"] for e in result["validation"]["errors"]})
 
     def test_role_minimums_are_checked_in_code(self):
+        sparse = [
+            dict(raw, oracle_text="", type_line="Artifact")
+            if raw["name"].startswith("Spell ") else raw
+            for raw in self.records
+        ]
+        self.store.import_cards(sparse)
         pool = make_pool(self.store)
-        for candidate in pool.cards:
-            candidate.roles &= {"theme", "lands"}
         result = self.run_draft(FakeModel(draft()), pool=pool, max_repairs=0)
         self.assertFalse(result["valid"])
         self.assertIn("role_target", {e["error"] for e in result["validation"]["errors"]})
 
     def test_repair_limit_is_initial_draft_plus_at_most_three_repairs(self):
         bad = draft()
-        bad["cards"][-1]["name"] = "Spell 0"
+        bad["buckets"]["support"][-1] = "Unknown"
         model = FakeModel(bad, bad, bad, bad)
         result = self.run_draft(model)
         self.assertFalse(result["valid"])
         self.assertEqual(len(model.calls), 4)
         self.assertEqual(len(result["attempts"]), 4)
-        self.assertIn("singleton", {e["error"] for e in result["validation"]["errors"]})
+        self.assertIn("schema", {e["error"] for e in result["validation"]["errors"]})
 
-    def test_negative_verifications_are_reused_and_budget_is_bounded(self):
+    def test_pool_only_drafting_never_spends_the_legacy_verification_budget(self):
         bad = draft()
-        bad["cards"][-1]["name"] = "Unknown"
+        bad["buckets"]["support"][-1] = "Unknown"
         result = self.run_draft(FakeModel(bad, bad, bad, bad))
         self.assertFalse(result["valid"])
-        self.assertEqual(len(self.client.get_calls), 1)
-        self.client.get_calls.clear()
+        self.assertEqual(self.client.get_calls, [])
         result = self.run_draft(FakeModel(bad), max_repairs=0, max_verifications=0)
-        self.assertIn("verification_budget", {e["error"] for e in result["validation"]["errors"]})
+        self.assertIn("schema", {e["error"] for e in result["validation"]["errors"]})
         self.assertEqual(self.client.get_calls, [])
 
     def test_land_and_commander_choices_cannot_override_code_policy(self):
         bad = draft(commander="Other Commander")
-        bad["cards"][-1]["name"] = "Plains"
+        bad["buckets"]["support"][-1] = "Plains"
         result = self.run_draft(FakeModel(bad, draft()))
         self.assertTrue(result["valid"], result)
         errors = {e["error"] for e in result["attempts"][0]["errors"]}
-        self.assertTrue({"land_selection", "commander_changed"} <= errors)
+        self.assertIn("schema", errors)
+        schema_errors = result["attempts"][0]["errors"]
+        self.assertTrue(any(e.get("path") == "$.commander" for e in schema_errors))
+        self.assertTrue(any(e.get("path") == "$.buckets.support[62]" for e in schema_errors))
 
-    def test_game_changer_errors_feed_back_then_repaired_deck_passes(self):
+    def test_assembly_respects_game_changer_allowance_without_model_repair(self):
         changed = [
             dict(raw, game_changer=True) if raw["name"] in {f"Spell {n}" for n in range(4)} else raw
             for raw in self.records
         ]
         self.store.import_cards(changed)
-        corrected = draft()
-        corrected["cards"][3]["name"] = "Spell 69"
-        result = self.run_draft(FakeModel(draft(), corrected))
+        model = FakeModel(draft())
+        result = self.run_draft(model)
         self.assertTrue(result["valid"], result)
         self.assertEqual(result["validation"]["game_changer_count"], 3)
-        self.assertIn("game_changers", {e["error"] for e in result["attempts"][0]["errors"]})
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(
+            len({f"Spell {n}" for n in range(4)} & result["cards"].keys()), 3
+        )
+
+    def test_required_game_changers_cannot_bypass_bracket_limit(self):
+        names = [f"Spell {n}" for n in range(4)]
+        self.store.import_cards([
+            dict(raw, game_changer=True) if raw["name"] in names else raw
+            for raw in self.records
+        ])
+        pool = make_pool(self.store, make_spec(must_include=names))
+        result = self.run_draft(FakeModel(draft()), pool=pool, max_repairs=0)
+        self.assertFalse(result["valid"])
+        self.assertIn("game_changers", {e["error"] for e in result["validation"]["errors"]})
+
+    def test_short_overlapping_buckets_are_padded_and_deduplicated(self):
+        chosen = draft(40)
+        chosen["buckets"]["creatures"] = ["Spell 0", "Spell 1"]
+        result = self.run_draft(FakeModel(chosen))
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(result["assembly"]["model_selected_unique"], 40)
+        self.assertEqual(len(result["assembly"]["cards"]), 63)
+        self.assertEqual(result["cards"]["Spell 0"], 1)
+        self.assertTrue(result["assembly"]["code_added"])
 
     def test_full_intake_discovery_draft_flow_uses_three_model_calls(self):
         model = FakeModel(
@@ -168,7 +195,7 @@ class PipelineTests(unittest.TestCase):
             {"queries": [{"role": "theme", "query": "t:myojin"}]},
             draft(),
         )
-        result = build_deck(
+        result = draft_from_request(
             "Myojin tribal with proliferate", JODAH["name"], model, self.client, self.store
         )
         self.assertTrue(result["valid"], result)

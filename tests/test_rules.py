@@ -136,6 +136,26 @@ class RulesTests(unittest.TestCase):
         self.assertEqual(result["errors"], [])
         self.assertTrue(all("published" in d and "source" in d for d in result["evidence"]))
 
+    def test_proliferate_definition_cannot_be_crowded_out_by_long_cost_questions(self):
+        distractions = "\n".join(
+            f"702.{n}a Casting from hand uses alternate costs, replacement effects, "
+            "counters, battlefield conditions, and zones, exactly as stated."
+            for n in range(30)
+        )
+        self.rules.import_rules(
+            RULES.replace("Glossary", distractions + "\nGlossary"),
+            source="https://example.invalid/rules.txt", fetched_at="today",
+        )
+        self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
+        evidence = self.rules.retrieve(
+            [JODAH["name"]],
+            "Casting from hand uses alternate costs, replacement effects, counters, "
+            "battlefield conditions, and zones. Can proliferate add an existing counter?",
+            limit=4,
+        )
+        self.assertEqual(len(evidence), 4)
+        self.assertIn("CR 701.34a", {e["id"] for e in evidence})
+
     def test_unknown_rule_nonverbatim_quote_and_oracle_only_claims_are_refused(self):
         self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
         for response in [

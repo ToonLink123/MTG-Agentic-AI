@@ -1,9 +1,8 @@
 """Mandatory approval/revision gates, separate from Commander format legality."""
 
-from .mana import validate_mana_base
+from .mana import is_land, validate_mana_base
 from .roles import validate_roles
 from .spec import DeckSpec, ground_spec
-from .mana import is_land
 
 
 def spec_for_deck(deck, store, *, bracket=None):

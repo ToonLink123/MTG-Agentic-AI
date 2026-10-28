@@ -3,9 +3,11 @@ from collections import deque
 
 from mtg_agentic.cards import name_key, trim_card
 from mtg_agentic.discovery import Candidate, CandidatePool
+from mtg_agentic.schema import DRAFT_ROLES
 from mtg_agentic.scryfall import CardNotFound
 from mtg_agentic.spec import DeckSpec
 from tests.fixtures import card
+from tests.land_fixtures import fixing_lands
 
 JODAH = card(
     "Jodah, Archmage Eternal",
@@ -57,6 +59,52 @@ def records(count=70):
     ]
 
 
+def playable_records():
+    """Synthetic Oracle abilities that satisfy roles without trusting pool tags."""
+    data = records()
+    for raw in data:
+        if not raw["name"].startswith("Spell "):
+            continue
+        number = int(raw["name"].split()[1])
+        if number < 18:
+            raw.update(
+                type_line="Creature — Spirit",
+                oracle_text="Draw a card. Create a Treasure token. Destroy target artifact. "
+                            "Your commander has hexproof.",
+            )
+        elif number < 21:
+            raw.update(
+                type_line="Instant",
+                oracle_text="Target creature gains indestructible until end of turn.",
+            )
+        elif number < 24:
+            raw.update(type_line="Sorcery", oracle_text="Destroy all creatures.")
+    return [
+        *data, *fixing_lands(),
+        card("City of Brass", types="Land",
+             text="{T}: Add one mana of any color.\n"
+                  "Whenever City of Brass becomes tapped, it deals 1 damage to you."),
+        card("Mana Confluence", types="Land",
+             text="{T}, Pay 1 life: Add one mana of any color."),
+    ]
+
+
+def playable_deck(**changes):
+    """An independent 63+36 fixture with ten real land sources of every color."""
+    data = {
+        "commander": JODAH["name"],
+        "bracket": 3,
+        "cards": {
+            **dict.fromkeys((f"Spell {n}" for n in range(63)), 1),
+            "Plains": 7, "Island": 5, "Swamp": 7, "Mountain": 7, "Forest": 5,
+            "Command Tower": 1, "City of Brass": 1, "Mana Confluence": 1,
+            "Tropical Island": 1, "Breeding Pool": 1,
+        },
+    }
+    data.update(changes)
+    return data
+
+
 def make_pool(store, spec=None, count=70):
     spec = spec or make_spec()
     candidates = [
@@ -70,7 +118,10 @@ def make_pool(store, spec=None, count=70):
 def draft(count=63, **changes):
     data = {
         "commander": JODAH["name"],
-        "cards": [{"name": f"Spell {n}", "quantity": 1} for n in range(count)],
+        "buckets": {
+            **{role: [] for role in DRAFT_ROLES},
+            "support": [f"Spell {n}" for n in range(count)],
+        },
     }
     data.update(changes)
     return data

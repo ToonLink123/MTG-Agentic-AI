@@ -185,6 +185,7 @@ def validate_deck(
     report: dict[str, Any] = {
         "valid": False,
         "commander": commander if commander_supplied else None,
+        "cards": {},
         "bracket": bracket,
         "card_count": card_count,
         "color_identity": [],
@@ -252,8 +253,11 @@ def validate_deck(
                     "detail": "A chosen commander color is required and is not yet supported",
                 }
             )
+    maindeck: Counter[str] = Counter()
     for entry in entries:
-        resolve(entry.name, entry.quantity)
+        if card := resolve(entry.name, entry.quantity):
+            maindeck[card["name"]] += entry.quantity
+    report["cards"] = dict(maindeck)
 
     commander_colors = set(leader["color_identity"]) if leader else None
     live_game_changers = {name_key(n) for n in game_changers} if game_changers is not None else None

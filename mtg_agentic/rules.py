@@ -352,7 +352,23 @@ class RulesStore:
         )[0]
         norm = math.sqrt(sum(x * x for x in query))
         terms = set(_tokens(question))
-        scored, pinned = [], []
+        scored, pinned, essential = [], [], []
+        # Long multi-part questions otherwise bury short operative definitions
+        # under keyword abilities that happen to mention costs and counters.
+        required_patterns = []
+        lower_question = question.lower()
+        if "proliferat" in lower_question:
+            required_patterns.append(r"\bto proliferate means\b")
+        if "counter" in lower_question:
+            required_patterns.extend((r"\ba counter is a marker\b", r"\ba keyword counter\b"))
+        if re.search(r"alternat(?:e|ive) cost", lower_question):
+            required_patterns.extend((
+                r"\ban alternative cost is\b", r"\ban alternative cost doesn['’]t change\b",
+            ))
+        if "casting" in lower_question or "cast" in lower_question:
+            required_patterns.append(r"\bto cast a spell is to\b")
+        if "enters" in lower_question:
+            required_patterns.append(r"\bsome replacement effects modify how a permanent enters\b")
         for id_, kind, text, source, date, card, raw in rows:
             if kind != "rule" and card not in keys:
                 continue
@@ -366,13 +382,18 @@ class RulesStore:
                 pinned.append((kind == "oracle", overlap, id_, doc))
             else:
                 scored.append((cosine + overlap, id_, doc))
+                if any(re.search(pattern, text, re.I) for pattern in required_patterns):
+                    essential.append(doc)
         # Reserve half the context for rules so many rulings cannot crowd them out.
         selected = [d[-1] for d in sorted(pinned, key=lambda x: x[:3], reverse=True)[: limit // 2]]
+        selected.extend(sorted(essential, key=lambda d: d["id"])[:limit - len(selected)])
+        selected_ids = {d["id"] for d in selected}
         selected.extend(
             d[-1]
-            for d in sorted(scored, key=lambda x: x[:2], reverse=True)[: limit - len(selected)]
+            for d in sorted(scored, key=lambda x: x[:2], reverse=True)
+            if d[-1]["id"] not in selected_ids
         )
-        return selected
+        return selected[:limit]
 
     def check_interaction(
         self, cards: list[str], question: str, model: JSONModel
@@ -390,6 +411,9 @@ class RulesStore:
                         "or contradicted only if evidence establishes every step, zone, cost and condition. "
                         "Each claim needs exact evidence IDs and verbatim quotes of at least 20 characters. "
                         "Cite CR rules or publisher rulings as well as relevant Oracle wording. If evidence "
+                        "supports a conclusion, every individual claim must include a CR rule or publisher "
+                        "ruling, not just Oracle text. Combine card-text facts with the applicable rule "
+                        "instead of producing separate Oracle-only claims. If evidence "
                         "is insufficient use unsupported with an empty claims array. Do not add uncited prose."
                     ),
                 },

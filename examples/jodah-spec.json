@@ -6,7 +6,11 @@
   "mechanics": ["proliferate", "counters"],
   "win_conditions": ["myojin combat damage", "alternate wincons"],
   "playstyle": "midrange value",
+  "commander_dependency": "medium",
   "must_include": [],
   "exclude": [],
-  "role_targets": {"ramp": 10, "draw": 10, "removal": 8, "wipes": 3, "lands": 36}
+  "role_targets": {
+    "ramp": 10, "draw": 10, "removal": 8, "wipes": 3,
+    "lands": 36, "creatures": 15, "protection": 4
+  }
 }

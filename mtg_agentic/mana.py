@@ -24,6 +24,22 @@ def is_land(card: Card) -> bool:
     return "Land" in front(card, "type_line").split("—")[0].split()
 
 
+def _symbol_demand(cost: str) -> dict[str, float]:
+    demand: Counter[str] = Counter()
+    for symbol in SYMBOL.findall(cost):
+        colors = [s for s in symbol.split("/") if s in set("WUBRGC")]
+        for color in colors:
+            demand[color] += (
+                (0.5 if "P" in symbol or symbol.startswith("2/") else 1) / len(colors)
+            )
+    return dict(demand)
+
+
+def mana_pips(card: Card) -> dict[str, float]:
+    """Unweighted front-face casting pips; generic costs do not require {C}."""
+    return _symbol_demand(front(card, "mana_cost"))
+
+
 def mana_demand(card: Card) -> dict[str, float]:
     symbols = SYMBOL.findall(front(card, "mana_cost"))
     derived = sum(
@@ -33,12 +49,49 @@ def mana_demand(card: Card) -> dict[str, float]:
     mv = derived if card.get("card_faces") else card.get("cmc")
     mv = mv if isinstance(mv, (float, int)) else derived
     weight = 3.0 if mv <= 2 else 2.0 if mv <= 4 else 1.0
-    demand: Counter[str] = Counter()
-    for symbol in symbols:
-        colors = [s for s in symbol.split("/") if s in set("WUBRGC")]
-        for color in colors:
-            demand[color] += weight * (0.5 if "P" in symbol or symbol.startswith("2/") else 1) / len(colors)
-    return dict(demand)
+    return {color: pips * weight for color, pips in mana_pips(card).items()}
+
+
+def mana_profile(
+    spells: Mapping[str, int], commander: str, store: OracleStore
+) -> dict[str, Any]:
+    """Count actual casting and recognized ability costs, including the commander once."""
+    pips: Counter[str] = Counter()
+    abilities: Counter[str] = Counter()
+    weights: Counter[str] = Counter()
+    for name, quantity in {**spells, commander: 1}.items():
+        if type(quantity) is not int or quantity <= 0:
+            continue
+        card = store.get_card(name)
+        if card is None or is_land(card):
+            continue
+        for color, amount in mana_pips(card).items():
+            pips[color] += amount * quantity
+        for color, amount in mana_demand(card).items():
+            weights[color] += amount * quantity
+        text = front(card, "oracle_text")
+        costs = re.findall(r"(?:^|[.\n])\s*([^:.\n]+):", text)
+        costs += re.findall(r"\bpay ((?:\{[^}]+\})+) rather than pay\b", text, re.I)
+        for cost in costs:
+            for color, amount in _symbol_demand(cost).items():
+                abilities[color] += amount * quantity
+                weights[color] += amount * quantity
+    leader = store.get_card(commander)
+    identity = "".join(c for c in "WUBRG" if leader and c in leader["color_identity"]) or "C"
+    fallback = not weights
+    if fallback:
+        weights.update({color: 1.0 for color in identity})
+    colors = [color for color in "WUBRG" if weights[color] > 0]
+    total = sum(weights.values())
+    return {
+        "mana_pips": dict(pips),
+        "ability_pips": dict(abilities),
+        "weighted_pips": dict(weights),
+        "demand_share": {c: weights[c] / total for c in "WUBRGC" if weights[c] > 0},
+        "colors": colors,
+        "strategy": "multicolor" if len(colors) > 1 else "monocolor" if colors else "colorless",
+        "identity_fallback": fallback,
+    }
 
 
 def direct_sources(card: Card, identity: str) -> set[str]:
@@ -168,12 +221,10 @@ def validate_mana_base(deck: Mapping[str, int], commander: str, store: OracleSto
     leader = store.get_card(commander)
     identity = "".join(c for c in "WUBRG" if leader and c in leader["color_identity"]) or "C"
     graph = source_graph(deck, identity, store)
-    minimums = {c: MIN_COLOR_SOURCES for c in identity}
-    if any(
-        mana_demand(card).get("C", 0) for name in [commander, *deck]
-        if (card := store.get_card(name)) and not is_land(card)
-    ):
-        minimums.setdefault("C", 1)
+    profile = mana_profile(deck, commander, store)
+    minimums = {c: MIN_COLOR_SOURCES for c in profile["colors"]}
+    if profile["weighted_pips"].get("C", 0):
+        minimums["C"] = MIN_COLOR_SOURCES if profile["strategy"] == "colorless" else 1
     errors = list(graph["errors"])
     for color, minimum in minimums.items():
         actual = graph["source_counts"].get(color, 0)

@@ -16,7 +16,6 @@ from .forge_runner import ForgeSimulator
 from .llm import JSONModel, request_json
 from .oracle import OracleStore
 from .playability import validate_playability
-from .roles import protection_features
 from .provenance import repository_state
 from .review import DeckReviewer
 from .schema import NAME_SCHEMA, object_schema

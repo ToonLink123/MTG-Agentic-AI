@@ -7,8 +7,9 @@ from .forge_config import ForgeInstallation, OpponentPod
 from .forge_metrics import summarize as summarize_simulation
 from .forge_runner import ForgeSimulator, simulate
 from .forge_support import ForgeSupport
+from .lands import generate_mana_base
 from .oracle import OracleStore
-from .pipeline import build_deck, discover, draft_deck
+from .pipeline import build_deck, discover, draft_deck, draft_from_request
 from .review import DeckReviewer
 from .revision import revise_deck
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore, check_interaction
@@ -37,6 +38,8 @@ __all__ = [
     "build_deck",
     "discover",
     "draft_deck",
+    "draft_from_request",
+    "generate_mana_base",
     "intake",
     "check_interaction",
     "run_evaluation",
