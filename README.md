@@ -4,7 +4,9 @@ Scryfall-backed discovery, local-LLM deck drafting, and deterministic Commander
 validation, with bracket review and citation-required interaction checks.
 Completed builds require local Forge gameplay runs; untested drafting remains separate.
 Python 3.10+, no runtime dependencies. Ollama runs locally without an API key;
-the legality validator and land allocation never use an LLM.
+the legality validator and land allocation never use an LLM. Rules reviews embed
+the Comprehensive Rules locally with Google's EmbeddingGemma 2, which needs
+`python -m pip install -e ".[embeddings]"` (torch and transformers 5.21+).
 
 ## Quick start
 
@@ -109,6 +111,15 @@ exclude, and role_targets.
 Color identity uses WUBRG order, or `C` for colorless. All seven role targets are
 required integers from 0 to 99. Missing/extra fields, wrong types, duplicate
 keys, invalid identities, and conflicting constraints are rejected in code.
+
+Every chat-model call uses a system prompt from `mtg_agentic/prompts.py`: intake,
+query planning, query repair, drafting, bracket assessment, interaction judging and
+revision. Each one is a step-by-step guide for small local models: what the inputs
+are, numbered steps in order, a self-check, then the output format. Code still
+enforces every rule in them. The bracket assessment also gets a per-deck schema,
+so constrained decoding can only cite deck cards and must review each Spellbook
+combo ID exactly once. Brackets 1-3 keep mass land denial (such as "destroy all
+lands") out of the candidate pool, since the bracket check rejects it anyway.
 
 Intake fetches the commander's actual trimmed Oracle text with an exact
 `get_card` lookup before prompting. The response cannot change the commander or
@@ -273,8 +284,8 @@ so a response that breaks one gets a single corrective retry. Opus, Sonnet 5.5 a
 Fable requests opt into server-side fallback, so a safety-classifier decline is
 retried on Anthropic's recommended model; Haiku 5.5 has no fallback, so a decline is
 reported as an error. Claude has no `temperature 0`, so runs are not deterministic.
-Rules embeddings stay local: review commands still use Ollama unless you pass
-`--embedding-backend hash` (or `--skip-review` for an explicitly untested `draft`).
+Rules embeddings stay local: review commands use EmbeddingGemma 2 unless you pass
+`--embedding-backend ollama` or `hash` (or `--skip-review` for an explicitly untested `draft`).
 
 LLM commands report progress on stderr while stdout stays JSON: each pipeline stage,
 a live line per Claude call showing its reasoning summary or output size, each
@@ -534,17 +545,42 @@ The downloader discovers the current TXT link on the official
 [rules page](https://magic.wizards.com/en/rules), records its effective date, and
 stores the raw response locally. The September 25, 2026 text was live-tested and
 yielded 3,165 numbered chunks. TOC entries and the glossary do not leak into rules.
-Chunks are embedded locally with Ollama `nomic-embed-text` and stored in SQLite.
-Retrieval combines vector cosine similarity with lexical overlap, reserving
-context for both rules and card-specific Oracle text/publisher rulings.
+Chunks are embedded locally with [EmbeddingGemma 2](https://huggingface.co/google/embeddinggemma-2)
+(Apache 2.0, revision pinned, text tower only: 270M parameters, bfloat16 on CUDA,
+float32 on CPU, never float16) and stored in SQLite. Each rule is embedded as
+`title: <section> > <heading> | text: <rule>`, questions with the model's
+question-answering prefix. The full index takes about 20 seconds on an RTX 3080 Ti.
+
+The same CR text also becomes a graph (`mtg_agentic/rules_graph.py`): 3,165 rules
+plus their sections, joined by "see rule" references, by links from each rule to
+the rule that defines a glossary term it uses (terms used by over 4% of rules,
+such as "spell", are ignored), and by parent/subrule links. September 25, 2026
+yields 17,203 edges and 726 terms. Retrieval reserves half the context for the
+cards' Oracle text and publisher rulings. Specific glossary or heading terms in
+the question keep their defining rule, which replaced a hand-written list of
+definition patterns; player wording such as "alternate cost" maps to the CR's
+"alternative cost". Multi-part questions are also ranked sentence by sentence,
+and those rankings take turns filling the remaining slots. The remaining rules are ranked by reciprocal rank fusion of
+three lists: embedding cosine, IDF-weighted stem overlap, and personalized
+PageRank over the graph, seeded by the best first-stage rules, the rules that
+define the question's terms, and the cards' keywords. Existing indexes gain the
+graph on the next `download-rules` without re-embedding.
+
+On 18 interaction questions with hand-picked gold rules, the default finds a gold
+rule for every question and 94% of all gold rules in its top 18 evidence items;
+the previous retrieval managed 83% and 71%. [BENCHMARK.md](BENCHMARK.md) explains
+the method, per-question results, a known gap on the long Myojin review question,
+and how to rerun it with `python -m benchmarks.rules_retrieval`.
 
 Scryfall rulings are ingested for **every distinct card, including the commander
 and basic lands**, even when a card has no published rulings. Unchanged evidence
 is not re-embedded. Indexes are tied to the embedding model; use a new database
 when changing it. Review commands accept `--embedding-model` and `--embedding-url`.
+`--embedding-backend ollama` uses Ollama `nomic-embed-text` and `rules.sqlite3`.
 `--embedding-backend hash` explicitly selects a dependency-free hashed-token
 **lexical baseline**, not a semantic model or silent fallback. It uses
-`rules-hash.sqlite3`; the default Ollama backend uses `rules.sqlite3`.
+`rules-hash.sqlite3`; the default EmbeddingGemma backend uses
+`rules-embeddinggemma-2.sqlite3`. `--embedding-device cpu` forces CPU.
 Both stay local even when the chat provider is hosted.
 
 `check_interaction` requires per-claim retrieved rule/ruling IDs and verbatim

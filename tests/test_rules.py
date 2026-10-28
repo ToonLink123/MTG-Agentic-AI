@@ -5,7 +5,15 @@ from unittest.mock import Mock
 
 from mtg_agentic.cards import validation_card
 from mtg_agentic.oracle import OracleStore
-from mtg_agentic.rules import HashEmbedder, OllamaEmbedder, RulesStore, chunk_rules
+from mtg_agentic.rules import (
+    HashEmbedder,
+    OllamaEmbedder,
+    RulesStore,
+    _interleave,
+    _subquestions,
+    chunk_rules,
+)
+from mtg_agentic.rules_graph import GRAPH_VERSION
 from mtg_agentic.validator import can_be_commander
 from tests.fixtures import card
 from tests.pipeline_fixtures import JODAH, FakeModel, records
@@ -27,6 +35,28 @@ Glossary
 This glossary must not get appended to the final rule.
 """
 QUOTE = "To proliferate means to choose any number of permanents and/or players that have a counter"
+GRAPH_RULES = (
+    RULES.split("Glossary")[0]
+    + "\n".join(f"200.{n}. Distraction {n} says nothing useful at all." for n in range(1, 21))
+    + """
+118. Costs
+118.9. Alternative costs are paid instead of the mana cost. See rule 601.2f.
+601. Casting Spells
+601.2f The player determines the total amount to pay.
+Glossary
+Alternative Cost
+A cost paid rather than the mana cost. See rule 118.9.
+"""
+)
+
+
+class TopicEmbedder:
+    """Deterministic vectors: one axis for alternative costs, one for everything else."""
+
+    identity = "topic-test:2"
+
+    def embed(self, texts, *, titles=None, query=False):
+        return [[1.0, 0.0] if "alternative" in t.lower() else [0.0, 1.0] for t in texts]
 
 
 def cited(status="supported", id_="CR 701.34a", quote=QUOTE):
@@ -194,6 +224,43 @@ class RulesTests(unittest.TestCase):
             [JODAH["name"]], "Counters?", FakeModel(cited(status="contradicted"))
         )
         self.assertEqual(result["status"], "contradicted")
+
+    def test_graph_walk_reaches_a_referenced_rule_neither_vectors_nor_words_find(self):
+        with RulesStore(self.path / "graph.sqlite3", TopicEmbedder()) as rules:
+            rules.import_rules(GRAPH_RULES, source="https://example.invalid", fetched_at="today")
+            ids = [d["id"] for d in rules.retrieve([], "How do alternative costs work?", limit=3)]
+        # The glossary anchors the defining rule; its "see rule" reference pulls in 601.2f
+        # ahead of distractors that tie with it on cosine and stem overlap.
+        self.assertEqual(ids, ["CR 118.9", "CR 601.2f", "CR 100.1"])
+
+    def test_old_index_gains_the_graph_on_download_without_reembedding(self):
+        with self.rules.db:
+            self.rules.db.execute("DELETE FROM rule_edges")
+            self.rules.db.execute("DELETE FROM rule_terms")
+            self.rules.db.execute("DELETE FROM rule_metadata WHERE key='graph_version'")
+        self.rules._graph_cache = None
+        with self.assertRaisesRegex(ValueError, "download-rules"):
+            self.rules.retrieve([], "Proliferate?")
+        cache = Mock()
+        cache.fetch.side_effect = [
+            (b'<a href="https://media.wizards.com/current/MagicCompRules.txt">TXT</a>', "new"),
+            (RULES.encode(), "new"),
+        ]
+        with unittest.mock.patch.object(self.rules, "_embed_documents") as embed:
+            metadata = self.rules.download_rules(cache)
+            embed.assert_not_called()
+        self.assertEqual(metadata["graph_version"], GRAPH_VERSION)
+        ids = [d["id"] for d in self.rules.retrieve([], "Can I proliferate?", limit=2)]
+        self.assertIn("CR 701.34a", ids)
+
+    def test_multi_part_questions_rank_each_sentence_and_take_turns(self):
+        self.assertEqual(_subquestions("Can proliferate add a counter?"), [])
+        self.assertEqual(
+            _subquestions("When does it enter with a counter? Can proliferate add another one?"),
+            ["When does it enter with a counter?", "Can proliferate add another one?"],
+        )
+        a, b, c = (Mock(id=x) for x in "abc")
+        self.assertEqual([d.id for d in _interleave([[a, b, c], [c, a, b]])], ["a", "c", "b"])
 
     def test_embedding_identity_and_invalid_vectors_fail_before_overwriting(self):
         bad = Mock()

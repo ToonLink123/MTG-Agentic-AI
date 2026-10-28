@@ -9,11 +9,13 @@ from mtg_agentic.brackets import (
     POLICY,
     BracketChecker,
     SpellbookClient,
+    assessment_schema,
     deterministic_signals,
     game_changers,
 )
 from mtg_agentic.cards import validation_card
 from mtg_agentic.oracle import OracleStore
+from mtg_agentic.schema import SchemaError, validate_json
 from mtg_agentic.sources import SourceCache, SourceError
 from tests.fixtures import card
 from tests.pipeline_fixtures import JODAH, FakeModel, records
@@ -93,6 +95,19 @@ class BracketTests(unittest.TestCase):
             FakeModel(answer or assessment()),
             spellbook=SpellbookClient(cache),
         )
+
+    def test_per_deck_schema_only_allows_deck_cards_and_every_combo_once(self):
+        schema = assessment_schema(["Spell 0", "Spell 1"], ["a", "b"])
+        review = [{"id": i, "early_likelihood": "unlikely", "reason": "Slow"} for i in "ab"]
+        validate_json(assessment(card_references=["Spell 0"], combo_reviews=review), schema)
+        for changes in (
+            {"card_references": ["Invented Card"], "combo_reviews": review},
+            {"combo_reviews": review[:1]},
+            {"combo_reviews": [*review[:1], {**review[0], "id": "c"}]},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(SchemaError):
+                validate_json(assessment(**changes), schema)
+        validate_json(assessment(), assessment_schema(["Spell 0"], []))
 
     def test_live_game_changer_list_is_dated_and_cached(self):
         first = game_changers(self.client, self.cache)

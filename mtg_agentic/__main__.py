@@ -14,6 +14,7 @@ from typing import Any
 
 from .brackets import BracketChecker
 from .discovery import CandidatePool
+from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .evaluation import evaluation_history, run_evaluation
 from .forge import ForgeError
 from .forge_cli import load_forge
@@ -97,23 +98,46 @@ def _claude_api_key(env_file: Path = Path(".env")) -> str:
     return ""
 
 
+RULES_INDEXES = {
+    "embeddinggemma": "rules-embeddinggemma-2.sqlite3",
+    "ollama": "rules.sqlite3",
+    "hash": "rules-hash.sqlite3",
+}
+
+
 def _embedding_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--embedding-backend", choices=("ollama", "hash"), default="ollama")
-    parser.add_argument("--embedding-model", default="nomic-embed-text")
+    parser.add_argument(
+        "--embedding-backend",
+        choices=tuple(RULES_INDEXES),
+        default="embeddinggemma",
+        help="Rules embeddings: local Hugging Face EmbeddingGemma 2 (default), Ollama, or hash",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        help=f"Default: {EMBEDDINGGEMMA_MODEL} (pinned revision) or nomic-embed-text for Ollama",
+    )
     parser.add_argument("--embedding-url", default="http://localhost:11434")
+    parser.add_argument("--embedding-device", help="embeddinggemma: cuda or cpu (default: auto)")
 
 
 def _embedder(args: argparse.Namespace):
     if args.embedding_backend == "hash":
         return HashEmbedder()
-    return OllamaEmbedder(args.embedding_model, base_url=args.embedding_url)
+    if args.embedding_backend == "ollama":
+        return OllamaEmbedder(args.embedding_model or "nomic-embed-text", base_url=args.embedding_url)
+    from .embeddings import EmbeddingGemmaEmbedder  # Imports torch/transformers only when used.
+
+    model = args.embedding_model or EMBEDDINGGEMMA_MODEL
+    return EmbeddingGemmaEmbedder(
+        model,
+        revision=EMBEDDINGGEMMA_REVISION if model == EMBEDDINGGEMMA_MODEL else None,
+        device=args.embedding_device,
+    )
 
 
 def _rules_path(args: argparse.Namespace) -> Path:
-    # Keep explicit lexical-baseline and semantic-model indexes separate.
-    return args.data_dir / (
-        "rules-hash.sqlite3" if args.embedding_backend == "hash" else "rules.sqlite3"
-    )
+    # Indexes are tied to their embedding model, so every backend keeps its own database.
+    return args.data_dir / RULES_INDEXES[args.embedding_backend]
 
 
 def _reviewer(args, stack, store, client, model):

@@ -144,6 +144,17 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertNotIn("Changer", {candidate.card["name"] for candidate in pool.cards})
 
+
+    def test_brackets_one_to_three_never_pool_mass_land_denial(self):
+        rage = card("Land Reset Myojin", types="Legendary Creature — Spirit", text="Destroy all lands.")
+        self.store.import_cards([*self.records, rage])
+        for bracket, kept in ((3, False), (4, True)):
+            with self.subTest(bracket=bracket):
+                pool = build_candidate_pool(
+                    make_spec(bracket=bracket), [CardQuery("theme", "a")], FakeCards([rage]), self.store
+                )
+                self.assertEqual("Land Reset Myojin" in {c.card["name"] for c in pool.cards}, kept)
+
     def test_empty_subtype_and_mechanic_tags_get_constrained_logged_fallbacks(self):
         myojin = card("Myojin Test", types="Legendary Creature — Spirit")
         proliferate = card("Proliferate Test", text="Proliferate.")

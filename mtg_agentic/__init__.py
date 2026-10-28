@@ -1,6 +1,7 @@
 """Card discovery and deterministic Commander validation."""
 
 from .brackets import BracketChecker, SpellbookClient
+from .embeddings import EmbeddingGemmaEmbedder
 from .evaluation import evaluation_history, run_evaluation
 from .forge import ForgeError, export_deck
 from .forge_config import ForgeInstallation, OpponentPod
@@ -30,6 +31,7 @@ __all__ = [
     "RulesStore",
     "OllamaEmbedder",
     "HashEmbedder",
+    "EmbeddingGemmaEmbedder",
     "SourceCache",
     "SourceError",
     "ScryfallClient",
