@@ -158,8 +158,9 @@ def validate_json(value: Any, schema: dict[str, Any]) -> None:
             for index, child in enumerate(item):
                 visit(child, rule["items"], f"{path}[{index}]")
         elif kind == "string":
+            # Strings must have content unless the schema opts in with an explicit minLength 0.
             if (
-                not item.strip()
+                (not item.strip() and rule.get("minLength") != 0)
                 or len(item) < rule.get("minLength", 0)
                 or len(item) > rule.get("maxLength", float("inf"))
             ):

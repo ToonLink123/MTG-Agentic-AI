@@ -3,11 +3,14 @@ __pycache__/
 *.egg-info/
 .venv/
 .ruff_cache/
+.pytest_cache/
 .coverage
 htmlcov/
 build/
 dist/
 .cache/
+# Comprehensive Rules text; the program downloads its own copy into .cache/.
+MagicCompRules*.txt
 .claude/settings.local.json*
 trajector-doctor-*.tar.gz
 trajector-doctor-*/

@@ -57,6 +57,20 @@ class PipelineCliTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("role_targets", schema["properties"])
 
+    def test_llama_cpp_provider_is_local_and_keyless_by_default(self):
+        from mtg_agentic.__main__ import _make_model
+        from mtg_agentic.llm import LFM3_MODEL, LlamaCppClient
+
+        args = Mock(
+            provider="llama-cpp", model=None, llm_url=None, llm_timeout=300,
+            context_size=98304, no_thinking=True,
+        )
+        with patch.dict("os.environ", {}, clear=True):
+            client = _make_model(args)
+        self.assertIsInstance(client, LlamaCppClient)
+        self.assertEqual((client.model, client.base_url), (LFM3_MODEL, "http://localhost:8080/v1"))
+        self.assertEqual((client.context_size, client.thinking), (98304, False))
+
     def test_build_requires_simulation_arguments_before_any_model_work(self):
         with (
             contextlib.redirect_stderr(io.StringIO()),

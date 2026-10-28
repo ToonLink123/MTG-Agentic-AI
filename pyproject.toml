@@ -13,6 +13,7 @@ dependencies = []
 [project.optional-dependencies]
 claude = ["anthropic>=0.84"]
 embeddings = ["torch", "transformers>=5.21"]
+tui = ["textual>=8.2"]
 
 [project.scripts]
 mtg-agentic = "mtg_agentic.__main__:main"

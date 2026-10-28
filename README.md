@@ -35,6 +35,114 @@ invalid deck, and `2` for an input/HTTP/storage failure. Use
 `python -m mtg_agentic --data-dir /path/to/data ...` to change the cache location.
 The default is `.cache/mtg-agentic/`, excluded from Git.
 
+## Terminal chat
+
+A dark terminal UI wraps the same commands in a chat. Name a commander, then describe
+the deck in plain words. The request runs intake, discovery and draft, with live
+progress, and shows the spec, the candidate pool and the finished list grouped by card
+type. Once there is a deck, keep talking: each message goes to the orchestrator alone,
+which answers questions or swaps cards (see [Orchestrator follow-ups](#orchestrator-follow-ups)).
+It needs [Textual](https://textual.textualize.io/):
+
+```powershell
+.venv\Scripts\Activate.ps1                     # the Python that has the [embeddings] extra
+python -m pip install -e ".[tui]"
+python -m mtg_agentic tui                      # or: tui --provider claude --model claude-haiku-5-5
+```
+
+Every step runs on the Python that started the TUI, so start it from the environment with
+the `embeddings` extra. The greeting warns when that Python's transformers is too old for
+rules reviews.
+
+Every action runs the regular CLI as a subprocess, so results match the commands above.
+Specs, pools and decks are saved under `.cache/mtg-agentic/tui/<session>/`. Esc stops a
+run. While a run works, each reply shows a step checklist and a live agent panel: every
+agent (intake, scout, drafter or council members, reviewer, the parallel rules judges)
+with a spinner, its model, its current task and elapsed time, plus the latest tool calls
+(Scryfall searches, rules lookups, rulings, Commander Spellbook, mana base, validation).
+The top bar counts the agents working. Each session keeps its chat in `session.json`
+beside its decks, and every follow-up that changes cards saves a new version
+(`01-deck-v2.json`, `-v3`...). Tab completes a `/command`. `/help` lists the commands:
+
+| Command | Does |
+|---|---|
+| a message | No deck yet: draft one. With a deck: ask the orchestrator about it or for changes |
+| `/draft REQUEST` | Draft a fresh deck in this session (the council when `/orchestrate` is on) |
+| `/new`, `/session [N]` | Start a new session; pick a past session to resume (arrow keys, Enter), or resume number N |
+| `/card NAME`, `/search QUERY` | Oracle text, Scryfall search |
+| `/ask [[A]] [[B]] QUESTION` | `check-interaction`, with cited rules and rulings |
+| `/validate`, `/bracket`, `/review` | `validate`, `bracket-check`, `review-deck` on the current deck |
+| `/load PATH`, `/deck` | Make a saved deck JSON current, or show the current deck |
+| `/export [PATH]` | Write the current deck as `1 Card Name` lines, commander first, beside its JSON (or to a new PATH), and copy it to the clipboard |
+| `/commander NAME` | Switch commanders |
+| `/model [PROVIDER] [MODEL]` | Show or switch the LLM: `/model claude`, `/model ollama qwen2.5:14b`, `/model default` |
+| `/mode [MODE]` | Bracket 3 rules: `auto` (read from the request), `standard`, `unrestricted`, `limited-land-destruction` |
+| `/review on\|off` | Whether each draft runs the bracket and rules review; `/review` alone reviews the current deck |
+| `/orchestrate on\|off` | Deck requests go to the council below; with Claude, the orchestrator also runs intake and discovery |
+| `/log`, `/clear`, `/quit` | Full progress log of the last run, clear the chat, quit |
+
+## Council drafting
+
+`council` drafts a saved pool with one orchestrator and several members instead of one
+model:
+
+```powershell
+python -m mtg_agentic council --provider claude --pool .cache/jodah-pool.json --output .cache/jodah-council.json
+```
+
+1. **Plan.** The orchestrator writes the game plan and non-goals, and picks the core: win
+   conditions, Game Changers and key engine cards, all from the pool. Code drops any Game
+   Changer past the bracket limit. Core cards join the spec's `must_include`.
+2. **Drafts.** Members draft in parallel and independently, each with a focus: engine and
+   synergy, interaction and resilience, or curve and consistency. Code assembles and
+   validates each draft.
+3. **Debate.** Cards in every draft are kept. Members vote keep or cut once, in parallel,
+   on only the cards the drafts disagree on, using each draft's role counts and problems.
+4. **Decision.** The orchestrator settles the contested slots.
+5. **Final.** Code assembles the decision, generates lands, validates and runs the safety
+   review; the orchestrator repairs anything that fails, as in `draft`.
+
+The debate is one round, so a council always finishes. A member whose draft or votes are
+malformed is left out; if no draft succeeds, the orchestrator drafts alone. With
+`--provider claude` the orchestrator defaults to `claude-sonnet-5-5` at `xhigh` effort
+and three members to `claude-haiku-5-5` at `high`; change them with
+`--orchestrator-model`, `--orchestrator-effort`, `--member-model`, `--member-effort` and
+`--members 2-6`. Other providers use `--model` for every role. The safety review runs on
+the member model. The deck JSON records the plan, core, each draft's problems, the
+agreed and contested cards, every vote and reason, and the decision under `council`.
+
+## Orchestrator follow-ups
+
+After a draft, the player talks to the orchestrator alone; the council never runs again.
+`edit-deck` takes one message:
+
+```powershell
+python -m mtg_agentic edit-deck .cache/jodah-council.json --pool .cache/jodah-pool.json --request "Swap the weakest ramp for more instant-speed protection" --provider claude --model claude-sonnet-5-5 --effort xhigh --output .cache/jodah-v2.json
+```
+
+The orchestrator works in steps, up to `--steps` (default 10). Each step it calls one
+tool or finishes:
+
+| Tool | Does |
+|---|---|
+| `search_cards` | Scryfall search, limited to the deck's colors and Commander legality |
+| `card` | Oracle text, roles, and whether a card can be added |
+| `rulings` | Publisher rulings |
+| `rules` | The Comprehensive Rules and rulings most relevant to a question |
+| `check_deck` | Dry run of swaps: regenerated lands, role counts and problems |
+| `combos` | Commander Spellbook combos after the swaps |
+
+It finishes with a reply and one-for-one nonland swaps. It may add pool cards, cards its
+searches found, and cards the player names as `[[Card Name]]`, when they fit the deck's
+colors, legality and bracket. Code applies the swaps exactly, regenerates the lands,
+validates, and runs the safety review unless `--skip-review`. Any problems go back to the
+orchestrator, which can use more tools and finish again, at most twice. A question
+changes nothing. Removing a must-include card at the player's request also drops it from
+the spec. Each exchange is kept under `conversation` in the deck JSON, so the next
+follow-up remembers it. In the TUI, follow-ups use the orchestrator model:
+`claude-sonnet-5-5` at `xhigh` with Claude unless `/model` picks another, or the current
+model for other providers.
+
 ## Intake -> spec -> discovery -> draft
 
 This build pipeline stops at a reviewed draft. Forge runs are explicit, separate
@@ -89,7 +197,7 @@ Model flags, available on each LLM command:
 - `--model qwen2.5:7b`, default `MTG_LLM_MODEL` or `qwen2.5:7b`.
 - `--llm-url http://localhost:11434`, or `MTG_LLM_BASE_URL`.
 - `--context-size 65536`, the default requested Ollama context.
-- `--provider ollama`, `openai-compatible`, or `claude`, or `MTG_LLM_PROVIDER`.
+- `--provider ollama`, `llama-cpp`, `openai-compatible`, or `claude`, or `MTG_LLM_PROVIDER`.
 - `--effort high`, Claude reasoning effort from `low` to `max` (claude provider only).
 - `--quiet`, placed before the command, hides the progress shown on stderr.
 - `--llm-timeout 300`, seconds per call.
@@ -275,6 +383,26 @@ base, or a simulation. Fetch/conditional lands are only potential sources;
 untapped timing, all activation restrictions, snow requirements, and affordability
 are not modeled. Check the warnings and review the resulting mana base.
 
+### llama.cpp and LFM3
+
+`--provider llama-cpp` talks to a local llama.cpp `llama-server` at
+`http://localhost:8080/v1` with no API key, temperature 0 and a JSON-schema grammar.
+It runs GGUF architectures Ollama may not load yet, such as
+[LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) (`Q8_0`),
+the provider's default model. Ollama 0.17 fails on it with `unknown model architecture: 'lfm3'`.
+Download a llama.cpp release (build b11944 or newer), then:
+
+```powershell
+llama-server -hf LiquidAI/LFM3-1.7B-GGUF:Q8_0 -c 98304 -np 1 -ngl 99 --jinja --port 8080
+python -m mtg_agentic intake --provider llama-cpp --context-size 98304 --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal with divinity counters and proliferate" --output .cache/jodah-lfm3-spec.json
+```
+
+Keep `--context-size` at or below the server's `-c` per slot (`-np 1` gives one slot
+the whole context). LFM3 reasons before its constrained JSON, often for 6K-16K tokens
+a call, so a reply may use all of the context the prompt leaves (a prompt must leave at
+least 8,192 tokens). `--no-thinking` turns reasoning off through the chat template's
+`enable_thinking`. Set `MTG_LLM_API_KEY` only if the server was started with `--api-key`.
+
 ### Optional API-key provider
 
 Ollama is always the default. To explicitly use a compatible hosted API later:
@@ -315,7 +443,10 @@ Rules embeddings stay local: review commands use EmbeddingGemma 2 unless you pas
 
 LLM commands report progress on stderr while stdout stays JSON: each pipeline stage,
 a live line per Claude call showing its reasoning summary or output size, each
-call's token use and cache reads, and run totals at the end. Put `--quiet` before
+call's token use and cache reads, and run totals at the end. Every provider also logs
+malformed replies, per call and in the run totals: invalid JSON, a schema violation, or a
+response truncated at the token limit (for example
+`llama.cpp: 9 calls | 2 malformed (1 invalid JSON, 1 schema) | prompt 120,431 tok | out 61,002`). Put `--quiet` before
 the command to hide it.
 
 Requests use 5-minute prompt caching. A repair or retry resends the candidate pool
@@ -575,7 +706,33 @@ Chunks are embedded locally with [EmbeddingGemma 2](https://huggingface.co/googl
 (Apache 2.0, revision pinned, text tower only: 270M parameters, bfloat16 on CUDA,
 float32 on CPU, never float16) and stored in SQLite. Each rule is embedded as
 `title: <section> > <heading> | text: <rule>`, questions with the model's
-question-answering prefix. The full index takes about 20 seconds on an RTX 3080 Ti.
+question-answering prefix. The full index takes about 20 seconds on an RTX 3080 Ti,
+and minutes on a CPU.
+
+### Prebuilt rule vectors
+
+A new install skips that step: before embedding, the program checks the public
+[jungter/mtg-agentic-cr-embeddings](https://huggingface.co/datasets/jungter/mtg-agentic-cr-embeddings)
+dataset for vectors built from the same rules text. The dataset holds only rule numbers
+and float32 vectors, never rule text. It uses them only when the model identity, the rules
+text hash, the hash of the exact embedded inputs (rule number, title and text), the rule
+numbers and the vector checksum all match; otherwise, or offline, it embeds locally. The
+weights then load only when a question first needs embedding, so building the index needs
+no model at all. The index is stored in SQLite as before, so later runs read it locally and
+make no request. The September 25, 2026 vectors give the same top 18 rules as a local
+build for every benchmark question.
+
+`--rules-index OWNER/NAME` (or `MTG_RULES_INDEX_REPO`) selects another dataset, and
+`--rules-index none` always embeds locally. When the rules change, publish new vectors:
+
+```powershell
+python -m mtg_agentic export-rules-index --output .cache/rules-export
+hf upload jungter/mtg-agentic-cr-embeddings .cache/rules-export . --repo-type dataset
+```
+
+`export-rules-index` publishes only vectors embedded on this machine, re-embedding first
+if the local index came from the dataset. Vectors only rank evidence: every cited quote is still checked verbatim
+against the rules text downloaded from Wizards.
 
 The same CR text also becomes a graph (`mtg_agentic/rules_graph.py`): 3,165 rules
 plus their sections, joined by "see rule" references, by links from each rule to
@@ -617,8 +774,10 @@ URLs and dates. Reviews account for hand versus other zones, alternate costs,
 replacement effects and existing counter types.
 
 Draft reviews check each included Myojin engine, a proliferate/poison question
-when relevant, and detected combos, with a 20-interaction budget. Overflow
-requires manual review rather than silently passing. Citation existence and
+when relevant, and every detected combo, with no cap. Evidence is retrieved for each
+question in turn, then the questions are asked in parallel: up to 8 at a time on
+Claude and other hosted APIs, one at a time on local Ollama and llama.cpp servers,
+which queue requests. A malformed answer fails only its own question. Citation existence and
 quotes are checked in code; **logical support remains LLM judgment**, not a
 rules-engine proof. Unsupported/contradicted findings enter bounded repairs;
 network/model failures never become successful reviews.

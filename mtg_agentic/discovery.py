@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from itertools import zip_longest
 from typing import Any
 
-from . import prompts
+from . import activity, prompts
 from .brackets import land_denial_forbidden
 from .cards import Card, name_key, trim_card
 from .land_options import preferred_lands
@@ -89,7 +89,8 @@ def generate_queries(spec: DeckSpec, model: JSONModel) -> list[CardQuery]:
         {"role": "user", "content": json.dumps(spec.to_dict())},
     ]
     log.info("discovery: planning card searches")
-    raw = request_json(model, messages, QUERY_SCHEMA)["queries"]
+    with activity.agent("scout", model, "plan Scryfall searches"):
+        raw = request_json(model, messages, QUERY_SCHEMA)["queries"]
     raw.extend(q.to_dict() for q in template_queries(spec))
     queries: list[CardQuery] = []
     seen: set[tuple[str, str]] = set()
@@ -272,6 +273,7 @@ def build_candidate_pool(
         def execute(text):
             try:
                 scoped = constrain_query(text, spec.color_identity)
+                activity.tool("scryfall search", f"{query.role}: {text}")
                 found = client.search_cards(scoped, max_results=results_per_query, order="edhrec")
                 history.append({"query": scoped, "returned": len(found), "error": None if found else "zero_results"})
                 return scoped, found
@@ -288,10 +290,11 @@ def build_candidate_pool(
         if not found and model is not None and repairs_used < max_query_repairs:
             repairs_used += 1
             try:
-                repair = request_json(model, [
-                    {"role": "system", "content": prompts.QUERY_REPAIR},
-                    {"role": "user", "content": json.dumps({"spec": spec.to_dict(), "role": query.role, "feedback": history[-1]})},
-                ], repair_schema)
+                with activity.agent("scout", model, f"repair the {query.role} search"):
+                    repair = request_json(model, [
+                        {"role": "system", "content": prompts.QUERY_REPAIR},
+                        {"role": "user", "content": json.dumps({"spec": spec.to_dict(), "role": query.role, "feedback": history[-1]})},
+                    ], repair_schema)
                 repaired, found = execute(repair["query"])
                 constrained = repaired or constrained
             except SchemaError as exc:

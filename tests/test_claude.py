@@ -97,6 +97,7 @@ class ClaudeTests(unittest.TestCase):
         retry = stream.call_args.kwargs["messages"]
         self.assertEqual(retry[0]["content"][0]["text"], "Myojin")
         self.assertIn("invalid string length", retry[1]["content"])
+        self.assertEqual((client.usage["schema"], client.usage["json"]), (1, 0))
 
     def test_only_text_after_a_mid_stream_fallback_is_parsed(self):
         client, _ = fake_client(
@@ -146,6 +147,7 @@ class ClaudeTests(unittest.TestCase):
         self.assertIn("2 calls", lines[2])
         self.assertIn("29% from cache", lines[2])
         self.assertIn("largest prompt 120,000 (over Haiku's 100K tier)", lines[2])
+        self.assertIn("0 malformed", lines[2])
 
     def test_prompt_over_the_budget_is_compacted_before_sending(self):
         out = io.StringIO()

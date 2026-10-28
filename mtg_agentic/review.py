@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import logging
+import threading
+from functools import partial
 from typing import Any
 
+from . import activity
 from .brackets import BracketChecker
 from .cards import name_key
-from .llm import JSONModel
+from .llm import JSONModel, concurrency, parallel, request_json
 from .oracle import OracleStore
-from .rules import RulesStore
+from .rules import INTERACTION_SCHEMA, RulesStore
+from .schema import SchemaError
 from .scryfall import ScryfallClient
 
 log = logging.getLogger(__name__)
@@ -95,26 +99,42 @@ class DeckReviewer:
                     ),
                 )
             )
+        # Retrieval stays on this thread (SQLite, embedder); every question is then asked at
+        # once, up to the model's concurrency, and each answer is checked in order.
+        requests = []
+        for i, (names, question) in enumerate(jobs, 1):
+            short = " + ".join(n.split(",")[0] for n in names)
+            log.info("review: rules question %d/%d (%s)", i, len(jobs), short)
+            requests.append(self.rules.interaction_request(names, question))
+        workers = concurrency(self.model)
+        answers: list[dict[str, Any] | None] = []
+        if jobs:
+            log.info("review: asking %d rules question(s), up to %d at a time", len(jobs), workers)
+            lock, answered = threading.Lock(), [0]
+
+            def ask(messages: list[dict[str, str]]) -> dict[str, Any] | None:
+                answer = self._ask(messages)
+                with lock:
+                    answered[0] += 1
+                    count = answered[0]
+                activity.progress("judges", f"{count}/{len(jobs)} answered")
+                return answer
+
+            task = f"{len(jobs)} rules questions, up to {workers} at a time"
+            with activity.agent("judges", self.model, task):
+                answers = parallel([partial(ask, messages) for messages, _ in requests], workers)
         interactions = []
-        for i, (names, question) in enumerate(jobs):
-            if i >= 20:
-                interactions.append(
-                    {
-                        "status": "unsupported",
-                        "cards": names,
-                        "question": question,
-                        "claims": [],
-                        "errors": ["Review budget exceeded; manual review required."],
-                    }
-                )
+        for (names, question), (_, evidence), answer in zip(jobs, requests, answers):
+            if answer is None:
+                interactions.append({
+                    "status": "unsupported", "claims": [], "cards": names, "question": question,
+                    "evidence": evidence,
+                    "errors": ["The model returned invalid grounded JSON for this question."],
+                })
             else:
-                log.info(
-                    "review: rules question %d/%d (%s)",
-                    i + 1,
-                    min(len(jobs), 20),
-                    " + ".join(n.split(",")[0] for n in names),
+                interactions.append(
+                    self.rules.judge_interaction(names, question, evidence, answer)
                 )
-                interactions.append(self.rules.check_interaction(names, question, self.model))
         errors = []
         if bracket_report["verdict"] != "fits":
             errors.append(
@@ -145,3 +165,9 @@ class DeckReviewer:
             "interactions": interactions,
             "errors": errors,
         }
+
+    def _ask(self, messages: list[dict[str, str]]) -> dict[str, Any] | None:
+        try:
+            return request_json(self.model, messages, INTERACTION_SCHEMA)
+        except SchemaError:
+            return None  # A malformed answer fails its own question, not the whole review.

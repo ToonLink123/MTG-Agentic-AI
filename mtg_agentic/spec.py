@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from . import prompts
+from . import activity, prompts
 from .brackets import land_denial_forbidden
 from .cards import Card, name_key
 from .llm import JSONModel, request_json
@@ -151,7 +151,8 @@ def intake(
         })},
     ]
     log.info("intake: turning the request into a deck spec")
-    data = request_json(model, messages, SPEC_SCHEMA)
+    with activity.agent("intake", model, "turn the request into a deck spec"):
+        data = request_json(model, messages, SPEC_SCHEMA)
     if bracket3_mode is not None:
         data["bracket3_mode"] = bracket3_mode
     spec = DeckSpec.from_dict(data)

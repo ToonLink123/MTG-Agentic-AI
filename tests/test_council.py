@@ -1,0 +1,187 @@
+import argparse
+import json
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from mtg_agentic import prompts
+from mtg_agentic.council import council_draft, plan_deck
+from mtg_agentic.oracle import OracleStore
+from mtg_agentic.schema import SchemaError
+from tests.pipeline_fixtures import JODAH, FakeCards, draft, make_pool, playable_records
+
+PLAN = {
+    "game_plan": "Cast Myojin from hand with Jodah, keep their counters, win in combat.",
+    "non_goals": ["token swarm"],
+    "win_conditions": ["Spell 1"],
+    "game_changers": [],
+    "key_cards": ["Spell 2", "Spell 3"],
+}
+
+
+def picks(*numbers):
+    selection = draft(count=0)
+    selection["buckets"]["support"] = [f"Spell {n}" for n in numbers]
+    return selection
+
+
+class CouncilModel:
+    """Answers each council prompt; member drafts are chosen by focus."""
+
+    def __init__(self, drafts, *, plan=PLAN, keep=None, concurrency=3):
+        self.drafts, self.plan, self.keep = drafts, plan, keep
+        self.concurrency = concurrency
+        self.calls, self.lock, self.running, self.peak = [], threading.Lock(), 0, 0
+
+    def complete_json(self, messages, schema):
+        system = messages[0]["content"]
+        kind = (
+            "plan" if system == prompts.COUNCIL_PLAN
+            else "draft" if prompts.COUNCIL_MEMBER in system
+            else "vote" if system == prompts.COUNCIL_CRITIQUE
+            else "decide" if system == prompts.COUNCIL_DECIDE
+            else "repair"
+        )
+        with self.lock:
+            self.calls.append(kind)
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        time.sleep(0.01)
+        with self.lock:
+            self.running -= 1
+        focus = json.loads(messages[-1]["content"]).get("focus")
+        if kind == "plan":
+            return self.plan
+        if kind == "draft":
+            result = self.drafts[focus]
+            if isinstance(result, Exception):
+                raise result
+            return result
+        payload = json.loads(messages[1]["content"])
+        if kind == "vote":
+            return {"votes": [
+                {"card": c["name"], "vote": "keep" if len(c["chosen_by"]) > 1 else "cut",
+                 "reason": f"{focus} view"}
+                for c in payload["contested"]
+            ]}
+        if kind == "decide":
+            contested = [c["name"] for c in payload["contested"]]
+            return {"keep": self.keep if self.keep is not None else contested[: payload["open_slots"]],
+                    "notes": "followed the vote"}
+        return draft()
+
+
+class CouncilTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name)
+        self.store = OracleStore(self.path / "oracle.sqlite3")
+        self.addCleanup(self.store.close)
+        self.records = playable_records()
+        self.store.import_cards(self.records)
+        self.client = FakeCards(self.records)
+        self.pool = make_pool(self.store)
+
+    def run_council(self, model, **kwargs):
+        with patch("mtg_agentic.scryfall.urlopen", side_effect=AssertionError("Unexpected HTTP")):
+            return council_draft(self.pool, model, model, self.client, self.store, **kwargs)
+
+    def test_plan_then_parallel_drafts_then_one_debate_round_then_a_decision(self):
+        model = CouncilModel({
+            "engine": picks(*range(63)),
+            "resilience": picks(*range(60), 63, 64, 65),
+            "consistency": picks(*range(60), 66, 67, 68),
+        })
+        with self.assertLogs("mtg_agentic.council", "INFO") as logs:
+            deck = self.run_council(model)
+        council = deck["council"]
+        self.assertEqual(model.calls[0], "plan")
+        self.assertEqual(sorted(model.calls[1:4]), ["draft"] * 3)
+        self.assertEqual(model.calls[4:7], ["vote"] * 3)
+        self.assertEqual(model.calls[7], "decide")
+        self.assertGreater(model.peak, 1)
+        stages = [line.split("council: ")[1][:3] for line in logs.output]
+        self.assertEqual(stages, ["1/5", "2/5", "3/5", "4/5", "5/5"])
+        self.assertTrue(deck["valid"], deck["validation"]["errors"])
+        self.assertTrue(set(council["core"]) <= set(deck["cards"]))
+        self.assertEqual(council["core"], ["Spell 1", "Spell 2", "Spell 3"])
+        self.assertTrue(set(council["core"]) <= set(deck["spec"]["must_include"]))
+        self.assertTrue(set(council["core"]) <= set(council["locked"]))
+        self.assertFalse(set(council["locked"]) & set(council["contested"]))
+        self.assertEqual(council["open_slots"], 63 - len(council["locked"]))
+        for name in council["contested"]:
+            self.assertEqual(sum(council["votes"][name][v] for v in ("keep", "cut")), 3)
+
+    def test_unanimous_drafts_skip_the_debate(self):
+        same = picks(*range(63))
+        model = CouncilModel({"engine": same, "resilience": same, "consistency": same})
+        deck = self.run_council(model)
+        self.assertEqual(model.calls.count("vote") + model.calls.count("decide"), 0)
+        self.assertEqual(deck["council"]["contested"], [])
+        self.assertTrue(deck["valid"], deck["validation"]["errors"])
+
+    def test_a_malformed_member_draft_is_left_out(self):
+        model = CouncilModel({
+            "engine": picks(*range(63)),
+            "resilience": SchemaError([{"error": "json", "detail": "bad"}]),
+            "consistency": picks(*range(60), 66, 67, 68),
+        })
+        deck = self.run_council(model)
+        self.assertEqual([d["focus"] for d in deck["council"]["drafts"]], ["engine", "consistency"])
+        self.assertEqual(model.calls.count("vote"), 2)
+
+    def test_game_changers_past_the_bracket_limit_leave_the_core(self):
+        plan = {**PLAN, "win_conditions": ["Spell 1"], "game_changers": ["Spell 2", "Spell 3"],
+                "key_cards": ["Spell 4", "Spell 5"]}
+        changers = {"Spell 1", "Spell 2", "Spell 3", "Spell 4"}
+        result = plan_deck(self.pool, CouncilModel({}, plan=plan), changers)
+        self.assertEqual(result["core"], ["Spell 1", "Spell 2", "Spell 3", "Spell 5"])
+        self.assertEqual(result["dropped_game_changers"], ["Spell 4"])
+
+
+class CouncilCliTests(unittest.TestCase):
+    def test_claude_council_defaults_to_sonnet_leading_haiku(self):
+        from mtg_agentic.__main__ import _council_models
+
+        args = argparse.Namespace(
+            provider="claude", model=None, orchestrator_model=None, member_model=None,
+            orchestrator_effort="xhigh", member_effort="high",
+        )
+        with patch("mtg_agentic.__main__._make_model", side_effect=lambda a: (a.model, a.effort)):
+            self.assertEqual(
+                _council_models(args),
+                (("claude-sonnet-5-5", "xhigh"), ("claude-haiku-5-5", "high")),
+            )
+            args.provider, args.model = "ollama", "qwen2.5:7b"
+            self.assertEqual(
+                _council_models(args), (("qwen2.5:7b", "xhigh"), ("qwen2.5:7b", "high"))
+            )
+
+    def test_council_command_drafts_a_saved_pool(self):
+        from mtg_agentic.__main__ import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            records = playable_records()
+            with OracleStore(path / "oracle.sqlite3") as store:
+                store.import_cards(records)
+                (path / "pool.json").write_text(json.dumps(make_pool(store).to_dict()), encoding="utf-8")
+            model = CouncilModel({focus: picks(*range(63)) for focus in ("engine", "resilience", "consistency")})
+            output = path / "deck.json"
+            with patch("mtg_agentic.__main__._make_model", return_value=model):
+                status = main([
+                    "--quiet", "--data-dir", str(path), "council", "--pool", str(path / "pool.json"),
+                    "--skip-review", "--output", str(output),
+                ])
+            deck = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(status, 0, deck.get("validation"))
+        self.assertEqual(deck["commander"], JODAH["name"])
+        self.assertEqual(deck["council"]["core"], ["Spell 1", "Spell 2", "Spell 3"])
+
+
+if __name__ == "__main__":
+    unittest.main()

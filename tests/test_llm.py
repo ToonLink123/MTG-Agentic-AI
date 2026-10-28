@@ -4,7 +4,14 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 
-from mtg_agentic.llm import LLMError, OllamaClient, OpenAICompatibleClient, request_json
+from mtg_agentic.llm import (
+    LFM3_MODEL,
+    LlamaCppClient,
+    LLMError,
+    OllamaClient,
+    OpenAICompatibleClient,
+    request_json,
+)
 from mtg_agentic.schema import SPEC_SCHEMA, SchemaError
 from tests.pipeline_fixtures import make_spec
 
@@ -86,3 +93,61 @@ class LLMTests(unittest.TestCase):
                 [{"role": "user", "content": "x" * 15000}], SPEC_SCHEMA
             )
         http.assert_not_called()
+
+    @patch("mtg_agentic.llm.urlopen")
+    def test_llama_cpp_defaults_to_local_lfm3_with_schema_and_no_key(self, http):
+        http.return_value = io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [{"message": {"content": json.dumps(make_spec().to_dict())}}],
+                    "usage": {"prompt_tokens": 900, "completion_tokens": 40},
+                }
+            ).encode()
+        )
+        client = LlamaCppClient()
+        request_json(client, [{"role": "user", "content": "Myojin"}], SPEC_SCHEMA)
+        request = http.call_args.args[0]
+        body = json.loads(request.data)
+        self.assertEqual(request.full_url, "http://localhost:8080/v1/chat/completions")
+        self.assertEqual(body["model"], LFM3_MODEL)
+        self.assertEqual(body["temperature"], 0)
+        self.assertEqual(body["response_format"]["json_schema"]["schema"], SPEC_SCHEMA)
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertNotIn("chat_template_kwargs", body)
+        prompt = len(json.dumps([{"role": "user", "content": "Myojin"}])) // 3
+        self.assertEqual(body["max_tokens"], 65536 - prompt)
+        self.assertEqual((client.usage["prompt"], client.usage["output"]), (900, 40))
+        http.return_value = io.BytesIO(
+            json.dumps({"choices": [{"message": {"content": json.dumps(make_spec().to_dict())}}]}).encode()
+        )
+        request_json(LlamaCppClient(thinking=False), [], SPEC_SCHEMA)
+        body = json.loads(http.call_args.args[0].data)
+        self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+
+    @patch("mtg_agentic.llm.urlopen")
+    def test_malformed_replies_are_counted_and_logged_per_call_and_in_totals(self, http):
+        replies = [
+            {"message": {"content": "not json"}},
+            {"message": {"content": "{}"}},
+            {"done_reason": "length"},
+            {"message": {"content": json.dumps(make_spec().to_dict())}, "eval_count": 7},
+        ]
+        http.side_effect = [io.BytesIO(json.dumps(r).encode()) for r in replies]
+        client = OllamaClient()
+        with self.assertLogs("mtg_agentic.llm", "INFO") as logs:
+            for error in (SchemaError, SchemaError, LLMError):
+                with self.assertRaises(error):
+                    request_json(client, [], SPEC_SCHEMA)
+            request_json(client, [], SPEC_SCHEMA)
+            client.report()
+        self.assertEqual(
+            {k: client.usage[k] for k in ("calls", "json", "schema", "truncated", "output")},
+            {"calls": 4, "json": 1, "schema": 1, "truncated": 1, "output": 7},
+        )
+        self.assertIn("MALFORMED invalid JSON", logs.output[0])
+        self.assertIn("MALFORMED schema", logs.output[1])
+        self.assertIn("MALFORMED truncated", logs.output[2])
+        self.assertIn("| ok |", logs.output[3])
+        self.assertIn(
+            "4 calls | 3 malformed (1 invalid JSON, 1 schema, 1 truncated)", logs.output[4]
+        )

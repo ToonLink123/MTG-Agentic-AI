@@ -12,8 +12,10 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from .brackets import BracketChecker, bracket_rules
+from .brackets import BracketChecker, SpellbookClient, bracket_rules
+from .council import MEMBER, ORCHESTRATOR, council_draft
 from .discovery import CandidatePool
+from .edit import Toolbox, edit_deck
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .evaluation import evaluation_history, run_evaluation
 from .forge import ForgeError
@@ -24,36 +26,58 @@ from .forge_config import OpponentPod
 from .forge_metrics import summarize
 from .forge_runner import ForgeSimulator
 from .lands import generate_mana_base, is_land
-from .llm import LLMError, OllamaClient, OpenAICompatibleClient
+from .llm import PROVIDERS, LlamaCppClient, LLMError, OllamaClient, OpenAICompatibleClient
 from .oracle import DEFAULT_DATA_DIR, OracleStore
 from .pipeline import build_deck, discover, draft_deck, draft_from_request
 from .playability import spec_for_deck, validate_playability
 from .review import DeckReviewer
 from .revision import revise_deck
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore
+from .rules_index import DEFAULT_REPO as DEFAULT_RULES_INDEX
+from .rules_index import PrebuiltIndex
 from .schema import BRACKET3_MODES, SPEC_SCHEMA, SchemaError, load_json
 from .scryfall import ScryfallClient, ScryfallError
 from .sources import SourceCache, SourceError
 from .spec import DeckSpec, intake
 from .validator import validate_deck
 
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
 
 def _model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
-        choices=("ollama", "openai-compatible", "claude"),
+        choices=PROVIDERS,
         default=os.getenv("MTG_LLM_PROVIDER", "ollama"),
     )
     parser.add_argument("--model", default=os.getenv("MTG_LLM_MODEL"))
     parser.add_argument("--llm-url", default=os.getenv("MTG_LLM_BASE_URL"))
     parser.add_argument("--llm-timeout", type=float, default=300)
     parser.add_argument("--context-size", type=int, default=65536)
+    parser.add_argument("--effort", choices=EFFORTS, default="high")
     parser.add_argument(
-        "--effort", choices=("low", "medium", "high", "xhigh", "max"), default="high"
+        "--no-thinking",
+        action="store_true",
+        help="llama-cpp: disable reasoning in chat templates that support enable_thinking",
     )
     parser.add_argument(
         "--output", type=Path, help="Save JSON to a NEW file; existing files are never overwritten"
     )
+
+
+def _council_models(args: argparse.Namespace):
+    """Orchestrator and member clients; Claude defaults to Sonnet leading Haiku."""
+    claude = args.provider == "claude"
+
+    def make(model: str | None, effort: str):
+        return _make_model(argparse.Namespace(**{**vars(args), "model": model, "effort": effort}))
+
+    orchestrator = make(
+        args.orchestrator_model or (ORCHESTRATOR[0] if claude else args.model),
+        args.orchestrator_effort,
+    )
+    member = make(args.member_model or (MEMBER[0] if claude else args.model), args.member_effort)
+    return orchestrator, member
 
 
 def _bracket3_options(parser: argparse.ArgumentParser) -> None:
@@ -80,6 +104,15 @@ def _make_model(args: argparse.Namespace):
             base_url=args.llm_url or "http://localhost:11434",
             timeout=args.llm_timeout,
             context_size=args.context_size,
+        )
+    if args.provider == "llama-cpp":
+        return LlamaCppClient(
+            *([args.model] if args.model else []),
+            base_url=args.llm_url or "http://localhost:8080/v1",
+            timeout=args.llm_timeout,
+            context_size=args.context_size,
+            api_key=os.getenv("MTG_LLM_API_KEY") or None,
+            thinking=not args.no_thinking,
         )
     if args.provider == "claude":
         from .claude import ClaudeClient  # Loads the optional Anthropic SDK only when selected.
@@ -135,6 +168,19 @@ def _embedding_options(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--embedding-url", default="http://localhost:11434")
     parser.add_argument("--embedding-device", help="embeddinggemma: cuda or cpu (default: auto)")
+    parser.add_argument(
+        "--rules-index",
+        default=os.getenv("MTG_RULES_INDEX_REPO", DEFAULT_RULES_INDEX),
+        help="Hugging Face dataset with prebuilt rule vectors, used when they match exactly; "
+        "'none' always embeds locally",
+    )
+
+
+def _rules_store(args: argparse.Namespace, *, prebuilt: bool = True) -> RulesStore:
+    repo = args.rules_index if prebuilt and args.rules_index not in {"", "none"} else None
+    return RulesStore(
+        _rules_path(args), _embedder(args), prebuilt=PrebuiltIndex(repo) if repo else None
+    )
 
 
 def _embedder(args: argparse.Namespace):
@@ -159,7 +205,7 @@ def _rules_path(args: argparse.Namespace) -> Path:
 
 def _reviewer(args, stack, store, client, model):
     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
-    rules = stack.enter_context(RulesStore(_rules_path(args), _embedder(args)))
+    rules = stack.enter_context(_rules_store(args))
     rules.download_rules(sources)
     brackets = BracketChecker(store, client, sources, model)
     return DeckReviewer(brackets, rules, model, store, client)
@@ -278,6 +324,42 @@ def main(argv: list[str] | None = None) -> int:
     )
     _embedding_options(draft_cmd)
     _model_options(draft_cmd)
+    council_cmd = commands.add_parser(
+        "council",
+        help="Draft with an orchestrator and members that debate only the cards they disagree on",
+    )
+    council_cmd.add_argument("--pool", required=True, type=Path)
+    council_cmd.add_argument("--members", type=int, choices=range(2, 7), default=3)
+    council_cmd.add_argument("--repairs", type=int, choices=range(4), default=3)
+    council_cmd.add_argument(
+        "--orchestrator-model", help=f"Default: {ORCHESTRATOR[0]} for claude, else --model"
+    )
+    council_cmd.add_argument("--orchestrator-effort", choices=EFFORTS, default=ORCHESTRATOR[1])
+    council_cmd.add_argument("--member-model", help=f"Default: {MEMBER[0]} for claude, else --model")
+    council_cmd.add_argument("--member-effort", choices=EFFORTS, default=MEMBER[1])
+    council_cmd.add_argument(
+        "--skip-review", action="store_true",
+        help="Explicitly skip bracket/rules safety review (not evaluation-ready)",
+    )
+    _embedding_options(council_cmd)
+    _model_options(council_cmd)
+    edit_cmd = commands.add_parser(
+        "edit-deck",
+        help="Ask the orchestrator about a drafted deck or for changes; it can use tools",
+    )
+    edit_cmd.add_argument("deck", type=Path)
+    edit_cmd.add_argument(
+        "--pool", type=Path, help="The deck's candidate pool; without it, only searches add cards"
+    )
+    edit_cmd.add_argument("--request", required=True, help="The player's message")
+    edit_cmd.add_argument("--steps", type=int, choices=range(2, 31), default=10,
+                          help="Most model steps, tool calls included")
+    edit_cmd.add_argument(
+        "--skip-review", action="store_true",
+        help="Explicitly skip bracket/rules safety review of the changes",
+    )
+    _embedding_options(edit_cmd)
+    _model_options(edit_cmd)
     build_cmd = commands.add_parser(
         "build", help="Draft, pass safety reviews, then complete at least 10 Forge games per pod"
     )
@@ -294,6 +376,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     download_rules.add_argument("--refresh", action="store_true")
     _embedding_options(download_rules)
+    export_index = commands.add_parser(
+        "export-rules-index", help="Embed the current rules locally and write files to publish"
+    )
+    export_index.add_argument("--output", type=Path, required=True, help="Directory to write")
+    _embedding_options(export_index)
     for name in ("bracket-check", "review-deck"):
         cmd = commands.add_parser(name, help="Assess a JSON deck; review-deck also checks rules")
         cmd.add_argument("deck", type=Path)
@@ -325,8 +412,22 @@ def main(argv: list[str] | None = None) -> int:
     _simulation_options(revise, required=True, games=50)
     history = commands.add_parser("evaluation-history")
     history.add_argument("--runs-dir", type=Path)
+    tui = commands.add_parser("tui", help="Dark terminal chat: pick a commander, describe a deck")
+    tui.add_argument("--provider", choices=PROVIDERS, help="Default: MTG_LLM_PROVIDER or ollama")
+    tui.add_argument("--model", help="Default: MTG_LLM_MODEL or the provider's default")
     register_forge_commands(commands)
     args = parser.parse_args(argv)
+    if args.command == "tui":
+        try:
+            from .tui import run_tui  # Loads the optional Textual package only when selected.
+        except ModuleNotFoundError as exc:
+            if exc.name != "textual" and not (exc.name or "").startswith("textual."):
+                raise
+            print(json.dumps({"valid": False, "errors": [
+                {"error": "input", "detail": 'The TUI needs: python -m pip install -e ".[tui]"'}
+            ]}))
+            return 2
+        return run_tui(args.data_dir, provider=args.provider, model=args.model)
     if args.command in {"evaluate", "evaluation-history"} and args.runs_dir is None:
         args.runs_dir = args.data_dir / "evaluations"
     if args.command == "revise" and args.runs_dir is None:
@@ -380,9 +481,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "download-rules":
             with (
                 SourceCache(args.data_dir / "sources.sqlite3") as sources,
-                RulesStore(_rules_path(args), _embedder(args)) as rules,
+                _rules_store(args) as rules,
             ):
                 _emit(rules.download_rules(sources, refresh=args.refresh))
+            return 0
+        if args.command == "export-rules-index":
+            # Never prebuilt: a published index must come from embeddings computed here.
+            with (
+                SourceCache(args.data_dir / "sources.sqlite3") as sources,
+                _rules_store(args, prebuilt=False) as rules,
+            ):
+                _emit(rules.export_index(sources, args.output))
             return 0
         if args.command in {
             "bracket-check",
@@ -412,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
                     _emit(result, args.output)
                     return 0 if result["verdict"] == "fits" else 1
                 if args.command == "check-interaction":
-                    rules = stack.enter_context(RulesStore(_rules_path(args), _embedder(args)))
+                    rules = stack.enter_context(_rules_store(args))
                     rules.download_rules(sources)
                     rules.ingest_deck(args.cards, store, client)
                     canonical = [store.get_card(n)["name"] for n in args.cards]
@@ -516,6 +625,68 @@ def main(argv: list[str] | None = None) -> int:
                     result["valid"] = result["passed"]
                 _emit(result, args.output)
                 return 0 if result["valid"] else 1
+        if args.command == "edit-deck":
+            if args.output is not None and args.output.exists():
+                raise ValueError("Output already exists; choose a new filename")
+            model = _make_model(args)
+            with (
+                ExitStack() as stack,
+                OracleStore(args.data_dir / "oracle.sqlite3") as store,
+                ScryfallClient(args.data_dir / "responses.sqlite3") as client,
+            ):
+                if hasattr(model, "report"):
+                    stack.callback(model.report)
+                if not store.ready:
+                    raise ValueError("Run download-oracle before using the LLM pipeline")
+                sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
+                # The orchestrator's rules tool needs the index even when the review is off.
+                if args.skip_review:
+                    reviewer = None
+                    rules = stack.enter_context(_rules_store(args))
+                    rules.download_rules(sources)
+                else:
+                    reviewer = _reviewer(args, stack, store, client, model)
+                    rules = reviewer.rules
+                deck = _deck_json(args.deck)
+                pool = (
+                    CandidatePool.from_dict(
+                        load_json(args.pool.read_text(encoding="utf-8-sig")), store
+                    )
+                    if args.pool is not None
+                    else CandidatePool(spec_for_deck(deck, store), [])
+                )
+                result = edit_deck(
+                    deck, pool, model, args.request,
+                    tools=Toolbox(store, client, rules, SpellbookClient(sources)),
+                    reviewer=reviewer, max_steps=args.steps,
+                )
+            _emit(result, args.output)
+            return 1 if result.get("valid") is False else 0
+        if args.command == "council":
+            if args.output is not None and args.output.exists():
+                raise ValueError("Output already exists; choose a new filename")
+            orchestrator, member = _council_models(args)
+            with (
+                ExitStack() as stack,
+                OracleStore(args.data_dir / "oracle.sqlite3") as store,
+                ScryfallClient(args.data_dir / "responses.sqlite3") as client,
+            ):
+                for model in (member, orchestrator):
+                    if hasattr(model, "report"):
+                        stack.callback(model.report)
+                if not store.ready:
+                    raise ValueError("Run download-oracle before using the LLM pipeline")
+                # The many parallel rules questions go to the cheaper member model.
+                reviewer = None if args.skip_review else _reviewer(args, stack, store, client, member)
+                pool = CandidatePool.from_dict(
+                    load_json(args.pool.read_text(encoding="utf-8-sig")), store
+                )
+                result = council_draft(
+                    pool, orchestrator, member, client, store,
+                    members=args.members, max_repairs=args.repairs, reviewer=reviewer,
+                )
+            _emit(result, args.output)
+            return 1 if result.get("valid") is False else 0
         if args.command in {"intake", "discover", "draft", "build"}:
             if args.output is not None and args.output.exists():
                 raise ValueError("Output already exists; choose a new filename")

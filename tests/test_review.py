@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -119,8 +121,11 @@ class ReviewTests(unittest.TestCase):
         bracket.check.return_value = {"verdict": "fits", "reasons": [], "spellbook": {"combos": []}}
         rules = Mock()
         rules.ingest_deck.return_value = {"count": 3}
-        rules.check_interaction.return_value = {"status": "supported", "claims": []}
-        return DeckReviewer(bracket, rules, Mock(), self.store, self.client)
+        rules.interaction_request.side_effect = lambda names, question: ([], [])
+        rules.judge_interaction.return_value = {"status": "supported", "claims": []}
+        model = Mock(concurrency=4)
+        model.complete_json.return_value = {"status": "supported", "claims": []}
+        return DeckReviewer(bracket, rules, model, self.store, self.client)
 
     def test_jodah_myojin_proliferate_engine_and_all_deck_rulings_are_checked(self):
         self.store.add_verified_card(card("Myojin Test", text="Enters with a divinity counter."))
@@ -131,7 +136,7 @@ class ReviewTests(unittest.TestCase):
         service.rules.ingest_deck.assert_called_once_with(
             [JODAH["name"], "Myojin Test", "Proliferator"], self.store, self.client
         )
-        names, question, _ = service.rules.check_interaction.call_args.args
+        names, question = service.rules.interaction_request.call_args.args
         self.assertEqual(names, [JODAH["name"], "Myojin Test", "Proliferator"])
         self.assertIn("casting from hand", question)
         self.assertIn("none is already present", question)
@@ -147,7 +152,7 @@ class ReviewTests(unittest.TestCase):
                 "results": ["Infinite mana"],
             }
         ]
-        service.rules.check_interaction.return_value = {
+        service.rules.judge_interaction.return_value = {
             "status": "unsupported",
             "cards": ["Spell 0", "Spell 1"],
             "question": "Loop?",
@@ -156,7 +161,7 @@ class ReviewTests(unittest.TestCase):
         result = service.check({"Spell 0": 1, "Spell 1": 1}, JODAH["name"], 3)
         self.assertEqual(result["status"], "needs_revision")
         self.assertEqual(result["errors"][0]["error"], "interaction_review")
-        self.assertIn("both untapped", service.rules.check_interaction.call_args.args[1])
+        self.assertIn("both untapped", service.rules.interaction_request.call_args.args[1])
 
     def test_new_myojin_review_uses_indestructible_not_divinity_counters(self):
         self.store.add_verified_card(card(
@@ -167,6 +172,47 @@ class ReviewTests(unittest.TestCase):
         self.store.add_verified_card(card("Proliferator", text="Proliferate."))
         service = self.service()
         service.check({"Myojin of Blooming Dawn": 1, "Proliferator": 1}, JODAH["name"], 3)
-        question = service.rules.check_interaction.call_args.args[1]
+        question = service.rules.interaction_request.call_args.args[1]
         self.assertIn("indestructible counter", question)
         self.assertNotIn("divinity counter", question)
+
+    def test_every_rules_question_is_asked_in_parallel_without_a_cap(self):
+        names = [f"Myojin {n}" for n in range(25)]
+        for name in names:
+            self.store.add_verified_card(card(name, text="Enters with a divinity counter."))
+        service = self.service()
+        lock, running, peak = threading.Lock(), [0], [0]
+
+        def answer(messages, schema):
+            with lock:
+                running[0] += 1
+                peak[0] = max(peak[0], running[0])
+            time.sleep(0.02)
+            with lock:
+                running[0] -= 1
+            return {"status": "supported", "claims": []}
+
+        service.model.complete_json.side_effect = answer
+        result = service.check(dict.fromkeys(names, 1), JODAH["name"], 3)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(len(result["interactions"]), 25)
+        self.assertEqual(service.model.complete_json.call_count, 25)
+        self.assertTrue(1 < peak[0] <= 4, peak[0])
+
+    def test_a_malformed_answer_fails_only_its_own_question(self):
+        for name in ("Myojin A", "Myojin B"):
+            self.store.add_verified_card(card(name, text="Enters with a divinity counter."))
+        service = self.service()
+        service.model.complete_json.side_effect = lambda messages, schema: (
+            {"wrong": True} if "Myojin A" in json.dumps(messages) else {"status": "supported", "claims": []}
+        )
+        service.rules.interaction_request.side_effect = lambda names, question: (
+            [{"role": "user", "content": question}], []
+        )
+        service.rules.judge_interaction.side_effect = lambda names, question, evidence, answer: {
+            "status": answer["status"], "claims": [], "cards": names, "question": question,
+        }
+        result = service.check({"Myojin A": 1, "Myojin B": 1}, JODAH["name"], 3)
+        statuses = {r["question"].split(",")[0]: r["status"] for r in result["interactions"]}
+        self.assertEqual(statuses, {"For Myojin A": "unsupported", "For Myojin B": "supported"})
+        self.assertEqual(result["status"], "needs_revision")

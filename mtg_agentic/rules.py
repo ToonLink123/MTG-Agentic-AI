@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
-from . import prompts
+from . import activity, prompts
 from .cards import name_key
 from .llm import HTTPJSONModel, JSONModel, request_json
 from .oracle import OracleStore
@@ -28,6 +28,7 @@ from .rules_graph import (
     in_family,
     stems,
 )
+from .rules_index import PrebuiltIndex, inputs_sha256, write_index
 from .schema import NAME_SCHEMA, object_schema
 from .scryfall import ScryfallClient
 from .sources import SourceCache, SourceError, utc_now
@@ -240,11 +241,14 @@ def _seeds(groups: list[tuple[dict[str, float], float]]) -> dict[str, float]:
 class RulesStore:
     """SQLite vectors fused with lexical scores and a walk over the Comprehensive Rules graph."""
 
-    def __init__(self, path: str | Path, embedder: Embedder):
+    def __init__(
+        self, path: str | Path, embedder: Embedder, *, prebuilt: PrebuiltIndex | None = None
+    ):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
         self.embedder = embedder
+        self.prebuilt = prebuilt
         self._docs: list[_Doc] | None = None
         self._graph_cache: RulesGraph | None = None
         self._df: Counter = Counter()
@@ -286,32 +290,29 @@ class RulesStore:
     def metadata(self) -> dict[str, str]:
         return dict(self.db.execute("SELECT key,value FROM rule_metadata"))
 
-    def _embed_documents(self, docs: list[dict[str, str]]) -> list[tuple[Any, ...]]:
+    def _embed_documents(
+        self, docs: list[dict[str, str]], vectors: list[list[float]] | None = None
+    ) -> list[tuple[Any, ...]]:
+        """Rows for `docs`, embedding them unless verified prebuilt `vectors` are given."""
         dimension = int(self._meta("dimension") or 0) or None
-        rows = []
-        for start in range(0, len(docs), 32):
-            batch = docs[start : start + 32]
-            vectors = _vectors(
-                self.embedder.embed(
-                    [d["text"] for d in batch], titles=[d.get("title") or "none" for d in batch]
-                ),
-                len(batch),
-                dimension,
-            )
-            dimension = len(vectors[0])
-            rows.extend(
-                (
-                    d["id"],
-                    d["kind"],
-                    d["text"],
-                    d["source"],
-                    d["published"],
-                    d["card"],
-                    json.dumps(v),
+        if vectors is not None:
+            vectors = _vectors(vectors, len(docs), dimension)
+        else:
+            vectors = []
+            for start in range(0, len(docs), 32):
+                batch = docs[start : start + 32]
+                vectors += _vectors(
+                    self.embedder.embed(
+                        [d["text"] for d in batch], titles=[d.get("title") or "none" for d in batch]
+                    ),
+                    len(batch),
+                    dimension,
                 )
-                for d, v in zip(batch, vectors)
-            )
-        return rows
+                dimension = len(vectors[0])
+        return [
+            (d["id"], d["kind"], d["text"], d["source"], d["published"], d["card"], json.dumps(v))
+            for d, v in zip(docs, vectors)
+        ]
 
     def _write(self, rows: list[tuple[Any, ...]]) -> None:
         self.db.executemany("INSERT OR REPLACE INTO documents VALUES (?,?,?,?,?,?,?)", rows)
@@ -371,7 +372,8 @@ class RulesStore:
     def _idf(self, stem: str) -> float:
         return math.log((self._rule_docs + 1) / (self._df.get(stem, 0) + 1)) + 1
 
-    def import_rules(self, text: str, *, source: str, fetched_at: str) -> dict[str, str]:
+    @staticmethod
+    def _parse_rules(text: str, source: str) -> tuple[str, GraphRows, list[dict[str, str]]]:
         date, chunks = chunk_rules(text)
         graph = build_graph(text, chunks)
         docs = [
@@ -386,7 +388,17 @@ class RulesStore:
             }
             for n, body in chunks.items()
         ]
-        rows = self._embed_documents(docs)
+        return date, graph, docs
+
+    def import_rules(self, text: str, *, source: str, fetched_at: str) -> dict[str, str]:
+        date, graph, docs = self._parse_rules(text, source)
+        rules_sha256 = hashlib.sha256(text.encode()).hexdigest()
+        inputs = inputs_sha256(docs)
+        vectors = None
+        if self.prebuilt is not None:
+            ids = [d["id"] for d in docs]
+            vectors = self.prebuilt.vectors(self.embedder.identity, rules_sha256, inputs, ids)
+        rows = self._embed_documents(docs, vectors)
         with self.db:
             self.db.execute("DELETE FROM documents WHERE kind='rule'")
             self._write(rows)
@@ -397,13 +409,16 @@ class RulesStore:
                     ("effective_date", date),
                     ("source", source),
                     ("fetched_at", fetched_at),
-                    ("rule_count", str(len(chunks))),
-                    ("rules_sha256", hashlib.sha256(text.encode()).hexdigest()),
+                    ("rule_count", str(len(docs))),
+                    ("rules_sha256", rules_sha256),
+                    ("inputs_sha256", inputs),
+                    ("vectors", f"hf:{self.prebuilt.repo}" if vectors else "local"),
                 ],
             )
         return self.metadata
 
-    def download_rules(self, cache: SourceCache, *, refresh: bool = False) -> dict[str, str]:
+    def _rules_text(self, cache: SourceCache, *, refresh: bool = False) -> tuple[str, str, str]:
+        """The current Comprehensive Rules text, its official URL and when it was fetched."""
         landing, _ = cache.fetch(RULES_PAGE, refresh=refresh)
         links = re.findall(
             r'https://media\.wizards\.com/[^"\'<>]+\.txt', html.unescape(landing.decode("utf-8"))
@@ -413,7 +428,31 @@ class RulesStore:
             raise SourceError("Official rules page did not link Comprehensive Rules text")
         source = quote(links[0], safe=":/%")
         raw, stamp = cache.fetch(source, refresh=refresh)
-        text = raw.decode("utf-8-sig")
+        return raw.decode("utf-8-sig"), source, stamp
+
+    def export_index(self, cache: SourceCache, out_dir: Path) -> dict[str, Any]:
+        """Write this store's rule vectors for publishing, embedding the current rules first."""
+        text, source, stamp = self._rules_text(cache)
+        _, _, docs = self._parse_rules(text, source)
+        inputs = inputs_sha256(docs)
+        # Publish only vectors embedded here from exactly these inputs, never re-published ones.
+        if self._meta("inputs_sha256") != inputs or self._meta("vectors") != "local":
+            self.import_rules(text, source=source, fetched_at=stamp)
+        if self._meta("vectors") != "local":
+            raise ValueError("Export needs locally embedded vectors; disable the prebuilt index")
+        stored = dict(self.db.execute("SELECT id, vector FROM documents WHERE kind='rule'"))
+        return write_index(
+            out_dir,
+            identity=self.embedder.identity,
+            rules_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            inputs=inputs,
+            effective_date=self._meta("effective_date") or "",
+            ids=[d["id"] for d in docs],
+            vectors=[json.loads(stored[d["id"]]) for d in docs],
+        )
+
+    def download_rules(self, cache: SourceCache, *, refresh: bool = False) -> dict[str, str]:
+        text, source, stamp = self._rules_text(cache, refresh=refresh)
         if self._meta("rules_sha256") != hashlib.sha256(text.encode()).hexdigest():
             return self.import_rules(text, source=source, fetched_at=stamp)
         with self.db:
@@ -438,6 +477,7 @@ class RulesStore:
         synced = []
         for key, card in canonical.items():
             # Scryfall's own 24-hour response cache makes repeated synchronization cheap.
+            activity.tool("scryfall rulings", card["name"])
             rulings = client.get_rulings(card["id"])
             source = f"https://api.scryfall.com/cards/{card['id']}/rulings"
             docs = [
@@ -592,28 +632,33 @@ class RulesStore:
     def check_interaction(
         self, cards: list[str], question: str, model: JSONModel
     ) -> dict[str, Any]:
+        messages, evidence = self.interaction_request(cards, question)
+        answer = request_json(model, messages, INTERACTION_SCHEMA)
+        return self.judge_interaction(cards, question, evidence, answer)
+
+    def interaction_request(
+        self, cards: list[str], question: str
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Retrieve evidence and build the judge's messages. SQLite and the embedder stay on
+        the calling thread, so only the model call itself can run in parallel."""
+        activity.tool("rules lookup", " + ".join(n.split(",")[0] for n in cards))
         evidence = self.retrieve(cards, question)
+        payload = {"cards": cards, "question": question, "evidence": evidence}
+        messages = [
+            {"role": "system", "content": prompts.INTERACTION},
+            {"role": "user", "content": json.dumps(payload)},
+        ]
+        return messages, evidence
+
+    def judge_interaction(
+        self,
+        cards: list[str],
+        question: str,
+        evidence: list[dict[str, str]],
+        answer: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Accept an answer only if every claim cites retrieved rules or rulings verbatim."""
         by_id = {e["id"]: e for e in evidence}
-        answer = request_json(
-            model,
-            [
-                {
-                    "role": "system",
-                    "content": prompts.INTERACTION,
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "cards": cards,
-                            "question": question,
-                            "evidence": evidence,
-                        }
-                    ),
-                },
-            ],
-            INTERACTION_SCHEMA,
-        )
         problems = []
         if answer["status"] != "unsupported" and not answer["claims"]:
             problems.append("A rules conclusion requires cited claims.")

@@ -8,6 +8,7 @@ SentenceTransformers head: mean pooling over every token, then L2 normalization.
 from __future__ import annotations
 
 import logging
+import sys
 import time
 
 EMBEDDINGGEMMA_MODEL = "google/embeddinggemma-2"
@@ -48,39 +49,55 @@ class EmbeddingGemmaEmbedder:
             raise ValueError(f"EmbeddingGemma 2 dimension must be one of {DIMENSIONS}")
         if type(batch_size) is not int or batch_size < 1:
             raise ValueError("Embedding batch size must be a positive integer")
+        # Checked at startup, before any model call, so a draft fails before it spends tokens.
+        # Nothing has been embedded yet; rules questions still need the model at runtime.
+        install = f'{sys.executable} -m pip install "transformers>=5.21" torch'
         try:
             import torch
             import transformers
             from transformers import AutoConfig, AutoModel, AutoTokenizer
         except ImportError:
             raise ValueError(
-                'EmbeddingGemma 2 needs: pip install "transformers>=5.21" torch'
+                f"EmbeddingGemma 2 needs transformers>=5.21 and torch in this Python. "
+                f"Install them with: {install}"
             ) from None
         if not hasattr(transformers, "EmbeddingGemma2Model"):
             raise ValueError(
-                f"EmbeddingGemma 2 needs transformers>=5.21, found {transformers.__version__}"
+                f"EmbeddingGemma 2 needs transformers>=5.21, but {sys.executable} has "
+                f"{transformers.__version__}. Nothing was embedded. Run with the project's "
+                f".venv, or upgrade with: {install}"
             )
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.model, self.revision, self.dimension = model, revision, dimension
+        self.batch_size, self._torch = batch_size, torch
+        self._auto = (AutoConfig, AutoModel, AutoTokenizer)
+        self.identity = f"hf:{model}@{revision or 'main'}:{dimension}:{FORMAT_VERSION}"
+        # Weights load on the first embed, so a prebuilt rules index never loads the model.
+        self._model = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
+        torch, (AutoConfig, AutoModel, AutoTokenizer) = self._torch, self._auto
         # The model card forbids float16: its activations overflow into NaN or silent garbage.
         bf16 = self.device.startswith("cuda") and torch.cuda.is_bf16_supported()
         dtype = torch.bfloat16 if bf16 else torch.float32
-        self.model, self.dimension, self.batch_size, self._torch = model, dimension, batch_size, torch
-        self.identity = f"hf:{model}@{revision or 'main'}:{dimension}:{FORMAT_VERSION}"
         start = time.monotonic()
         config = AutoConfig.from_pretrained(
-            model, revision=revision, vision_config=None, audio_config=None
+            self.model, revision=self.revision, vision_config=None, audio_config=None
         )
-        self._tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
-        self._model = (
-            AutoModel.from_pretrained(model, revision=revision, config=config, dtype=dtype)
-            .to(self.device)
-            .eval()
+        self._tokenizer = AutoTokenizer.from_pretrained(self.model, revision=self.revision)
+        model = AutoModel.from_pretrained(
+            self.model, revision=self.revision, config=config, dtype=dtype
         )
-        log.info("embeddings: loaded %s on %s in %.1fs", model, self.device, time.monotonic() - start)
+        self._model = model.to(self.device).eval()
+        took = time.monotonic() - start
+        log.info("embeddings: loaded %s on %s in %.1fs", self.model, self.device, took)
 
     def embed(
         self, texts: list[str], *, titles: list[str] | None = None, query: bool = False
     ) -> list[list[float]]:
+        self._load()
         torch = self._torch
         inputs = format_inputs(texts, titles=titles, query=query)
         vectors: list[list[float]] = []

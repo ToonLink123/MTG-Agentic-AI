@@ -1,0 +1,420 @@
+import asyncio
+import contextlib
+import importlib.util
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from rich.console import Console
+
+from mtg_agentic.__main__ import main
+from mtg_agentic.cards import trim_card
+from tests.pipeline_fixtures import JODAH, make_spec
+
+HAS_TEXTUAL = importlib.util.find_spec("textual") is not None
+if HAS_TEXTUAL:
+    from textual.widgets import Input
+
+    from mtg_agentic.tui import (
+        COUNCIL_STEPS,
+        ChatApp,
+        SessionPicker,
+        Settings,
+        card_type,
+        identity,
+        mana,
+        parse_question,
+        render_deck,
+        run_cli,
+    )
+
+SPEC = make_spec().to_dict()
+POOL = {
+    "version": 1, "spec": SPEC, "diagnostics": [],
+    "cards": [{**trim_card(JODAH), "name": "Sol Ring", "roles": ["ramp"]}],
+    "queries": [{"role": "ramp", "query": "otag:ramp"}],
+}
+DECK = {
+    "valid": False, "commander": JODAH["name"], "bracket": 3, "spec": SPEC,
+    "cards": {"Sol Ring": 1, "Island": 10}, "role_counts": {"ramp": 1, "lands": 10},
+    "validation": {"errors": [{"error": "deck_size", "detail": "Expected 99 cards"}]},
+    "review": {"status": "not_run", "errors": []},
+}
+
+
+def plain(renderable, width=120):
+    console = Console(width=width, file=io.StringIO(), color_system=None)
+    console.print(renderable)
+    return console.file.getvalue()
+
+
+@unittest.skipUnless(HAS_TEXTUAL, "the TUI needs the optional textual package")
+class TuiHelperTests(unittest.TestCase):
+    def test_double_brackets_mark_cards_and_stay_readable_in_the_question(self):
+        cards, question = parse_question("Does [[Doubling Season]] double [[ Myojin of Night's Reach ]] counters?")
+        self.assertEqual(cards, ["Doubling Season", "Myojin of Night's Reach"])
+        self.assertEqual(question, "Does Doubling Season double Myojin of Night's Reach counters?")
+        self.assertEqual(parse_question("no cards here"), ([], "no cards here"))
+
+    def test_follow_ups_use_the_orchestrator_model_unless_one_is_chosen(self):
+        lead = ["--provider", "claude", "--model", "claude-sonnet-5-5", "--effort", "xhigh"]
+        self.assertEqual(Settings(provider="claude").orchestrator_args(), lead)
+        self.assertEqual(Settings(provider="claude", orchestrate=True).orchestrator_args(), lead)
+        chosen = Settings(provider="claude", model="claude-opus-5-5")
+        self.assertEqual(chosen.orchestrator_args(), ["--provider", "claude", "--model", "claude-opus-5-5"])
+        self.assertEqual(Settings(provider="ollama").orchestrator_args(), ["--provider", "ollama"])
+
+    def test_model_takes_an_optional_provider_that_resets_the_model(self):
+        settings = Settings(provider="ollama", model="qwen2.5:7b")
+        self.assertEqual(settings.model_args(), ["--provider", "ollama", "--model", "qwen2.5:7b"])
+        settings.choose_model(["Claude"])
+        self.assertEqual(settings.model_args(), ["--provider", "claude"])
+        settings.choose_model(["claude-haiku-5-5"])
+        self.assertEqual((settings.provider, settings.model), ("claude", "claude-haiku-5-5"))
+        settings.choose_model(["ollama", "qwen3:8b"])
+        self.assertEqual((settings.provider, settings.model), ("ollama", "qwen3:8b"))
+        settings.choose_model(["default"])
+        self.assertIsNone(settings.model)
+        with self.assertRaises(ValueError):
+            settings.choose_model(["claude", "a", "b"])
+        self.assertEqual(settings.provider, "ollama")  # A rejected command changes nothing.
+
+    def test_mode_and_review_accept_only_their_values(self):
+        settings = Settings()
+        settings.choose_mode("unrestricted")
+        settings.choose_review("off")
+        self.assertEqual((settings.mode, settings.review), ("unrestricted", False))
+        settings.choose_mode("auto")
+        self.assertIsNone(settings.mode)
+        with self.assertRaises(ValueError):
+            settings.choose_mode("loose")
+        with self.assertRaises(ValueError):
+            settings.choose_review("maybe")
+
+    def test_startup_warns_when_this_python_cannot_embed_rules_questions(self):
+        from mtg_agentic.tui import embedding_problem
+
+        versions = {"5.21.0": None, "5.30.1": None, "4.57.6": "4.57.6", "5.2.0": "5.2.0"}
+        for version, flagged in versions.items():
+            with patch("importlib.metadata.version", return_value=version):
+                problem = embedding_problem()
+            self.assertEqual(problem is None, flagged is None, version)
+            if flagged:
+                self.assertIn(f"transformers {flagged}", problem)
+                self.assertIn(sys.executable, problem)
+
+    def test_mana_and_identity_read_in_wubrg_order_with_hybrid_symbols_grouped(self):
+        self.assertEqual(mana("{W}{U}{B/P}{R}{G}").plain, "WU(B/P)RG")
+        self.assertEqual(mana("{1}{U} // {3}{R}").plain, "1U // 3R")
+        self.assertEqual(identity(["B", "G", "R", "U", "W"]).plain, "WUBRG")
+        self.assertEqual(identity([]).plain, "C")
+
+    def test_deck_groups_cards_by_front_face_type_with_lands_last(self):
+        self.assertEqual(card_type({"type_line": "Artifact Creature — Golem"}), "Creature")
+        self.assertEqual(card_type({"type_line": "Artifact Land"}), "Land")
+        self.assertEqual(card_type({"type_line": "Sorcery // Land"}), "Sorcery")
+        self.assertEqual(card_type(None), "Other")
+        types = {"Sol Ring": "Artifact", "Island": "Basic Land — Island", JODAH["name"]: JODAH["type_line"]}
+
+        def lookup(name):
+            return {"type_line": types[name], "mana_cost": "{1}", "cmc": 1}
+
+        text = plain(render_deck(DECK, lookup, Path("deck.json")))
+        self.assertIn("1 problem", text)
+        self.assertIn("Artifacts 1", text)
+        self.assertIn("Lands 10", text)
+        self.assertIn("10 Island", text)
+        self.assertIn("deck_size: Expected 99 cards", text)
+        self.assertLess(text.index("Artifacts"), text.index("Lands"))
+
+
+class FakeCli:
+    def __init__(self, results, wait=None, lines=None):
+        self.results, self.wait, self.calls = results, wait, []
+        self.lines = lines or {}
+
+    async def __call__(self, argv, data_dir, on_line):
+        self.calls.append(argv)
+        on_line(f"running {argv[0]}")
+        for line in self.lines.get(argv[0], []):
+            on_line(line)
+        if self.wait is not None:
+            await self.wait.wait()
+        return self.results[argv[0]]
+
+
+@unittest.skipUnless(HAS_TEXTUAL, "the TUI needs the optional textual package")
+class TuiAppTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.data_dir = Path(directory.name)
+
+    async def send(self, app, pilot, text, *, settle=True):
+        app.query_one(Input).value = text
+        await pilot.press("enter")
+        await pilot.pause()
+        if settle:
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+    async def test_a_name_sets_the_commander_then_a_request_runs_the_pipeline(self):
+        cli = FakeCli({
+            "card": (0, trim_card(JODAH)), "intake": (0, SPEC), "discover": (0, POOL), "draft": (1, DECK),
+        })
+        app = ChatApp(self.data_dir, Settings(provider="ollama"), runner=cli)
+        async with app.run_test() as pilot:
+            await self.send(app, pilot, "jodah")
+            self.assertEqual(app.commander, JODAH["name"])
+            await self.send(app, pilot, "/review off")
+            await self.send(app, pilot, "/mode unrestricted")
+            await self.send(app, pilot, "/model ollama qwen3:8b")
+            await self.send(app, pilot, "Bracket 3 Myojin tribal")
+        intake, discover, draft = cli.calls[1:]
+        self.assertEqual(cli.calls[0], ["card", "jodah"])
+        self.assertEqual(intake[:5], ["intake", "--commander", JODAH["name"], "--request", "Bracket 3 Myojin tribal"])
+        self.assertIn("unrestricted", intake)
+        self.assertEqual(intake[-4:], ["--provider", "ollama", "--model", "qwen3:8b"])
+        self.assertEqual(Path(discover[2]).name, "01-spec.json")
+        self.assertEqual(Path(draft[2]).name, "01-pool.json")
+        self.assertIn("--skip-review", draft)
+        self.assertEqual(json.loads(app.deck_path.read_text(encoding="utf-8")), DECK)
+        self.assertEqual([s["state"] for s in app.last.steps], ["done", "done", "warn"])
+        self.assertFalse(app.busy)
+
+    async def test_an_error_envelope_stops_the_pipeline_at_that_step(self):
+        error = {"valid": False, "errors": [{"error": "llm", "detail": "Ollama is not running"}]}
+        cli = FakeCli({"intake": (2, error)})
+        app = ChatApp(self.data_dir, Settings(), runner=cli)
+        async with app.run_test() as pilot:
+            app.commander = JODAH["name"]
+            await self.send(app, pilot, "Myojin tribal")
+        self.assertEqual([argv[0] for argv in cli.calls], ["intake"])
+        self.assertEqual([s["state"] for s in app.last.steps], ["failed", "pending", "pending"])
+        self.assertIsNone(app.deck)
+
+    async def test_escape_stops_the_run_and_new_requests_wait_until_then(self):
+        cli = FakeCli({"intake": (0, SPEC)}, wait=asyncio.Event())
+        app = ChatApp(self.data_dir, Settings(), runner=cli)
+        async with app.run_test() as pilot:
+            app.commander = JODAH["name"]
+            await self.send(app, pilot, "Myojin tribal", settle=False)
+            self.assertTrue(app.busy)
+            await self.send(app, pilot, "another deck", settle=False)
+            self.assertEqual(len(cli.calls), 1)
+            await self.send(app, pilot, "/mode standard", settle=False)  # Settings still apply.
+            self.assertEqual(app.settings.mode, "standard")
+            await pilot.press("escape")
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+            self.assertFalse(app.busy)
+            self.assertEqual(app.last.steps[0]["state"], "stopped")
+
+    async def test_orchestrate_mode_runs_the_council_and_shows_its_agents_and_tools(self):
+        council = {
+            "orchestrator": "claude-sonnet-5-5", "member": "claude-haiku-5-5",
+            "game_plan": "Cast [[Myojin]] from hand with Jodah.", "non_goals": ["tokens"],
+            "core": ["Sol Ring"], "dropped_game_changers": [],
+            "drafts": [{"focus": "engine", "role_counts": {}, "problems": 0}],
+            "locked": ["Sol Ring"], "contested": ["Spell 1"], "open_slots": 1, "votes": {},
+            "decision": {"keep": ["Spell 1"], "notes": "followed the vote"},
+        }
+        lines = [
+            "council: 1/5 plan: claude-sonnet-5-5 sets the game plan and core",
+            "agent: orchestrator | start | claude-sonnet-5-5 | game plan and core cards",
+            "agent: orchestrator | done | 3.0s",
+            "council: 2/5 drafts: 3 members draft around 1 core cards",
+            "agent: engine | start | claude-haiku-5-5 | draft around the core",
+            "tool: assemble | 63 nonland slots by role",
+            "agent: engine | done | 2.0s",
+            "council: 3/5 debate: 40 cards agreed; 1 contested for 1 slots",
+            "council: 4/5 decision: claude-sonnet-5-5 settles 1 contested cards",
+            "council: 5/5 final: lands, validation and safety review",
+            "agent: judges | start | claude-haiku-5-5 | 2 rules questions, up to 8 at a time",
+            "agent: judges | progress | 2/2 answered",
+            "agent: judges | done | 4.0s",
+        ]
+        cli = FakeCli(
+            {"intake": (0, SPEC), "discover": (0, POOL), "council": (1, {**DECK, "council": council})},
+            lines={"council": lines},
+        )
+        app = ChatApp(self.data_dir, Settings(provider="claude"), runner=cli)
+        async with app.run_test() as pilot:
+            app.commander = JODAH["name"]
+            await self.send(app, pilot, "/orchestrate on")
+            self.assertTrue(app.settings.orchestrate)
+            await self.send(app, pilot, "Myojin tribal")
+            turn = app.last
+        lead = ["--provider", "claude", "--model", "claude-sonnet-5-5", "--effort", "xhigh"]
+        intake, discover, run = cli.calls
+        self.assertEqual((intake[-6:], discover[-6:]), (lead, lead))
+        self.assertEqual((run[0], Path(run[2]).name, run[-2:]), ("council", "01-pool.json", ["--provider", "claude"]))
+        self.assertEqual([s["name"] for s in turn.steps], COUNCIL_STEPS)
+        self.assertEqual([s["state"] for s in turn.steps], ["done"] * 6 + ["warn"])
+        self.assertEqual(turn.steps[3]["detail"], "3 members draft around 1 core cards")
+        self.assertEqual({n: a["state"] for n, a in turn.agents.items()},
+                         {"orchestrator": "done", "engine": "done", "judges": "done"})
+        self.assertEqual(turn.agents["judges"]["calls"], 1)
+        self.assertEqual(turn.tools, [("assemble", "63 nonland slots by role")])
+        self.assertFalse(any(line.startswith(("agent:", "tool:")) for line in turn.tail))
+        self.assertEqual(turn.lines[-len(lines):], lines)  # /log still has every event
+
+    async def test_export_writes_a_text_list_beside_the_deck_and_copies_it(self):
+        from mtg_agentic.validator import _parse_decklist
+
+        deck = self.data_dir / "deck.json"
+        deck.write_text(json.dumps(DECK), encoding="utf-8")
+        app = ChatApp(self.data_dir, Settings(), runner=FakeCli({}))
+        async with app.run_test() as pilot:
+            await self.send(app, pilot, "/export")  # No deck yet: nothing to write.
+            self.assertFalse((self.data_dir / "deck.txt").exists())
+            await self.send(app, pilot, f"/load {deck}")
+            with patch.object(app, "copy_to_clipboard") as copy:
+                await self.send(app, pilot, "/export")
+                await self.send(app, pilot, "/export")  # Never overwrites: deck-2.txt.
+                await self.send(app, pilot, f"/export {self.data_dir / 'deck.txt'}")
+        expected = f"1 {JODAH['name']}\n1 Sol Ring\n10 Island\n"
+        self.assertEqual((self.data_dir / "deck.txt").read_text(encoding="utf-8"), expected)
+        self.assertEqual((self.data_dir / "deck-2.txt").read_text(encoding="utf-8"), expected)
+        self.assertFalse((self.data_dir / "deck-3.txt").exists())
+        self.assertEqual(copy.call_count, 2)
+        copy.assert_called_with(expected)
+        entries, errors = _parse_decklist(expected)
+        self.assertEqual(errors, [])
+        self.assertEqual([(e.quantity, e.name) for e in entries],
+                         [(1, JODAH["name"]), (1, "Sol Ring"), (10, "Island")])
+
+    async def test_follow_ups_go_to_the_orchestrator_alone_and_save_new_versions(self):
+        swap = {"remove": "Sol Ring", "add": "Arcane Signet", "reason": "cheaper"}
+        edited = {**DECK, "valid": True, "edit": {
+            "reply": "Swapped Sol Ring.", "swaps": [swap], "tools": ["card"], "changed": True,
+        }}
+        answered = {**edited, "edit": {"reply": "Island taps for U.", "swaps": [], "tools": [],
+                                       "changed": False}}
+        cli = FakeCli({
+            "intake": (0, SPEC), "discover": (0, POOL), "council": (1, DECK), "edit-deck": (0, edited),
+        })
+        app = ChatApp(self.data_dir, Settings(provider="claude", orchestrate=True), runner=cli)
+        async with app.run_test() as pilot:
+            app.commander = JODAH["name"]
+            await self.send(app, pilot, "Myojin tribal")
+            first = app.deck_path
+            await self.send(app, pilot, "Swap Sol Ring for something cheaper")
+            self.assertEqual(app.deck_path.name, "01-deck-v2.json")
+            cli.results["edit-deck"] = (0, answered)
+            await self.send(app, pilot, "What does Island do?")
+            self.assertEqual(app.deck_path.name, "01-deck-v2.json")  # A question keeps the version.
+            self.assertEqual(json.loads(app.deck_path.read_text(encoding="utf-8")), answered)
+            session = json.loads((app.session / "session.json").read_text(encoding="utf-8"))
+        self.assertEqual([argv[0] for argv in cli.calls],
+                         ["intake", "discover", "council", "edit-deck", "edit-deck"])
+        edit = cli.calls[3]
+        self.assertEqual(edit[:2], ["edit-deck", str(first)])
+        self.assertEqual(Path(edit[edit.index("--pool") + 1]), first.parent / "01-pool.json")
+        self.assertEqual(edit[edit.index("--request") + 1], "Swap Sol Ring for something cheaper")
+        self.assertEqual(edit[-6:], ["--provider", "claude", "--model", "claude-sonnet-5-5",
+                                     "--effort", "xhigh"])
+        self.assertEqual(cli.calls[4][1], str(first.parent / "01-deck-v2.json"))
+        self.assertEqual([t["role"] for t in session["turns"]],
+                         ["player", "assistant", "player", "orchestrator", "player", "orchestrator"])
+        self.assertEqual(session["turns"][3]["text"], "Swapped Sol Ring.\n- Sol Ring + Arcane Signet")
+        self.assertEqual(session["deck"], "01-deck-v2.json")
+
+    async def test_new_starts_over_and_session_resumes_a_past_one(self):
+        old = self.data_dir / "tui" / "20261027-101500"
+        old.mkdir(parents=True)
+        (old / "01-deck.json").write_text(json.dumps(DECK), encoding="utf-8")
+        (old / "01-pool.json").write_text(json.dumps(POOL), encoding="utf-8")
+        turns = [{"role": "player", "text": "Myojin tribal"},
+                 {"role": "assistant", "text": "Drafted 01-deck.json: 1 problem."}]
+        (old / "session.json").write_text(json.dumps({
+            "version": 1, "commander": JODAH["name"], "valid": False, "deck": "01-deck.json",
+            "turns": turns,
+        }), encoding="utf-8")
+        app = ChatApp(self.data_dir, Settings(), runner=FakeCli({}))
+        async with app.run_test() as pilot:
+            app.commander = JODAH["name"]
+            first = app.session
+            await self.send(app, pilot, "/new")
+            self.assertNotEqual(app.session, first)
+            self.assertIsNone(app.commander)
+            await self.send(app, pilot, "/session 1")
+            self.assertEqual((app.session, app.commander), (old, JODAH["name"]))
+            self.assertEqual((app.deck_path, app.pool_path), (old / "01-deck.json", old / "01-pool.json"))
+            self.assertEqual((app.transcript, app.runs), (turns, 1))
+            await self.send(app, pilot, "/new")
+            await self.send(app, pilot, "/session")
+            self.assertIsInstance(app.screen, SessionPicker)
+            await pilot.press("escape")
+            await pilot.pause()
+            self.assertNotIsInstance(app.screen, SessionPicker)
+            self.assertIsNone(app.deck)
+            await self.send(app, pilot, "/session")
+            await pilot.press("down", "enter")
+            await pilot.pause(0.2)
+            self.assertEqual(app.session, old)
+            self.assertEqual(app.deck, DECK)
+
+    async def test_tab_completes_the_suggested_command(self):
+        app = ChatApp(self.data_dir, Settings(), runner=FakeCli({}))
+        async with app.run_test() as pilot:
+            prompt = app.query_one(Input)
+            await pilot.press(*"/sess")
+            await pilot.pause(0.1)
+            await pilot.press("tab")
+            self.assertEqual(prompt.value, "/session")
+            self.assertIs(app.focused, prompt)
+
+    async def test_deck_commands_use_the_current_deck_file(self):
+        cli = FakeCli({
+            "validate": (1, {"valid": False, "errors": []}),
+            "bracket-check": (0, {"verdict": "fits"}),
+            "review-deck": (0, {"status": "passed", "valid": True, "errors": []}),
+        })
+        app = ChatApp(self.data_dir, Settings(provider="claude"), runner=cli)
+        deck = self.data_dir / "deck.json"
+        deck.write_text(json.dumps(DECK), encoding="utf-8")
+        async with app.run_test() as pilot:
+            await self.send(app, pilot, "/validate")
+            self.assertEqual(cli.calls, [])
+            await self.send(app, pilot, f"/load {deck}")
+            self.assertEqual(app.commander, JODAH["name"])
+            await self.send(app, pilot, "/validate")
+            await self.send(app, pilot, "/bracket")
+            await self.send(app, pilot, "/review on")  # A setting, not a review.
+            await self.send(app, pilot, "/review")
+        self.assertEqual(cli.calls, [
+            ["validate", str(deck)],
+            ["bracket-check", str(deck), "--provider", "claude"],
+            ["review-deck", str(deck), "--provider", "claude"],
+        ])
+
+    async def test_run_cli_streams_a_real_command_and_returns_its_json(self):
+        lines = []
+        code, schema = await run_cli(["spec-schema"], self.data_dir, lines.append)
+        self.assertEqual(code, 0)
+        self.assertIn("commander", schema["properties"])
+        code, result = await run_cli(["validate", str(self.data_dir / "missing.json")], self.data_dir, lines.append)
+        self.assertEqual(code, 2)
+        self.assertEqual(result["errors"][0]["error"], "input")
+
+
+class TuiCommandTests(unittest.TestCase):
+    def test_tui_without_textual_explains_how_to_install_it(self):
+        output = io.StringIO()
+        with patch.dict(sys.modules):
+            for name in [n for n in sys.modules if n == "mtg_agentic.tui" or n.split(".")[0] == "textual"]:
+                del sys.modules[name]
+            sys.modules["textual"] = None
+            with contextlib.redirect_stdout(output):
+                status = main(["tui"])
+        self.assertEqual(status, 2)
+        self.assertIn('pip install -e ".[tui]"', json.loads(output.getvalue())["errors"][0]["detail"])
+
+
+if __name__ == "__main__":
+    unittest.main()

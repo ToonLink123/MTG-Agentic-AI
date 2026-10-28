@@ -6,11 +6,12 @@ import copy
 import json
 import math
 import shutil
+import threading
 import time
 from typing import Any, TextIO
 
 from .compaction import TRIGGER, Compactor
-from .llm import LLMError, Message
+from .llm import MALFORMED, LLMError, Message, malformed_kind, malformed_summary
 from .schema import SchemaError, load_json, validate_json
 
 try:
@@ -49,6 +50,7 @@ class ClaudeClient:
         effort: str = "high",
         max_tokens: int = 64000,
         progress: TextIO | None = None,
+        concurrency: int = 8,
     ):
         if not api_key:
             raise ValueError("Set CLAUDE_API (environment or .env) for the claude provider")
@@ -60,10 +62,13 @@ class ClaudeClient:
         self.effort = effort
         self.max_tokens = max_tokens
         self.progress = progress
+        # Requests independent questions may run at once; the SDK retries rate limits.
+        self.concurrency = concurrency
+        self._lock = threading.Lock()
         # Haiku 5.5 is cheaper while a prompt stays within its tier, so compact to stay there.
         self.compact_at = HAIKU_TIER_TOKENS if self._haiku else None
         self.usage = dict.fromkeys(
-            ("calls", "input", "cached", "written", "output", "largest", "compactions"), 0
+            ("calls", "input", "cached", "written", "output", "largest", "compactions", *MALFORMED), 0
         )
         self._compactor = Compactor()
         self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
@@ -71,9 +76,7 @@ class ClaudeClient:
     def complete_json(self, messages: list[Message], schema: dict[str, Any]) -> Any:
         text = self._ask(messages, schema)
         try:
-            result = load_json(text)
-            validate_json(result, schema)
-            return result
+            return self._parse(text, schema)
         except SchemaError as exc:
             # Structured outputs cannot enforce lengths or ranges. Retry once, append-only,
             # so the original prompt is served from cache.
@@ -87,9 +90,25 @@ class ClaudeClient:
                     }
                 ),
             }
-            result = load_json(self._ask([*messages, retry], schema))
+            return self._parse(self._ask([*messages, retry], schema), schema)
+
+    def _parse(self, text: str, schema: dict[str, Any]) -> Any:
+        try:
+            result = load_json(text)
             validate_json(result, schema)
             return result
+        except SchemaError as exc:
+            self._malformed(malformed_kind(exc), str(exc))
+            raise
+
+    def _malformed(self, kind: str, detail: str = "") -> None:
+        with self._lock:
+            self.usage[kind] += 1
+            summary = malformed_summary(self.usage)
+        if self.progress:
+            line = f"MALFORMED {MALFORMED[kind]}" + (f": {detail[:120]}" if detail else "")
+            line += f" | {summary} so far"
+            print("  " + line, file=self.progress, flush=True)
 
     def _ask(self, messages: list[Message], schema: dict[str, Any]) -> str:
         # Leading system messages become the system prompt; the rest are conversation turns.
@@ -106,7 +125,9 @@ class ClaudeClient:
             if self.model in FALLBACK_MODELS
             else {}
         )
-        status = _Status(self.progress, self.model) if self.progress else None
+        # Parallel calls share one terminal, so only the main thread draws a live line.
+        live = threading.current_thread() is threading.main_thread()
+        status = _Status(self.progress, self.model, live=live) if self.progress else None
         try:
             for turn, text in zip(turns, self._fit(turns, system, output_config)):
                 turn["content"] = text
@@ -149,6 +170,7 @@ class ClaudeClient:
         if response.stop_reason == "refusal":
             raise LLMError("Claude declined the request")
         if response.stop_reason == "max_tokens":
+            self._malformed("truncated")
             raise LLMError("Claude truncated its JSON response")
         # A mid-stream fallback keeps the declined partial; only text after the last switch counts.
         content = response.content
@@ -182,7 +204,8 @@ class ClaudeClient:
             return texts
         ratio = chars / tokens
         texts, short = self._compactor.shrink(originals, math.ceil((tokens - trigger) * ratio))
-        self.usage["compactions"] += 1
+        with self._lock:
+            self.usage["compactions"] += 1
         if self.progress:
             after = round((fixed + sum(map(len, texts))) / ratio)
             note = f"compacted prompt ~{tokens:,} -> ~{after:,} tokens (budget {self.compact_at:,})"
@@ -196,12 +219,13 @@ class ClaudeClient:
         written = usage.cache_creation_input_tokens or 0
         prompt = usage.input_tokens + cached + written
         totals = self.usage
-        totals["calls"] += 1
-        totals["input"] += usage.input_tokens
-        totals["cached"] += cached
-        totals["written"] += written
-        totals["output"] += usage.output_tokens
-        totals["largest"] = max(totals["largest"], prompt)
+        with self._lock:
+            totals["calls"] += 1
+            totals["input"] += usage.input_tokens
+            totals["cached"] += cached
+            totals["written"] += written
+            totals["output"] += usage.output_tokens
+            totals["largest"] = max(totals["largest"], prompt)
         if status:
             line = (
                 f"{self.model} | {status.elapsed():.1f}s | prompt {prompt:,} tok "
@@ -229,6 +253,7 @@ class ClaudeClient:
         if self._haiku:
             over = totals["largest"] > HAIKU_TIER_TOKENS
             line += " (over Haiku's 100K tier)" if over else " (within Haiku's 100K tier)"
+        line += f" | {malformed_summary(totals)}"
         if totals["compactions"]:
             line += f" | compacted {totals['compactions']} request(s)"
         print(line, file=self.progress, flush=True)
@@ -237,9 +262,9 @@ class ClaudeClient:
 class _Status:
     """A self-overwriting progress line for one streamed call; drawn only on a terminal."""
 
-    def __init__(self, out: TextIO, model: str):
+    def __init__(self, out: TextIO, model: str, *, live: bool = True):
         self.out, self.model = out, model
-        self.live = out.isatty()
+        self.live = live and out.isatty()
         self.start = self.drawn = time.monotonic()
         self.phase, self.chars, self.thought, self.width = "waiting", 0, "", 0
 

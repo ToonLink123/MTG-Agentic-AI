@@ -9,7 +9,7 @@ from collections import Counter
 from typing import Any
 from urllib.parse import urlencode
 
-from . import prompts
+from . import activity, prompts
 from .cards import Card, name_key, trim_card
 from .llm import JSONModel, request_json
 from .mana import is_land
@@ -412,6 +412,7 @@ class BracketChecker:
                 raise ValueError("Bracket check requires exact cards and positive quantities")
             resolved.append((c, q))
         signals = deterministic_signals(resolved, self.game_changer_list["names"])
+        activity.tool("commander spellbook", f"combos among {len(cards) + 1} cards")
         combos = self.spellbook.find_combos(cards, commander)
         signals["possible_extra_turn_chaining"] = bool(
             signals["counts"]["extra_turns"] > 1
@@ -445,30 +446,31 @@ class BracketChecker:
             warnings.append("Spellbook search truncated; absence of a combo is not established.")
         if bracket3_mode != "unrestricted" and signals["land_denial_candidates"]:
             warnings.append("Review possible land-denial effects in context.")
-        assessment = request_json(
-            self.model,
-            [
-                {
-                    "role": "system",
-                    "content": prompts.BRACKET,
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "target_bracket": bracket,
-                            "policy": POLICY,
-                            "selected_rules": rules,
-                            "signals": signals,
-                            "commander": commander,
-                            "cards": [{"quantity": q, **trim_card(c)} for c, q in resolved],
-                            "spellbook": combos,
-                        }
-                    ),
-                },
-            ],
-            assessment_schema(sorted(c["name"] for c, _ in resolved), [c["id"] for c in combos["combos"]]),
-        )
+        with activity.agent("reviewer", self.model, f"bracket {bracket} assessment"):
+            assessment = request_json(
+                self.model,
+                [
+                    {
+                        "role": "system",
+                        "content": prompts.BRACKET,
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "target_bracket": bracket,
+                                "policy": POLICY,
+                                "selected_rules": rules,
+                                "signals": signals,
+                                "commander": commander,
+                                "cards": [{"quantity": q, **trim_card(c)} for c, q in resolved],
+                                "spellbook": combos,
+                            }
+                        ),
+                    },
+                ],
+                assessment_schema(sorted(c["name"] for c, _ in resolved), [c["id"] for c in combos["combos"]]),
+            )
         known = {c["name"] for c, _ in resolved}
         reviews = assessment["combo_reviews"]
         expected = {c["id"] for c in combos["combos"]}
