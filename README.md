@@ -1,5 +1,7 @@
 # Ring
 
+[Gitbook here]([url](https://ring-2.gitbook.io/ring-docs))
+
 Ring builds Commander decks for Magic: The Gathering from a few words. Name a commander,
 describe the deck you want, answer a few questions about playstyle, and a team of agents
 searches the card pool, maps the deck's engine, drafts it, and checks it before you see it.
