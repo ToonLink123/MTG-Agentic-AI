@@ -130,6 +130,21 @@ class RulesTests(unittest.TestCase):
         self.assertTrue(any(d["kind"] == "ruling" for d in docs))
         self.assertFalse(any(d["text"] == "untrusted" for d in docs))
 
+    def test_ingest_reads_rulings_from_the_local_bulk_file(self):
+        self.store.import_rulings([
+            {"object": "ruling", "oracle_id": "Spell 0", "source": "wotc",
+             "published_at": "2024-01-01", "comment": QUOTE},
+            {"object": "ruling", "oracle_id": "Spell 0", "source": "scryfall",
+             "published_at": "2024-02-01", "comment": "A Scryfall note, not a ruling."},
+        ])
+        result = self.rules.ingest_deck([JODAH["name"], "Spell 0"], self.store, self.client)
+        self.assertEqual(result["count"], 2)
+        self.client.get_rulings.assert_not_called()
+        self.client.download_rulings.assert_not_called()
+        rulings = [d for d in self.rules.retrieve(["Spell 0"], "proliferate counter")
+                   if d["kind"] == "ruling"]
+        self.assertEqual([d["text"] for d in rulings], [QUOTE])
+
     def test_unchanged_rule_text_does_not_reembed_after_http_refresh(self):
         cache = Mock()
         cache.fetch.side_effect = [

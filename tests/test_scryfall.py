@@ -11,7 +11,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from mtg_agentic.cards import trim_card
 from mtg_agentic.oracle import OracleStore
-from mtg_agentic.scryfall import API_URL, CardNotFound, ScryfallClient, ScryfallError
+from mtg_agentic.scryfall import (
+    API_URL,
+    CardNotFound,
+    ScryfallClient,
+    ScryfallError,
+    card_rulings,
+)
 from tests.fixtures import BOLT, DFC, SOL_RING
 
 
@@ -245,6 +251,78 @@ class ScryfallTests(unittest.TestCase):
                 self.assertEqual(self.http.call_count, calls)
             self.assertIsNone(store.get_card("Sol Ring"))
             self.assertIsNotNone(store.get_card("Lightning Bolt"))
+
+    def test_an_older_index_is_rebuilt_from_the_saved_bulk_file_without_downloading(self):
+        with OracleStore(self.path / "oracle.sqlite3") as store:
+            store.import_cards([SOL_RING], metadata={"updated_at": "monday"})
+            with gzip.open(self.path / "oracle-cards.jsonl.gz", "wt", encoding="utf-8") as saved:
+                saved.write(json.dumps({**SOL_RING, "edhrec_rank": 1}) + "\n")
+            store._db.execute("DELETE FROM metadata WHERE key = 'index_version'")
+            self.assertFalse(store.current)
+            info = self.client.download_oracle_cards(store)
+            self.assertTrue(store.current)
+            self.assertEqual(self.http.call_count, 0)
+            self.assertEqual(info["updated_at"], "monday")
+            self.assertEqual(store.get_card("Sol Ring")["edhrec_rank"], 1)
+
+    def test_oracle_tags_download_once_and_keep_only_oracle_tags(self):
+        tags = [
+            {"object": "tag", "id": "t1", "slug": "ramp", "label": "ramp", "type": "oracle",
+             "aliases": ["acceleration"], "child_ids": [],
+             "taggings": [{"oracle_id": "Sol Ring", "weight": "median"}]},
+            {"object": "tag", "id": "t2", "slug": "squirrel", "label": "squirrel",
+             "type": "illustration", "taggings": []},
+        ]
+        body = "".join(json.dumps(tag) + "\n" for tag in tags).encode()
+        self.http.side_effect = [
+            response({"jsonl_download_uri": "https://data.scryfall.io/oracle-tags.jsonl.gz",
+                      "updated_at": "today"}),
+            io.BytesIO(gzip.compress(body)),
+        ]
+        with OracleStore(self.path / "oracle.sqlite3") as store:
+            info = self.client.download_oracle_tags(store)
+            self.assertEqual((info["tag_count"], info["updated_at"]), (1, "today"))
+            self.assertEqual(self.client.download_oracle_tags(store), info)
+            self.assertEqual(self.http.call_count, 2)
+            self.assertEqual(store.tagged("Acceleration"), {"Sol Ring"})
+            self.assertIsNone(store.tagged("squirrel"))
+        self.assertTrue((self.path / "oracle-tags.jsonl.gz").is_file())
+        url = self.http.call_args_list[0].args[0].full_url
+        self.assertEqual(url, f"{API_URL}/bulk-data/oracle-tags")
+
+    def test_rulings_download_once_then_answer_locally_oldest_first(self):
+        rulings = [
+            {"object": "ruling", "oracle_id": "Sol Ring", "source": "wotc",
+             "published_at": "2021-03-01", "comment": "Newer."},
+            {"object": "ruling", "oracle_id": "Sol Ring", "source": "wotc",
+             "published_at": "2004-10-04", "comment": "Older."},
+        ]
+        body = "".join(json.dumps(ruling) + "\n" for ruling in rulings).encode()
+        self.http.side_effect = [
+            response({"jsonl_download_uri": "https://data.scryfall.io/rulings.jsonl.gz",
+                      "updated_at": "today"}),
+            io.BytesIO(gzip.compress(body)),
+        ]
+        with OracleStore(self.path / "oracle.sqlite3") as store:
+            store.import_cards([SOL_RING])
+            card = store.get_card("Sol Ring")
+            for _ in range(2):
+                found = card_rulings(store, self.client, card)
+                self.assertEqual([r["comment"] for r in found], ["Older.", "Newer."])
+            self.assertEqual(self.http.call_count, 2)  # The bulk file once, then local reads.
+            self.assertEqual(store.ruling_metadata["ruling_count"], 2)
+        url = self.http.call_args_list[0].args[0].full_url
+        self.assertEqual(url, f"{API_URL}/bulk-data/rulings")
+
+    def test_a_source_without_bulk_downloads_answers_rulings_itself(self):
+        class Live:
+            def get_rulings(self, card_id):
+                return [{"source": "wotc", "published_at": "2020-01-01", "comment": card_id}]
+
+        with OracleStore(self.path / "oracle.sqlite3") as store:
+            store.import_cards([SOL_RING])
+            card = store.get_card("Sol Ring")
+            self.assertEqual(card_rulings(store, Live(), card)[0]["comment"], card["id"])
 
     def test_bad_bulk_does_not_replace_snapshot_or_leave_temporary_file(self):
         with OracleStore(self.path / "oracle.sqlite3") as store:

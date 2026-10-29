@@ -11,7 +11,7 @@ from mtg_agentic import claude
 from mtg_agentic.__main__ import _claude_api_key
 from mtg_agentic.llm import LLMError, request_json
 from mtg_agentic.schema import DRAFT_SCHEMA, SPEC_SCHEMA, SchemaError
-from tests.pipeline_fixtures import draft, make_spec
+from tests.pipeline_fixtures import draft, spec_reply
 
 
 def text(value):
@@ -44,7 +44,7 @@ def api_error(cls, status, body=None):
     return cls("error", response=response, body=body)
 
 
-SPEC = make_spec().to_dict()
+SPEC = spec_reply()
 
 
 @unittest.skipIf(claude.anthropic is None, "anthropic SDK not installed")
@@ -177,6 +177,26 @@ class ClaudeTests(unittest.TestCase):
                 client.complete_json([{"role": "user", "content": "x" * 5000}], SPEC_SCHEMA)
                 client._client.messages.count_tokens.assert_not_called()
         self.assertIsNone(claude.ClaudeClient("claude-opus-5-5", api_key="k").compact_at)
+
+    def test_prompts_are_never_cut_unless_a_budget_is_set(self):
+        self.assertIsNone(claude.ClaudeClient("claude-haiku-5-5", api_key="k").compact_at)
+        budget = claude.ClaudeClient("claude-haiku-5-5", api_key="k",
+                                     compact_at=claude.HAIKU_TIER_TOKENS)
+        self.assertEqual(budget.compact_at, 100_000)
+
+    def test_long_card_name_enums_are_sent_as_plain_strings(self):
+        names = [f"Card {n}" for n in range(200)]
+        schema = {"type": "object", "properties": {
+            "keep": {"type": "array", "items": {"type": "string", "enum": names}},
+            "tool": {"type": "string", "enum": ["card", "finish"]},
+            "swaps": {"type": "array", "items": {"type": "object", "properties": {
+                "add": {"type": "string", "enum": names}}}},
+        }}
+        wire = claude._wire_schema(schema)
+        self.assertNotIn("enum", wire["properties"]["keep"]["items"])
+        self.assertNotIn("enum", wire["properties"]["swaps"]["items"]["properties"]["add"])
+        self.assertEqual(wire["properties"]["tool"]["enum"], ["card", "finish"])
+        self.assertEqual(len(schema["properties"]["keep"]["items"]["enum"]), 200)  # Not mutated.
 
     def test_api_errors_are_clear_and_do_not_echo_the_key(self):
         sdk = claude.anthropic

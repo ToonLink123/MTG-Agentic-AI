@@ -23,18 +23,33 @@ except ImportError:  # Optional dependency; only this provider needs it.
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 # Haiku 5.5 bills prompts above this size on its higher rate card.
 HAIKU_TIER_TOKENS = 100_000
+# Enums longer than this (card names from a large pool) are sent as plain strings: compiling
+# hundreds of names into the output grammar costs more than the local check that replaces it.
+WIRE_ENUM_LIMIT = 64
+NAME_HINT = "An exact card name from the supplied data; checked locally."
 
 
 def _wire_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Avoid compiling the same large card-name enum into every role bucket."""
+    """The schema Claude decodes with. Role buckets and any long enum become plain strings;
+    request_json still validates the answer against the full schema."""
     result = copy.deepcopy(schema)
     buckets = result.get("properties", {}).get("buckets", {}).get("properties", {})
     for bucket in buckets.values():
         if "enum" in bucket.get("items", {}):
-            bucket["items"] = {
-                "type": "string",
-                "description": "An exact nonland card name from the supplied candidate pool; checked locally.",
-            }
+            bucket["items"] = {"type": "string", "description": NAME_HINT}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("enum"), list) and len(node["enum"]) > WIRE_ENUM_LIMIT:
+                node.pop("enum")
+                node["description"] = NAME_HINT
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(result)
     return result
 
 
@@ -51,6 +66,7 @@ class ClaudeClient:
         max_tokens: int = 64000,
         progress: TextIO | None = None,
         concurrency: int = 8,
+        compact_at: int | None = None,
     ):
         if not api_key:
             raise ValueError("Set CLAUDE_API (environment or .env) for the claude provider")
@@ -65,8 +81,9 @@ class ClaudeClient:
         # Requests independent questions may run at once; the SDK retries rate limits.
         self.concurrency = concurrency
         self._lock = threading.Lock()
-        # Haiku 5.5 is cheaper while a prompt stays within its tier, so compact to stay there.
-        self.compact_at = HAIKU_TIER_TOKENS if self._haiku else None
+        # Prompts are never cut by default, so large candidate pools reach the model whole.
+        # Pass compact_at=HAIKU_TIER_TOKENS to keep Haiku within its cheaper tier instead.
+        self.compact_at = compact_at
         self.usage = dict.fromkeys(
             ("calls", "input", "cached", "written", "output", "largest", "compactions", *MALFORMED), 0
         )

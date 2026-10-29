@@ -62,6 +62,98 @@ SPEC_SCHEMA = object_schema(
         ),
     }
 )
+# The player's own words travel with the spec: the request, the interview before intake, the
+# asks split out of them, and the interview questions left to the agents.
+ANSWER_SOURCES = ("option", "own", "agents")
+ASK_KINDS = ("cards", "deck")
+ANSWER_SCHEMA = object_schema({
+    "question": {"type": "string", "minLength": 1, "maxLength": 300},
+    "answer": {"type": "string", "minLength": 0, "maxLength": 1000},
+    "source": {"type": "string", "enum": list(ANSWER_SOURCES)},
+})
+ANSWERS_SCHEMA = {"type": "array", "items": ANSWER_SCHEMA, "maxItems": 40}
+ASK_FIELDS = {
+    "quote": {"type": "string", "minLength": 1, "maxLength": 400},
+    "wants": {"type": "string", "minLength": 1, "maxLength": 300},
+    "kind": {"type": "string", "enum": list(ASK_KINDS)},
+}
+BRIEF_SCHEMA = object_schema({
+    "request": {"type": "string", "minLength": 0, "maxLength": 8000},
+    "interview": ANSWERS_SCHEMA,
+    "asks": {
+        "type": "array", "maxItems": 10,
+        "items": object_schema({"id": {"type": "string", "pattern": r"A\d{1,2}"}, **ASK_FIELDS}),
+    },
+    "deferred": {
+        "type": "array", "maxItems": 40,
+        "items": {"type": "string", "minLength": 1, "maxLength": 300},
+    },
+})
+EMPTY_BRIEF = {"request": "", "interview": [], "asks": [], "deferred": []}
+# Intake answers with the spec fields plus the asks; code adds ids and builds the brief.
+INTAKE_SCHEMA = object_schema({
+    **SPEC_SCHEMA["properties"],
+    "asks": {"type": "array", "minItems": 1, "maxItems": 10, "items": object_schema(ASK_FIELDS)},
+})
+# Local search results saved with a pool: the terms searched and the ranked hits.
+LOCAL_SEARCH_SCHEMA = object_schema({
+    "terms": {"type": "array", "maxItems": 40, "items": object_schema({
+        "term": {"type": "string", "minLength": 1, "maxLength": 200},
+        "cards": {"type": "integer", "minimum": 0},
+    })},
+    "hits": {"type": "array", "maxItems": 100, "items": object_schema({
+        "name": NAME_SCHEMA,
+        "score": {"type": "integer", "minimum": 0},
+        "matched": {"type": "array", "maxItems": 6, "items": NAME_SCHEMA},
+    })},
+})
+MAP_STAGES = ("makes", "multiplies", "spends", "pays_off", "protects")
+
+
+def text(most: int, least: int = 1) -> dict[str, Any]:
+    return {"type": "string", "minLength": least, "maxLength": most}
+
+
+def map_schema(
+    ask_ids: list[str] | None = None, *, searches: int = 0, stored: bool = False
+) -> dict[str, Any]:
+    """The engine map. Card names are plain strings: code keeps only pool cards and says how
+    many it dropped, instead of constraining every name list to a large enum. A model may
+    propose up to `searches` queries for its gaps; a `stored` map records what each found."""
+    ask = {"type": "string", "enum": ask_ids} if ask_ids else {"type": "string", "pattern": r"A\d{1,2}"}
+    search = {"for": text(80), "query": text(400)}
+    if stored:
+        search.update(added={"type": "array", "maxItems": 12, "items": NAME_SCHEMA},
+                      error=text(300, 0))
+    card = object_schema({
+        "name": NAME_SCHEMA, "tier": {"type": "string", "enum": ["primary", "adjacent"]},
+        "role": text(160),
+    })
+    return object_schema({
+        "summary": text(800),
+        "resources": {"type": "array", "minItems": 1, "maxItems": 4, "items": text(80)},
+        "stages": {"type": "array", "maxItems": len(MAP_STAGES), "items": object_schema({
+            "stage": {"type": "string", "enum": list(MAP_STAGES)},
+            "what": text(200),
+            "cards": {"type": "array", "maxItems": 12, "items": card},
+        })},
+        "links": {"type": "array", "maxItems": 14, "items": object_schema({
+            "from": NAME_SCHEMA, "to": NAME_SCHEMA, "how": text(200),
+            "source": {"type": "string", "enum": ["oracle", "combo"]},
+        })},
+        "asks": {"type": "array", "maxItems": len(ask_ids) if ask_ids is not None else 10,
+                 "items": object_schema({
+                     "ask": ask,
+                     "cards": {"type": "array", "maxItems": 8, "uniqueItems": True,
+                               "items": NAME_SCHEMA},
+                     "note": text(200, 0),
+                 })},
+        "gaps": {"type": "array", "maxItems": 8, "items": text(200)},
+        "searches": {"type": "array", "maxItems": 8 if stored else searches,
+                     "items": object_schema(search)},
+    })
+
+
 QUERY_SCHEMA = object_schema(
     {
         "queries": {
@@ -77,6 +169,7 @@ QUERY_SCHEMA = object_schema(
         },
     }
 )
+OUTSIDE_PICKS = 10  # Cards a drafter may name from outside the pool; code checks each.
 DRAFT_SCHEMA = object_schema(
     {
         "commander": NAME_SCHEMA,
@@ -84,6 +177,9 @@ DRAFT_SCHEMA = object_schema(
             role: {"type": "array", "items": NAME_SCHEMA, "maxItems": 63, "uniqueItems": True}
             for role in DRAFT_ROLES
         }),
+        "outside": {"type": "array", "maxItems": OUTSIDE_PICKS, "items": object_schema({
+            "name": NAME_SCHEMA, "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+        })},
     }
 )
 

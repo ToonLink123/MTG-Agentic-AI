@@ -31,7 +31,13 @@ def trim_card(card: Card) -> Card:
 def validation_card(card: Card) -> Card:
     """Retain only additional fields needed for deterministic validation."""
     result = trim_card(card)
+    faces = card.get("card_faces", [])
+    colors = card.get("colors")
+    if colors is None:
+        colors = sorted({c for face in faces for c in face.get("colors", [])}, key="WUBRG".find)
     result.update(
+        # Local search: colors and keywords for c: and kw:, the EDHREC rank for its ordering.
+        colors=colors, keywords=card.get("keywords", []), edhrec_rank=card.get("edhrec_rank"),
         oracle_id=card.get("oracle_id", card["id"]),
         layout=card.get("layout", "normal"),
         cmc=card.get("cmc"),

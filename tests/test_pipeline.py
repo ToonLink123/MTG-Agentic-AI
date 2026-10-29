@@ -13,8 +13,10 @@ from tests.pipeline_fixtures import (
     FakeCards,
     FakeModel,
     draft,
+    intake_reply,
     make_pool,
     make_spec,
+    map_reply,
     playable_records,
 )
 
@@ -189,17 +191,18 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["cards"]["Spell 0"], 1)
         self.assertTrue(result["assembly"]["code_added"])
 
-    def test_full_intake_discovery_draft_flow_uses_three_model_calls(self):
+    def test_full_intake_discovery_map_draft_flow_uses_four_model_calls(self):
         model = FakeModel(
-            make_spec().to_dict(),
+            intake_reply(),
             {"queries": [{"role": "theme", "query": "t:myojin"}]},
+            map_reply(),
             draft(),
         )
         result = draft_from_request(
             "Myojin tribal with proliferate", JODAH["name"], model, self.client, self.store
         )
         self.assertTrue(result["valid"], result)
-        self.assertEqual(len(model.calls), 3)
+        self.assertEqual(len(model.calls), 4)
         self.assertEqual(self.client.get_calls, [(JODAH["name"], False)])
 
     def test_invalid_loop_bounds_are_rejected(self):

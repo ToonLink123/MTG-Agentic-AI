@@ -24,7 +24,7 @@ class OracleTests(unittest.TestCase):
         self.assertIsNone(self.store.get_card("Sol Rng"))
         self.assertNotIn("prices", self.store.get_card("Sol Ring"))
         with OracleStore(self.path / "oracle.sqlite3") as other:
-            self.assertEqual(other.metadata, {"card_count": 2, "updated_at": "today"})
+            self.assertEqual(other.metadata, {"card_count": 2, "updated_at": "today", "index_version": 2})
             self.assertEqual(other.get_card("Sol Ring")["name"], "Sol Ring")
 
     def test_array_jsonl_and_gzip_imports(self):
@@ -60,7 +60,8 @@ class OracleTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             self.store.import_cards(broken(), metadata={"updated_at": "new"})
-        self.assertEqual(self.store.metadata, {"card_count": 1, "updated_at": "old"})
+        self.assertEqual(self.store.metadata,
+                         {"card_count": 1, "updated_at": "old", "index_version": 2})
         self.assertIsNotNone(self.store.get_card("Sol Ring"))
         self.assertIsNone(self.store.get_card("Lightning Bolt"))
 

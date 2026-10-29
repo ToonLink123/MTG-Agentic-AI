@@ -83,6 +83,22 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue({"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"} <= names)
         self.assertEqual(len(client.search_calls), 2)
 
+    def test_after_each_querys_top_cards_the_pool_fills_by_fit(self):
+        spell = {n: self.records[7 + n] for n in range(70)}
+        narrow_a = [spell[n] for n in (0, 1, 2, 3, 4, 55)]
+        narrow_b = [spell[n] for n in (60, 61, 62, 63, 64, 55)]
+        broad = [spell[n] for n in range(10, 50)]
+        client = FakeCards([], [narrow_a, narrow_b, broad])
+        queries = [CardQuery("theme", "a"), CardQuery("mechanics", "b"), CardQuery("creatures", "c")]
+        pool = build_candidate_pool(make_spec(), queries, client, self.store, limit=13)
+        names = [c.card["name"] for c in pool.cards]
+        # Six basics, then each query's most-played cards taking turns (the creature role query
+        # goes deeper, toward three times its target), then the best fit: Spell 55 sits deep in
+        # both narrow searches, so it beats the rest of every single search.
+        self.assertEqual(names[6:], ["Spell 0", "Spell 60", "Spell 10", "Spell 11", "Spell 12",
+                                     "Spell 13", "Spell 55"])
+        self.assertFalse(any(d["result_limit_reached"] for d in pool.diagnostics))
+
     def test_pool_reload_does_not_trust_saved_oracle_or_legality_fields(self):
         pool = build_candidate_pool(
             make_spec(), [CardQuery("theme", "a")], FakeCards(self.records), self.store
@@ -101,7 +117,7 @@ class DiscoveryTests(unittest.TestCase):
         data = {"version": 1, "spec": spec.to_dict(), "cards": []}
         with self.assertRaises(ValueError):
             CandidatePool.from_dict(data, self.store)
-        for limit in (0, 401, True):
+        for limit in (0, 1001, True):
             with self.assertRaises(ValueError):
                 build_candidate_pool(make_spec(), [], FakeCards([]), self.store, limit=limit)
 

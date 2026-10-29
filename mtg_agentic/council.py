@@ -1,7 +1,9 @@
 """Council drafting: one orchestrator, several members, one bounded debate.
 
 The orchestrator fixes the game plan and the core (win conditions, Game Changers, key engine
-pieces) once, so members never disagree about what the deck is. Members then draft
+pieces) once, and decides any interview question the player left to the agents, so members
+never disagree about what the deck is. Every member also drafts from the same engine map, when
+the pool has one. Members then draft
 independently, each with a different focus. Cards every draft chose are kept outright; members
 vote once on the rest and the orchestrator settles those slots. Code still owns assembly,
 lands, legality and the safety review, exactly as in a single-model draft.
@@ -22,7 +24,13 @@ from .discovery import CandidatePool
 from .lands import is_land
 from .llm import JSONModel, concurrency, parallel, request_json
 from .oracle import OracleStore
-from .pipeline import build_from_selection, draft_deck, draft_request, game_changer_names
+from .pipeline import (
+    admit_outside,
+    build_from_selection,
+    draft_deck,
+    draft_request,
+    game_changer_names,
+)
 from .review import DeckReviewer
 from .roles import oracle_roles
 from .schema import NAME_SCHEMA, STRING_LIST, SchemaError, object_schema
@@ -64,24 +72,40 @@ def plan_deck(pool: CandidatePool, model: JSONModel, changers: set[str]) -> dict
     available = [n for n in names if n in changers]
     limit = max(0, GAME_CHANGER_LIMITS[spec.bracket] - int(spec.commander in changers))
     allowed = min(limit, len(available), 6)
-    schema = object_schema({
+    fields = {
         "game_plan": {"type": "string", "minLength": 1, "maxLength": 1500},
         "non_goals": {**STRING_LIST, "maxItems": 8},
         "win_conditions": _pick(names, minItems=1, maxItems=6),
         "game_changers": _pick(available, maxItems=allowed) if allowed
         else {"type": "array", "items": NAME_SCHEMA, "maxItems": 0},
         "key_cards": _pick(names, maxItems=8),
-    })
+    }
+    # Interview questions the player left to the agents: the orchestrator decides each once.
+    deferred = spec.brief["deferred"]
+    if deferred:
+        fields["decisions"] = {
+            "type": "array", "minItems": len(deferred), "maxItems": len(deferred),
+            "items": object_schema({
+                "question": {"type": "string", "enum": deferred},
+                "decision": {"type": "string", "minLength": 1, "maxLength": 400},
+            }),
+        }
     payload = {
         "spec": spec.to_dict(), "nonland_slots": 99 - spec.role_targets["lands"],
         "game_changer_limit": limit, "game_changers_available": available,
+        "engine_map": pool.engine_map or None,
         "candidates": [c.to_dict() for c in _nonlands(pool).values()],
     }
-    with activity.agent("orchestrator", model, "game plan and core cards"):
+    task = "game plan, core cards" + (f" and {len(deferred)} open questions" if deferred else "")
+    with activity.agent("orchestrator", model, task):
         plan = request_json(model, [
             {"role": "system", "content": prompts.COUNCIL_PLAN},
             {"role": "user", "content": json.dumps(payload)},
-        ], schema)
+        ], object_schema(fields))
+    decisions: dict[str, dict[str, str]] = {}
+    for item in plan.get("decisions", []):
+        decisions.setdefault(item["question"], item)
+    plan = {**plan, "decisions": list(decisions.values())}
     picked = [*plan["win_conditions"], *plan["game_changers"], *plan["key_cards"]]
     core = list(dict.fromkeys(picked))
     # A Game Changer can also be listed as a win condition or key card; keep the first ones.
@@ -103,8 +127,10 @@ def _members(count: int) -> list[tuple[str, str]]:
 def draft_members(
     pool: CandidatePool, model: JSONModel, council: dict[str, Any], members: int,
     store: OracleStore, reviewer: DeckReviewer | None,
-) -> list[dict[str, Any]]:
-    """Independent drafts in parallel; only the model calls leave this thread."""
+) -> tuple[list[dict[str, Any]], CandidatePool]:
+    """Independent drafts in parallel; only the model calls leave this thread. Returns the
+    drafts and the pool with every member's accepted outside picks, which the debate and the
+    final draft then use like any other candidate."""
     shared = draft_request(pool, {"council": council})
     base = [
         {"role": "system", "content": shared[0]["content"] + "\n\n" + prompts.COUNCIL_MEMBER},
@@ -123,18 +149,26 @@ def draft_members(
 
     seats = _members(members)
     raws = parallel([partial(ask, focus, brief) for focus, brief in seats], concurrency(model))
+    picks: dict[str, tuple[list[str], list[dict[str, str]]]] = {}
+    for (focus, _), raw in zip(seats, raws):
+        if raw is not None and raw.get("outside"):
+            pool, accepted, rejected = admit_outside(pool, raw["outside"], store)
+            picks[focus] = (accepted, rejected)
     drafts = []
     for (focus, _), raw in zip(seats, raws):
         if raw is None:
             continue
-        built = build_from_selection(pool, raw["buckets"], store, reviewer=reviewer)
+        accepted, rejected = picks.get(focus, ([], []))
+        buckets = {"outside": accepted, **raw["buckets"]} if accepted else raw["buckets"]
+        built = build_from_selection(pool, buckets, store, reviewer=reviewer)
         drafts.append({
             "focus": focus,
             "nonlands": sorted(built["assembly"]["cards"]),
             "role_counts": built["playability"]["roles"]["role_counts"],
             "problems": built["errors"],
+            "outside": {"accepted": accepted, "rejected": rejected},
         })
-    return drafts
+    return drafts, pool
 
 
 def debate(
@@ -237,18 +271,19 @@ def council_draft(
     lead = getattr(orchestrator, "model", "orchestrator")
     stage("plan", f"{lead} sets the game plan and core")
     plan = plan_deck(checked, orchestrator, changers)
-    council = {key: plan[key] for key in ("game_plan", "non_goals", "core")}
+    council = {key: plan[key] for key in ("game_plan", "non_goals", "core", "decisions")}
     working = _with_core(checked, plan["core"])
     slots = 99 - working.spec.role_targets["lands"]
 
     stage("drafts", f"{members} members draft around {len(plan['core'])} core cards")
-    drafts = draft_members(working, member, council, members, store, reviewer)
+    drafts, working = draft_members(working, member, council, members, store, reviewer)
     record: dict[str, Any] = {
         "orchestrator": getattr(orchestrator, "model", None),
         "member": getattr(member, "model", None),
         **plan,
         "drafts": [
-            {"focus": d["focus"], "role_counts": d["role_counts"], "problems": len(d["problems"])}
+            {"focus": d["focus"], "role_counts": d["role_counts"], "problems": len(d["problems"]),
+             "outside": d["outside"]}
             for d in drafts
         ],
     }

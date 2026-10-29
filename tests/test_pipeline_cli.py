@@ -13,8 +13,10 @@ from tests.pipeline_fixtures import (
     FakeCards,
     FakeModel,
     draft,
+    intake_reply,
     make_pool,
     make_spec,
+    map_reply,
     playable_deck,
     playable_records,
 )
@@ -47,10 +49,21 @@ class PipelineCliTests(unittest.TestCase):
                 side_effect=FakeCards(self.cards).search_cards,
             ),
             patch("mtg_agentic.scryfall.urlopen", side_effect=AssertionError("No real HTTP")),
+            patch("mtg_agentic.__main__.BulkSearch", lambda store, client: FakeCards(self.cards)),
         ):
             quiet = [] if stderr else ["--quiet"]
             status = main([*quiet, "--data-dir", str(self.path), *args])
         return status, json.loads(output.getvalue())
+
+    def test_claude_discovers_a_thousand_card_pool_and_local_models_keep_350(self):
+        spec = self.path / "spec.json"
+        spec.write_text(json.dumps(make_spec().to_dict()), encoding="utf-8")
+        for provider, limit in (("claude", 1000), ("ollama", 350)):
+            with self.subTest(provider=provider), patch("mtg_agentic.__main__.discover") as run:
+                run.return_value.to_dict.return_value = {"cards": []}
+                status, _ = self.run_cli("discover", "--spec", str(spec), "--provider", provider)
+            self.assertEqual(status, 0)
+            self.assertEqual(run.call_args.kwargs["pool_limit"], limit)
 
     def test_schema_command_needs_no_model_or_network(self):
         status, schema = self.run_cli("spec-schema")
@@ -98,7 +111,7 @@ class PipelineCliTests(unittest.TestCase):
                 "build", "--commander", JODAH["name"], "--request", "Myojin",
                 "--bracket3-mode", "unrestricted",
                 "--forge-home", str(self.path), "--pod", str(self.path / "pod.json"),
-                model=FakeModel(make_spec().to_dict(), {"queries": [{"role": "theme", "query": "t:myojin"}]}, draft()),
+                model=FakeModel(intake_reply(), {"queries": [{"role": "theme", "query": "t:myojin"}]}, map_reply(), draft()),
             )
         self.assertEqual(status, 0, report)
         self.assertTrue(report["build_passed"])
@@ -119,9 +132,11 @@ class PipelineCliTests(unittest.TestCase):
             "--output",
             str(output),
         )
-        status, summary = self.run_cli(*args, model=FakeModel(make_spec().to_dict()))
+        status, summary = self.run_cli(*args, model=FakeModel(intake_reply()))
         self.assertEqual(status, 0)
-        self.assertEqual(json.loads(output.read_text(encoding="utf-8")), make_spec().to_dict())
+        saved = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual({**saved, "brief": None}, {**make_spec().to_dict(), "brief": None})
+        self.assertEqual(saved["brief"]["asks"][0]["quote"], "Myojin")
         self.assertEqual(summary["output"], str(output))
         before = output.read_bytes()
         status, result = self.run_cli(*args)
@@ -133,7 +148,7 @@ class PipelineCliTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 status, result = self.run_cli(
                     "intake", "--commander", JODAH["name"], "--request", "Myojin",
-                    "--bracket3-mode", mode, model=FakeModel(make_spec().to_dict()),
+                    "--bracket3-mode", mode, model=FakeModel(intake_reply()),
                 )
                 self.assertEqual(status, 0)
                 self.assertEqual(result["bracket3_mode"], mode)

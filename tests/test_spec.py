@@ -8,7 +8,14 @@ from mtg_agentic.oracle import OracleStore
 from mtg_agentic.schema import SPEC_SCHEMA, SchemaError, load_json, validate_json
 from mtg_agentic.spec import DeckSpec, ground_spec, intake
 from tests.fixtures import card
-from tests.pipeline_fixtures import JODAH, FakeCards, FakeModel, make_spec, records
+from tests.pipeline_fixtures import (
+    JODAH,
+    FakeCards,
+    FakeModel,
+    intake_reply,
+    make_spec,
+    records,
+)
 
 
 class SpecTests(unittest.TestCase):
@@ -40,7 +47,7 @@ class SpecTests(unittest.TestCase):
             make_spec(bracket3_mode="unknown")
 
     def test_explicit_intake_mode_overrides_model_and_is_in_payload(self):
-        model = FakeModel(make_spec().to_dict())
+        model = FakeModel(intake_reply())
         spec = intake(
             "Myojin", JODAH["name"], model, FakeCards(self.records), self.store,
             bracket3_mode="unrestricted",
@@ -95,16 +102,14 @@ class SpecTests(unittest.TestCase):
                 ground_spec(spec, self.store)
 
     def test_intake_uses_fetched_oracle_text_and_strict_schema(self):
-        model = FakeModel(make_spec().to_dict())
+        model = FakeModel(intake_reply())
         client = FakeCards(self.records)
-        spec = intake(
-            "Myojin tribal with divinity counters and proliferate",
-            JODAH["name"],
-            model,
-            client,
-            self.store,
-        )
-        self.assertEqual(spec, make_spec())
+        request = "Myojin tribal with divinity counters and proliferate"
+        spec = intake(request, JODAH["name"], model, client, self.store)
+        self.assertEqual(spec, make_spec(brief={
+            "request": request, "interview": [], "deferred": [],
+            "asks": [{"id": "A1", "quote": "Myojin", "wants": "Myojin tribal", "kind": "cards"}],
+        }))
         self.assertEqual(client.get_calls, [(JODAH["name"], False)])
         payload = json.loads(model.calls[0][0][1]["content"])
         self.assertEqual(payload["commander_card"]["oracle_text"], JODAH["oracle_text"])
@@ -114,8 +119,8 @@ class SpecTests(unittest.TestCase):
         other = card("Other Commander", types="Legendary Creature — Human", colors="WUBRG")
         self.store.import_cards([*self.records, other])
         for result in (
-            make_spec(commander="Other Commander").to_dict(),
-            make_spec(color_identity="WU").to_dict(),
+            intake_reply(commander="Other Commander"),
+            intake_reply(color_identity="WU"),
             {},
         ):
             with self.subTest(result=result), self.assertRaises(SchemaError):

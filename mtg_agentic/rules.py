@@ -30,7 +30,7 @@ from .rules_graph import (
 )
 from .rules_index import PrebuiltIndex, inputs_sha256, write_index
 from .schema import NAME_SCHEMA, object_schema
-from .scryfall import ScryfallClient
+from .scryfall import ScryfallClient, card_rulings
 from .sources import SourceCache, SourceError, utc_now
 
 RULES_PAGE = "https://magic.wizards.com/en/rules"
@@ -476,9 +476,8 @@ class RulesStore:
             canonical[name_key(card["name"])] = card
         synced = []
         for key, card in canonical.items():
-            # Scryfall's own 24-hour response cache makes repeated synchronization cheap.
-            activity.tool("scryfall rulings", card["name"])
-            rulings = client.get_rulings(card["id"])
+            activity.tool("rulings", card["name"])
+            rulings = card_rulings(oracle, client, card)
             source = f"https://api.scryfall.com/cards/{card['id']}/rulings"
             docs = [
                 {

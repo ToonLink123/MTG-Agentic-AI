@@ -1,7 +1,7 @@
 """Agent and tool progress events, one stderr line each.
 
 `agent: orchestrator | start | claude-sonnet-5-5 | game plan and core` marks an LLM agent at work,
-`tool: scryfall search | otag:ramp` a tool it uses. The terminal UI draws these as a live agent
+`tool: card search | otag:ramp` a tool it uses. The terminal UI draws these as a live agent
 panel; on the plain CLI they are ordinary progress lines. Logging is thread-safe, so parallel
 agents may report at once.
 """

@@ -12,11 +12,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from . import bootstrap
 from .brackets import BracketChecker, SpellbookClient, bracket_rules
+from .bulk_search import BulkSearch
 from .council import MEMBER, ORCHESTRATOR, council_draft
 from .discovery import CandidatePool
 from .edit import Toolbox, edit_deck
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
+from .engine_map import build_engine_map
 from .evaluation import evaluation_history, run_evaluation
 from .forge import ForgeError
 from .forge_cli import load_forge
@@ -25,6 +28,7 @@ from .forge_cli import run_command as run_forge_command
 from .forge_config import OpponentPod
 from .forge_metrics import summarize
 from .forge_runner import ForgeSimulator
+from .interview import MAX_ROUNDS, interview_round
 from .lands import generate_mana_base, is_land
 from .llm import PROVIDERS, LlamaCppClient, LLMError, OllamaClient, OpenAICompatibleClient
 from .oracle import DEFAULT_DATA_DIR, OracleStore
@@ -42,6 +46,11 @@ from .spec import DeckSpec, intake
 from .validator import validate_deck
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# Claude's 1M-token context holds a 1,000-card pool (about 130K tokens); local models
+# usually run 32-64K contexts, so they keep the smaller pool.
+POOL_LIMITS = {"claude": 1000}
+DEFAULT_POOL_LIMIT = 350
+POOL_HELP = "Most candidates (up to 1000); default 1000 with claude, 350 otherwise"
 
 
 def _model_options(parser: argparse.ArgumentParser) -> None:
@@ -149,7 +158,7 @@ def _claude_api_key(env_file: Path = Path(".env")) -> str:
 
 
 RULES_INDEXES = {
-    "embeddinggemma": "rules-embeddinggemma-2.sqlite3",
+    "embeddinggemma": bootstrap.RULES_INDEX,
     "ollama": "rules.sqlite3",
     "hash": "rules-hash.sqlite3",
 }
@@ -209,6 +218,61 @@ def _reviewer(args, stack, store, client, model):
     rules.download_rules(sources)
     brackets = BracketChecker(store, client, sources, model)
     return DeckReviewer(brackets, rules, model, store, client)
+
+
+def _setup(args: argparse.Namespace) -> dict[str, Any]:
+    """Download every missing piece the pipeline reads locally, in order, logging each stage."""
+    done = (
+        dict.fromkeys(bootstrap.STEPS, False) if args.refresh
+        else bootstrap.status(args.data_dir, _rules_path(args).name)
+    )
+    steps: dict[str, str] = {}
+    with (
+        OracleStore(args.data_dir / "oracle.sqlite3") as store,
+        ScryfallClient(args.data_dir / "responses.sqlite3") as client,
+    ):
+        def cards() -> str:
+            info = client.download_oracle_cards(store, force=args.refresh)
+            store.text_count("treasure")  # Builds the full-text index local search uses.
+            return f"{info['card_count']:,} cards"
+
+        def rules() -> str:
+            with (
+                SourceCache(args.data_dir / "sources.sqlite3") as sources,
+                _rules_store(args) as index,
+            ):
+                return f"{index.download_rules(sources, refresh=args.refresh)['rule_count']} rules"
+
+        def model() -> str:
+            if args.embedding_backend != "embeddinggemma":
+                return f"skipped: the {args.embedding_backend} backend needs no download"
+            if problem := bootstrap.embedding_problem():
+                return f"skipped: {problem}"
+            if bootstrap.model_cached() and not args.refresh:
+                return bootstrap.ALREADY
+            bootstrap.fetch_model()
+            return "EmbeddingGemma 2 downloaded"
+
+        actions = {
+            "Card data": cards,
+            "Oracle tags": lambda: f"{client.download_oracle_tags(store, force=args.refresh)['tag_count']:,} tags",
+            "Rulings": lambda: f"{client.download_rulings(store, force=args.refresh)['ruling_count']:,} rulings",
+            "Commander Spellbook": lambda: "skipped: --skip-combos" if args.skip_combos else (
+                f"{SpellbookClient(store=store).download_variants(store, force=args.refresh)['combo_count']:,} combos"
+            ),
+            "Rules index": rules,
+            "Embedding model": model,
+        }
+        for name in bootstrap.STEPS:
+            # The model step always checks for itself, to say why it skips the download.
+            if done[name] and name != "Embedding model":
+                bootstrap.stage(name, bootstrap.ALREADY)
+                steps[name] = bootstrap.ALREADY
+                continue
+            bootstrap.stage(name, "downloading")
+            steps[name] = actions[name]()
+            bootstrap.stage(name, steps[name])
+    return {"ready": True, "steps": steps}
 
 
 def _simulation_options(parser, *, required=False, games=10):
@@ -281,8 +345,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--quiet", action="store_true", help="No live progress on stderr")
     commands = parser.add_subparsers(dest="command", required=True)
-    bulk = commands.add_parser("download-oracle", help="Download/index Oracle Cards once")
+    bulk = commands.add_parser(
+        "download-oracle",
+        help="Download/index Oracle Cards, Oracle tags, rulings and Commander Spellbook combos once",
+    )
     bulk.add_argument("--refresh", action="store_true")
+    bulk.add_argument(
+        "--skip-combos", action="store_true",
+        help="Skip the Commander Spellbook export (about 700 MB, parsed as it downloads); "
+        "combo checks then query its API",
+    )
+    setup_cmd = commands.add_parser(
+        "setup",
+        help="Download everything the pipeline reads locally, once: card data, Oracle tags, "
+        "rulings, Commander Spellbook combos, the rules index and the embedding model "
+        "(about 2.3 GB); later runs only fetch what is missing",
+    )
+    setup_cmd.add_argument("--refresh", action="store_true", help="Download fresh copies of everything")
+    setup_cmd.add_argument("--skip-combos", action="store_true",
+                           help="Skip the 700 MB Commander Spellbook export; combo checks use its API")
+    _embedding_options(setup_cmd)
     search = commands.add_parser("search", help="Search Scryfall, with all pages trimmed")
     search.add_argument("query")
     card = commands.add_parser("card", help="Exact name lookup, then fuzzy fallback")
@@ -301,17 +383,46 @@ def main(argv: list[str] | None = None) -> int:
     mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec)")
     mana_base.add_argument("--output", type=Path, help="Write the mana-base report to a NEW file")
     commands.add_parser("spec-schema", help="Print the fixed intake JSON schema")
+    interview_cmd = commands.add_parser(
+        "interview",
+        help="One round of playstyle questions before intake; run again with the answers until "
+        'the status is "ready"',
+    )
+    interview_cmd.add_argument("--commander", required=True)
+    interview_cmd.add_argument("--request", required=True)
+    interview_cmd.add_argument(
+        "--answers", type=Path,
+        help="JSON list of earlier answers: {question, answer, source: option|own|agents}",
+    )
+    interview_cmd.add_argument("--round", dest="round_number", type=int, default=1)
+    interview_cmd.add_argument(
+        "--max-rounds", type=int, choices=range(1, 21), default=MAX_ROUNDS, metavar="1-20",
+        help=f"The last round must be ready (default {MAX_ROUNDS})",
+    )
+    _bracket3_options(interview_cmd)
+    _model_options(interview_cmd)
     intake_cmd = commands.add_parser("intake", help="Ground preferences in fetched commander text")
     intake_cmd.add_argument("--commander", required=True)
     intake_cmd.add_argument("--request", required=True)
+    intake_cmd.add_argument(
+        "--interview", type=Path, help="The interview's answers, as for interview --answers"
+    )
     _bracket3_options(intake_cmd)
     _model_options(intake_cmd)
     discover_cmd = commands.add_parser(
         "discover", help="Generate live queries and save a tagged pool"
     )
     discover_cmd.add_argument("--spec", required=True, type=Path)
-    discover_cmd.add_argument("--pool-limit", type=int, default=350)
+    discover_cmd.add_argument("--pool-limit", type=int, help=POOL_HELP)
     _model_options(discover_cmd)
+    map_cmd = commands.add_parser(
+        "engine-map", help="Map the pool's resource loop for the brief; prints the mapped pool"
+    )
+    map_cmd.add_argument("--pool", required=True, type=Path)
+    map_cmd.add_argument(
+        "--no-combos", action="store_true", help="Skip the Commander Spellbook combo lookup"
+    )
+    _model_options(map_cmd)
     draft_cmd = commands.add_parser(
         "draft", help="Choose spells, calculate lands, validate and repair"
     )
@@ -366,7 +477,7 @@ def main(argv: list[str] | None = None) -> int:
     build_cmd.add_argument("--commander", required=True)
     build_cmd.add_argument("--request", required=True)
     _bracket3_options(build_cmd)
-    build_cmd.add_argument("--pool-limit", type=int, default=350)
+    build_cmd.add_argument("--pool-limit", type=int, help=POOL_HELP)
     build_cmd.add_argument("--repairs", type=int, choices=range(4), default=3)
     _simulation_options(build_cmd, required=True)
     _embedding_options(build_cmd)
@@ -397,7 +508,7 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--runs-dir", type=Path)
     evaluate.add_argument("--label", default="")
     evaluate.add_argument("--repairs", type=int, choices=range(4), default=3)
-    evaluate.add_argument("--pool-limit", type=int, default=350)
+    evaluate.add_argument("--pool-limit", type=int, help=POOL_HELP)
     _model_options(evaluate)
     _embedding_options(evaluate)
     _simulation_options(evaluate)
@@ -417,6 +528,8 @@ def main(argv: list[str] | None = None) -> int:
     tui.add_argument("--model", help="Default: MTG_LLM_MODEL or the provider's default")
     register_forge_commands(commands)
     args = parser.parse_args(argv)
+    if getattr(args, "pool_limit", 0) is None:
+        args.pool_limit = POOL_LIMITS.get(args.provider, DEFAULT_POOL_LIMIT)
     if args.command == "tui":
         try:
             from .tui import run_tui  # Loads the optional Textual package only when selected.
@@ -450,6 +563,9 @@ def main(argv: list[str] | None = None) -> int:
             return code
         if args.command == "spec-schema":
             _emit(SPEC_SCHEMA)
+            return 0
+        if args.command == "setup":
+            _emit(_setup(args))
             return 0
         if args.command == "mana-base":
             if args.output is not None and args.output.exists():
@@ -596,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
                             return results
                     elif args.pod:
                         raise ValueError("--pod requires --forge-home")
+                    search = BulkSearch(store, client)
                     result = run_evaluation(
                         lambda case: draft_from_request(
                             case["request"],
@@ -606,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
                             pool_limit=args.pool_limit,
                             max_repairs=args.repairs,
                             reviewer=reviewer,
+                            search=search,
                         ),
                         store,
                         args.runs_dir,
@@ -657,7 +775,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 result = edit_deck(
                     deck, pool, model, args.request,
-                    tools=Toolbox(store, client, rules, SpellbookClient(sources)),
+                    tools=Toolbox(store, client, rules, SpellbookClient(sources, store=store),
+                                  BulkSearch(store, client)),
                     reviewer=reviewer, max_steps=args.steps,
                 )
             _emit(result, args.output)
@@ -687,7 +806,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
-        if args.command in {"intake", "discover", "draft", "build"}:
+        if args.command in {"interview", "intake", "discover", "engine-map", "draft", "build"}:
             if args.output is not None and args.output.exists():
                 raise ValueError("Output already exists; choose a new filename")
             model = _make_model(args)
@@ -708,15 +827,47 @@ def main(argv: list[str] | None = None) -> int:
                     simulator, pods = _simulation(args, store)
                 if args.command == "build" or (args.command == "draft" and not args.skip_review):
                     reviewer = _reviewer(args, stack, store, client, model)
-                if args.command == "intake":
+                if args.command == "interview":
+                    leader = store.get_card(args.commander)
+                    if leader is None:
+                        raise ValueError("Commander is absent from the local card data")
+                    answers = (
+                        load_json(args.answers.read_text(encoding="utf-8-sig"))
+                        if args.answers is not None else []
+                    )
+                    result = interview_round(
+                        args.request, leader, answers, model, round_number=args.round_number,
+                        max_rounds=args.max_rounds, bracket3_mode=args.bracket3_mode,
+                    )
+                elif args.command == "intake":
+                    answers = (
+                        load_json(args.interview.read_text(encoding="utf-8-sig"))
+                        if args.interview is not None else []
+                    )
                     result = intake(
                         args.request, args.commander, model, client, store,
-                        bracket3_mode=args.bracket3_mode,
+                        bracket3_mode=args.bracket3_mode, interview=answers,
                     ).to_dict()
+                elif args.command == "engine-map":
+                    pool = CandidatePool.from_dict(
+                        load_json(args.pool.read_text(encoding="utf-8-sig")), store
+                    )
+                    sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
+                    spellbook = None if args.no_combos else SpellbookClient(sources, store=store)
+                    try:
+                        pool = build_engine_map(
+                            pool, model, store, spellbook=spellbook,
+                            search=BulkSearch(store, client),
+                        )
+                        result = pool.to_dict()
+                    except SchemaError as exc:
+                        # Drafting still works without a map, so this is a warning, not an error.
+                        result = {**pool.to_dict(), "valid": False, "map_errors": exc.errors}
                 elif args.command == "discover":
                     spec = DeckSpec.from_dict(load_json(args.spec.read_text(encoding="utf-8-sig")))
                     result = discover(
-                        spec, model, client, store, pool_limit=args.pool_limit
+                        spec, model, client, store, pool_limit=args.pool_limit,
+                        search=BulkSearch(store, client),
                     ).to_dict()
                 elif args.command == "draft":
                     pool = CandidatePool.from_dict(
@@ -740,6 +891,7 @@ def main(argv: list[str] | None = None) -> int:
                         games=args.games,
                         seed=args.seed,
                         bracket3_mode=args.bracket3_mode,
+                        search=BulkSearch(store, client),
                     )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
@@ -777,6 +929,15 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "download-oracle":
                 with OracleStore(args.data_dir / "oracle.sqlite3") as store:
                     result = client.download_oracle_cards(store, force=args.refresh)
+                    result = {
+                        **result,
+                        "tags": client.download_oracle_tags(store, force=args.refresh),
+                        "rulings": client.download_rulings(store, force=args.refresh),
+                    }
+                    if not args.skip_combos:
+                        result["combos"] = SpellbookClient(store=store).download_variants(
+                            store, force=args.refresh
+                        )
             elif args.command == "search":
                 result = client.search_cards(args.query)
             elif args.command == "card":

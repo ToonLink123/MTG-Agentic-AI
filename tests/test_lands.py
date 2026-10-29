@@ -227,7 +227,7 @@ class LandTests(unittest.TestCase):
         pool.cards.append(Candidate(self.store.get_card("Nature's Lore"), {"ramp"}))
         # A saved pool deliberately has no premium lands, and the model picks none.
         buckets = {role: [] for role in DRAFT_ROLES}
-        model = FakeModel({"commander": leader["name"], "buckets": buckets})
+        model = FakeModel({"commander": leader["name"], "buckets": buckets, "outside": []})
         client = FakeCards(data)
         result = draft_deck(pool, model, client, self.store, max_repairs=0)
         self.assertTrue(result["valid"], result["validation"]["errors"])

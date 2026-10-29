@@ -11,6 +11,7 @@ from mtg_agentic import prompts
 from mtg_agentic.council import council_draft, plan_deck
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.schema import SchemaError
+from tests.fixtures import card
 from tests.pipeline_fixtures import JODAH, FakeCards, draft, make_pool, playable_records
 
 PLAN = {
@@ -115,6 +116,22 @@ class CouncilTests(unittest.TestCase):
         self.assertEqual(council["open_slots"], 63 - len(council["locked"]))
         for name in council["contested"]:
             self.assertEqual(sum(council["votes"][name][v] for v in ("keep", "cut")), 3)
+
+    def test_members_outside_picks_join_the_debate_like_candidates(self):
+        extra = card("Outside Engine", colors="U", mana_cost="{1}{U}", cmc=2,
+                     text="Draw two cards.")
+        self.store.import_cards([*self.records, extra])
+        self.pool = make_pool(self.store)
+        engine = {**picks(*range(62)), "outside": [{"name": "Outside Engine", "reason": "fits"}]}
+        model = CouncilModel({
+            "engine": engine, "resilience": picks(*range(63)), "consistency": picks(*range(63)),
+        })
+        deck = self.run_council(model)
+        council = deck["council"]
+        self.assertEqual(council["drafts"][0]["outside"],
+                         {"accepted": ["Outside Engine"], "rejected": []})
+        self.assertIn("Outside Engine", council["contested"])
+        self.assertTrue(deck["valid"], deck["validation"]["errors"])
 
     def test_unanimous_drafts_skip_the_debate(self):
         same = picks(*range(63))

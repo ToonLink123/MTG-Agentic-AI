@@ -111,6 +111,16 @@ class EditTests(unittest.TestCase):
         self.assertTrue(result["review_passed"])
         self.assertEqual(result["edit"]["reply"], "Fixed it.")
 
+    def test_the_rulings_tool_reads_local_rulings(self):
+        deck, pool = self.deck()
+        self.store.import_rulings([{"oracle_id": "Spell 3", "source": "wotc",
+                                    "published_at": "2024-01-01", "comment": "It can target itself."}])
+        model = FakeModel(act("rulings", cards=["Spell 3"]), act(reply="Yes, it can."))
+        self.edit(deck, pool, model, "Can Spell 3 target itself?")
+        answer = json.loads(model.calls[1][0][-1]["content"])
+        self.assertEqual(answer["result"]["rulings"],
+                         [{"name": "Spell 3", "rulings": ["It can target itself."]}])
+
     def test_the_last_step_must_finish(self):
         deck, pool = self.deck()
         model = FakeModel(act("card", cards=["Spell 66"]), act(reply="Out of steps; no change."))

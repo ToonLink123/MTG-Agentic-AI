@@ -13,7 +13,7 @@ from mtg_agentic.llm import (
     request_json,
 )
 from mtg_agentic.schema import SPEC_SCHEMA, SchemaError
-from tests.pipeline_fixtures import make_spec
+from tests.pipeline_fixtures import spec_reply
 
 
 class LLMTests(unittest.TestCase):
@@ -21,7 +21,7 @@ class LLMTests(unittest.TestCase):
     def test_ollama_requests_schema_without_api_key(self, http):
         http.return_value = io.BytesIO(
             json.dumps(
-                {"done": True, "message": {"content": json.dumps(make_spec().to_dict())}}
+                {"done": True, "message": {"content": json.dumps(spec_reply())}}
             ).encode()
         )
         result = request_json(OllamaClient(), [{"role": "user", "content": "Myojin"}], SPEC_SCHEMA)
@@ -38,7 +38,7 @@ class LLMTests(unittest.TestCase):
     def test_openai_adapter_sends_schema_and_explicit_key(self, http):
         http.return_value = io.BytesIO(
             json.dumps(
-                {"choices": [{"message": {"content": json.dumps(make_spec().to_dict())}}]}
+                {"choices": [{"message": {"content": json.dumps(spec_reply())}}]}
             ).encode()
         )
         client = OpenAICompatibleClient("test-model", api_key="test-key")
@@ -99,7 +99,7 @@ class LLMTests(unittest.TestCase):
         http.return_value = io.BytesIO(
             json.dumps(
                 {
-                    "choices": [{"message": {"content": json.dumps(make_spec().to_dict())}}],
+                    "choices": [{"message": {"content": json.dumps(spec_reply())}}],
                     "usage": {"prompt_tokens": 900, "completion_tokens": 40},
                 }
             ).encode()
@@ -118,7 +118,7 @@ class LLMTests(unittest.TestCase):
         self.assertEqual(body["max_tokens"], 65536 - prompt)
         self.assertEqual((client.usage["prompt"], client.usage["output"]), (900, 40))
         http.return_value = io.BytesIO(
-            json.dumps({"choices": [{"message": {"content": json.dumps(make_spec().to_dict())}}]}).encode()
+            json.dumps({"choices": [{"message": {"content": json.dumps(spec_reply())}}]}).encode()
         )
         request_json(LlamaCppClient(thinking=False), [], SPEC_SCHEMA)
         body = json.loads(http.call_args.args[0].data)
@@ -130,7 +130,7 @@ class LLMTests(unittest.TestCase):
             {"message": {"content": "not json"}},
             {"message": {"content": "{}"}},
             {"done_reason": "length"},
-            {"message": {"content": json.dumps(make_spec().to_dict())}, "eval_count": 7},
+            {"message": {"content": json.dumps(spec_reply())}, "eval_count": 7},
         ]
         http.side_effect = [io.BytesIO(json.dumps(r).encode()) for r in replies]
         client = OllamaClient()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -14,11 +15,22 @@ from .brackets import land_denial_forbidden
 from .cards import Card, name_key
 from .llm import JSONModel, request_json
 from .oracle import OracleStore
-from .schema import SPEC_SCHEMA, SchemaError, validate_json
+from .schema import (
+    ANSWERS_SCHEMA,
+    BRIEF_SCHEMA,
+    EMPTY_BRIEF,
+    INTAKE_SCHEMA,
+    SPEC_SCHEMA,
+    SchemaError,
+    validate_json,
+)
 from .scryfall import ScryfallClient
 from .validator import can_be_commander, card_errors
 
 log = logging.getLogger(__name__)
+# Curly quotes and dashes a model may type for the player's straight ones.
+_PLAIN = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+                        "\u2013": "-", "\u2014": "-"})
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,8 @@ class DeckSpec:
     role_targets: dict[str, int]
     commander_dependency: str = "medium"
     bracket3_mode: str = "standard"
+    # The player's words (request, interview, asks, deferred questions); see BRIEF_SCHEMA.
+    brief: dict[str, Any] = dataclasses.field(default_factory=lambda: deepcopy(EMPTY_BRIEF))
 
     @classmethod
     def from_dict(cls, data: Any) -> DeckSpec:
@@ -48,8 +62,10 @@ class DeckSpec:
             if isinstance(data.get("role_targets"), dict):
                 data["role_targets"].setdefault("creatures", 15)
                 data["role_targets"].setdefault("protection", 6 if data["commander_dependency"] == "high" else 4)
+        brief = data.pop("brief", deepcopy(EMPTY_BRIEF)) if isinstance(data, dict) else None
         validate_json(data, SPEC_SCHEMA)
-        result = cls(**json.loads(json.dumps(data)))
+        validate_json(brief, BRIEF_SCHEMA)
+        result = cls(**json.loads(json.dumps({**data, "brief": brief})))
         errors: list[dict[str, Any]] = []
         if result.bracket != 3 and result.bracket3_mode != "standard":
             errors.append({"error": "spec", "detail": "Custom Bracket 3 modes require bracket 3"})
@@ -129,12 +145,25 @@ def ground_spec(spec: DeckSpec, store: OracleStore, commander: Card | None = Non
     return DeckSpec.from_dict(grounded)
 
 
+def _plain(text: str) -> str:
+    return " ".join(text.translate(_PLAIN).casefold().split())
+
+
+def _unquoted(asks: list[dict[str, Any]], words: list[str]) -> list[str]:
+    """Quotes that are not the player's words: in the request or an answer they gave."""
+    said = [_plain(text) for text in words]
+    return [a["quote"] for a in asks if not any(_plain(a["quote"]) in text for text in said)]
+
+
 def intake(
     request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore,
-    *, bracket3_mode: str | None = None,
+    *, bracket3_mode: str | None = None, interview: list[dict[str, str]] | None = None,
 ) -> DeckSpec:
+    """The spec plus a brief: the player's words, split into asks that quote them exactly."""
     if not isinstance(request, str) or not request.strip() or len(request) > 8000:
         raise ValueError("Intake request must contain 1 to 8000 characters")
+    answers = deepcopy(interview or [])
+    validate_json(answers, ANSWERS_SCHEMA)
     if not store.ready:
         raise ValueError("Download an Oracle snapshot before intake")
     fetched = client.get_card(commander, fuzzy=False)
@@ -144,15 +173,45 @@ def intake(
     messages = [
         {
             "role": "system",
-            "content": prompts.INTAKE + json.dumps(SPEC_SCHEMA),
+            "content": prompts.INTAKE + json.dumps(INTAKE_SCHEMA),
         },
         {"role": "user", "content": json.dumps({
-            "request": request, "commander_card": fetched, "bracket3_mode": bracket3_mode,
+            "request": request, "interview": answers, "commander_card": fetched,
+            "bracket3_mode": bracket3_mode,
         })},
     ]
     log.info("intake: turning the request into a deck spec")
     with activity.agent("intake", model, "turn the request into a deck spec"):
-        data = request_json(model, messages, SPEC_SCHEMA)
+        data = request_json(model, messages, INTAKE_SCHEMA)
+    words = [request, *(a["answer"] for a in answers if a["source"] != "agents")]
+    unquoted = _unquoted(data["asks"], words)
+    if unquoted:
+        # One chance to copy the player's words exactly, then code drops what still is not.
+        messages += [
+            {"role": "assistant", "content": json.dumps(data)},
+            {"role": "user", "content": json.dumps({
+                "problems": [{"quote": q, "detail": "Not found in the request or an answer"}
+                             for q in unquoted],
+                "instruction": "Return the same JSON object. Copy every ask's quote character "
+                "for character from the request or an interview answer; change nothing else.",
+            })},
+        ]
+        with activity.agent("intake", model, "quote the player's words exactly"):
+            try:
+                data = request_json(model, messages, INTAKE_SCHEMA)
+            except SchemaError:
+                log.warning("intake: the quote repair was invalid; keeping the first answer")
+    unquoted = _unquoted(data["asks"], words)
+    asks = [a for a in data.pop("asks") if a["quote"] not in unquoted]
+    if unquoted:
+        log.warning("intake: dropped %d ask(s) that do not quote the player", len(unquoted))
+    if not asks:
+        asks = [{"quote": request.strip()[:400], "wants": "the request as a whole", "kind": "cards"}]
+    data["brief"] = {
+        "request": request, "interview": answers,
+        "asks": [{"id": f"A{number}", **ask} for number, ask in enumerate(asks, 1)],
+        "deferred": [a["question"] for a in answers if a["source"] == "agents"],
+    }
     if bracket3_mode is not None:
         data["bracket3_mode"] = bracket3_mode
     spec = DeckSpec.from_dict(data)

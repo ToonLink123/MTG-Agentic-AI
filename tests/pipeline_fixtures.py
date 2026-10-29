@@ -46,6 +46,30 @@ def make_spec(**changes):
     return DeckSpec.from_dict(data)
 
 
+def spec_reply(**changes):
+    """A spec as a model writes it: the SPEC_SCHEMA fields, without the brief code adds."""
+    data = make_spec(**changes).to_dict()
+    data.pop("brief")
+    return data
+
+
+def intake_reply(*asks, **changes):
+    """Intake's answer: the spec fields plus asks, by default one quoting "Myojin"."""
+    asks = asks or ({"quote": "Myojin", "wants": "Myojin tribal", "kind": "cards"},)
+    return {**spec_reply(**changes), "asks": list(asks)}
+
+
+def map_reply(*stages, asks=(), **changes):
+    """An engine map as a model writes it."""
+    data = {
+        "summary": "Cast Myojin, keep their counters, win in combat.",
+        "resources": ["divinity counters"],
+        "stages": list(stages), "links": [], "asks": list(asks), "gaps": [], "searches": [],
+    }
+    data.update(changes)
+    return data
+
+
 def records(count=70):
     return [
         JODAH,
@@ -122,6 +146,7 @@ def draft(count=63, **changes):
             **{role: [] for role in DRAFT_ROLES},
             "support": [f"Spell {n}" for n in range(count)],
         },
+        "outside": [],
     }
     data.update(changes)
     return data

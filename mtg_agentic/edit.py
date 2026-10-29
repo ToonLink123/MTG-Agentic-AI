@@ -22,12 +22,12 @@ from .discovery import CandidatePool, constrain_query, eligible
 from .lands import is_land
 from .llm import JSONModel, request_json
 from .oracle import OracleStore
-from .pipeline import check_cards, game_changer_names, make_lands
+from .pipeline import ask_report, check_cards, game_changer_names, make_lands
 from .review import DeckReviewer
 from .roles import oracle_roles
 from .rules import RulesStore
 from .schema import NAME_SCHEMA, SchemaError, object_schema
-from .scryfall import ScryfallClient, ScryfallError
+from .scryfall import ScryfallClient, ScryfallError, card_rulings
 from .sources import SourceError
 from .spec import DeckSpec
 
@@ -44,6 +44,8 @@ class Toolbox:
     client: ScryfallClient | None = None
     rules: RulesStore | None = None
     spellbook: SpellbookClient | None = None
+    # Searches go here when set (the local BulkSearch), else to the client's live search.
+    search: Any = None
 
 
 def _clip(text: str, limit: int) -> str:
@@ -119,7 +121,7 @@ class _Session:
         )
         return {
             "spec": spec, "cards": cards, "land_base": land_base, "validation": validation,
-            "playability": playability, "errors": errors,
+            "playability": playability, "errors": errors, "asks": ask_report(pool, cards),
         }
 
     def run(self, action: dict[str, Any]) -> dict[str, Any]:
@@ -130,12 +132,13 @@ class _Session:
             return {"error": str(exc)}
 
     def _tool_search_cards(self, action: dict[str, Any]) -> dict[str, Any]:
-        if self.tools.client is None:
+        searcher = self.tools.search or self.tools.client
+        if searcher is None:
             return {"error": "Card search is unavailable here."}
         query = action["query"].strip()
-        activity.tool("scryfall search", query)
+        activity.tool("card search", query)
         scoped = constrain_query(query, self.spec.color_identity)
-        found = self.tools.client.search_cards(scoped, max_results=20, order="edhrec")
+        found = searcher.search_cards(scoped, max_results=20, order="edhrec")
         rows = []
         for result in found:
             card = self.store.get_card(result["name"])
@@ -157,16 +160,16 @@ class _Session:
         return {"cards": rows}
 
     def _tool_rulings(self, action: dict[str, Any]) -> dict[str, Any]:
-        if self.tools.client is None:
+        if self.tools.client is None and not self.store.rulings_ready:
             return {"error": "Rulings are unavailable here."}
         rows = []
         for name in action["cards"][:5]:
-            activity.tool("scryfall rulings", name)
+            activity.tool("rulings", name)
             card = self.lookup(name)
             if card is None:
                 rows.append({"name": name, "error": "No such card"})
                 continue
-            rulings = self.tools.client.get_rulings(card["id"])
+            rulings = card_rulings(self.store, self.tools.client, card)
             texts = [_clip(r["comment"] or "", 500) for r in rulings[:12]]
             rows.append({"name": card["name"], "rulings": texts})
         return {"rulings": rows}
@@ -257,8 +260,10 @@ def edit_deck(
     ]
     payload = {
         "spec": session.spec.to_dict(),
-        "plan": {k: deck["council"][k] for k in ("game_plan", "non_goals", "core")}
+        "plan": {k: deck["council"].get(k, []) for k in ("game_plan", "non_goals", "core",
+                                                         "decisions")}
         if deck.get("council") else None,
+        "engine_map": session.pool.engine_map or None,
         "deck": [
             {**trim_card(session.records[n]), "quantity": q,
              "roles": sorted(oracle_roles(session.records[n]))}
@@ -347,6 +352,6 @@ def _result(
             protection=built["playability"]["roles"]["protection"],
             playability=built["playability"], land_base=built["land_base"],
             validation=validation, review=built["review"],
-            review_passed=built["review"]["status"] == "passed",
+            review_passed=built["review"]["status"] == "passed", asks=built["asks"],
         )
     return result

@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
+import logging
 import re
 from collections import Counter
-from typing import Any
-from urllib.parse import urlencode
+from collections.abc import Iterator
+from typing import Any, TextIO
+from urllib.error import URLError
+from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 from . import activity, prompts
 from .cards import Card, name_key, trim_card
@@ -15,8 +20,71 @@ from .llm import JSONModel, request_json
 from .mana import is_land
 from .oracle import OracleStore
 from .schema import BRACKET3_MODES, NAME_SCHEMA, STRING_LIST, SchemaError, object_schema
-from .scryfall import ScryfallClient
-from .sources import SourceCache, SourceError
+from .scryfall import USER_AGENT, ScryfallClient
+from .sources import SourceCache, SourceError, utc_now
+
+SPELLBOOK_EXPORT = "https://json.commanderspellbook.com/variants.json"
+log = logging.getLogger(__name__)
+
+
+def stream_variants(stream: TextIO, chunk: int = 1 << 20) -> Iterator[dict[str, Any]]:
+    """The variants of Commander Spellbook's export, decoded one at a time, so the whole
+    file (about 700 MB) never sits in memory."""
+    decoder = json.JSONDecoder()
+    buffer = ""
+    while True:
+        text = stream.read(chunk)
+        if not text:
+            raise SourceError("The Spellbook export has no variants list")
+        buffer += text
+        key = buffer.find('"variants"')
+        start = buffer.find("[", key) if key >= 0 else -1
+        if start >= 0:
+            buffer, position = buffer[start + 1:], 0
+            break
+        buffer = buffer[key:] if key >= 0 else buffer[-16:]
+    while True:
+        while position < len(buffer) and buffer[position] in " \t\r\n,":
+            position += 1
+        if position < len(buffer) and buffer[position] == "]":
+            return
+        try:
+            if position >= len(buffer):
+                raise ValueError("need more text")
+            variant, end = decoder.raw_decode(buffer, position)
+        except ValueError:
+            text = stream.read(chunk)
+            if not text:
+                raise SourceError("The Spellbook export ended in the middle of a variant") from None
+            buffer, position = buffer[position:] + text, 0
+            continue
+        if not isinstance(variant, dict):
+            raise SourceError("Spellbook variants must be objects")
+        yield variant
+        position = end
+
+
+def compact_variant(variant: dict[str, Any]) -> dict[str, Any] | None:
+    """What find_combos reads, for the variants of at most two cards, the only ones a combo
+    check matches or flags. Card images and every other field are dropped."""
+    try:
+        uses = variant["uses"]
+        if variant["status"] != "OK" or not uses or sum(u["quantity"] for u in uses) > 2:
+            return None
+        return {
+            "id": variant["id"], "status": "OK",
+            "uses": [{**{k: v for k, v in u.items() if k != "card"},
+                      "card": {"name": u["card"]["name"]}} for u in uses],
+            # Only whether templates are required matters.
+            "requires": [{"template": True}] if variant.get("requires") else [],
+            "produces": [{"feature": {"name": p["feature"]["name"]}} for p in variant["produces"]],
+            "manaNeeded": variant.get("manaNeeded") or "",
+            "easyPrerequisites": variant.get("easyPrerequisites") or "",
+            "notablePrerequisites": variant.get("notablePrerequisites") or "",
+            "description": variant.get("description") or "",
+        }
+    except (KeyError, TypeError) as exc:
+        raise SourceError("Invalid Spellbook variant fields") from exc
 
 POLICY = {
     "version": "2026-02-09",
@@ -137,14 +205,54 @@ def game_changers(client: ScryfallClient, cache: SourceCache) -> dict[str, Any]:
 
 
 class SpellbookClient:
-    """Sparse, cached read-only POST queries. Never accept almost-included combos."""
+    """Combos from the local copy of Commander Spellbook's export when the store has one,
+    otherwise sparse, cached read-only POST queries. Never accept almost-included combos."""
 
-    def __init__(self, cache: SourceCache, *, max_pages: int = 3):
+    def __init__(
+        self, cache: SourceCache | None = None, *, max_pages: int = 3,
+        store: OracleStore | None = None,
+    ):
         if not 1 <= max_pages <= 3:
             raise ValueError("Spellbook max_pages must be from 1 to 3")
-        self.cache, self.max_pages = cache, max_pages
+        self.cache, self.max_pages, self.store = cache, max_pages, store
+
+    def download_variants(self, store: OracleStore, *, force: bool = False) -> dict[str, Any]:
+        """Stream the export once into the store, keeping only the variants combo checks use."""
+        if store.combos_ready and not force:
+            return store.combo_metadata
+        log.info("spellbook: downloading the Commander Spellbook export (about 700 MB, once)")
+        request = Request(SPELLBOOK_EXPORT, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        read = 0
+
+        def variants() -> Iterator[dict[str, Any]]:
+            nonlocal read
+            with urlopen(request, timeout=120) as response:
+                if urlsplit(response.geturl()).netloc != urlsplit(SPELLBOOK_EXPORT).netloc:
+                    raise SourceError("The Spellbook export redirected to an unexpected host")
+                for variant in stream_variants(io.TextIOWrapper(response, encoding="utf-8")):
+                    read += 1
+                    if read % 20000 == 0:
+                        log.info("spellbook: %d variants read", read)
+                    if (kept := compact_variant(variant)) is not None:
+                        yield kept
+
+        try:
+            store.import_combos(variants(), metadata={
+                "downloaded_at": utc_now(), "source": SPELLBOOK_EXPORT,
+            })
+        except (URLError, OSError) as exc:
+            raise SourceError("Cannot reach the Commander Spellbook export; retry later") from exc
+        log.info("spellbook: kept %d of %d variants", store.combo_metadata["combo_count"], read)
+        return store.combo_metadata
 
     def find_combos(self, cards: dict[str, int], commander: str) -> dict[str, Any]:
+        if self.store is not None and self.store.combos_ready:
+            # Every variant whose cards are all present: no pages, so nothing is truncated.
+            variants = {v["id"]: v for v in self.store.combo_candidates([*cards, commander])}
+            stamps = [self.store.combo_metadata.get("downloaded_at")]
+            return self._matched(variants, cards, commander, True, stamps, SPELLBOOK_EXPORT)
+        if self.cache is None:
+            raise SourceError("Commander Spellbook combos are not downloaded; run download-oracle")
         payload = {
             "main": [{"card": n, "quantity": q} for n, q in sorted(cards.items())],
             "commanders": [{"card": commander, "quantity": 1}],
@@ -177,6 +285,14 @@ class SpellbookClient:
             url = "https://backend.commanderspellbook.com/find-my-combos?" + urlencode(
                 {"limit": 100, "offset": len(visited) * 100}
             )
+        return self._matched(variants, cards, commander, complete, stamps,
+                             "https://commanderspellbook.com")
+
+    @staticmethod
+    def _matched(
+        variants: dict[str, Any], cards: dict[str, int], commander: str, complete: bool,
+        stamps: list[Any], source: str,
+    ) -> dict[str, Any]:
         available = Counter({name_key(n): q for n, q in cards.items()})
         available[name_key(commander)] += 1
         matched = []
@@ -232,7 +348,7 @@ class SpellbookClient:
             "complete": complete and not unresolved_templates,
             "observed_at": stamps,
             "attribution": "Commander Spellbook",
-            "source": "https://commanderspellbook.com",
+            "source": source,
             "scope": "Known exact two-card, template-free variants only; prerequisites not proven.",
         }
 
@@ -395,7 +511,7 @@ class BracketChecker:
         spellbook: SpellbookClient | None = None,
     ):
         self.store, self.client, self.cache, self.model = store, client, cache, model
-        self.spellbook = spellbook or SpellbookClient(cache)
+        self.spellbook = spellbook or SpellbookClient(cache, store=store)
         self.game_changer_list = game_changers(client, cache)
 
     def check(

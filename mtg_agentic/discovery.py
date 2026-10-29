@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from itertools import zip_longest
 from typing import Any
@@ -12,17 +14,35 @@ from typing import Any
 from . import activity, prompts
 from .brackets import land_denial_forbidden
 from .cards import Card, name_key, trim_card
+from .engine_map import clean_map
 from .land_options import preferred_lands
 from .llm import JSONModel, request_json
-from .mana import BASIC_LANDS
+from .mana import BASIC_LANDS, is_land
 from .oracle import OracleStore
-from .schema import QUERY_SCHEMA, ROLES, SchemaError, object_schema
+from .schema import (
+    LOCAL_SEARCH_SCHEMA,
+    QUERY_SCHEMA,
+    ROLES,
+    SchemaError,
+    map_schema,
+    object_schema,
+    validate_json,
+)
 from .scryfall import ScryfallClient, ScryfallError
 from .spec import DeckSpec, ground_spec
 from .validator import card_errors
 
 log = logging.getLogger(__name__)
 
+# A saved pool may outgrow the discovery limit: gap searches and drafters' outside picks add
+# cards after discovery.
+MAX_POOL = 1200
+POOL_LIMIT = 1000  # The most candidates discovery selects.
+THEME_FLOOR = 6  # Most-played cards each non-role query keeps before the fit ranking.
+FIT_FADE = 30  # A card this far down a query's most-played order earns half its fit there.
+LOCAL_FIRST = 15  # Theme-search hits that join outright; the rest compete on fit.
+LOCAL_FIT = 4.0  # Fit the best theme-search hit adds; the others in proportion to their score.
+ROLE_FLOOR = 10  # At least this many most-played cards per role query (ramp, draw, removal...).
 DEFAULT_QUERIES = {
     "ramp": "otag:ramp",
     "draw": "otag:draw",
@@ -158,6 +178,10 @@ class CandidatePool:
     cards: list[Candidate]
     queries: list[CardQuery] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # The local search's terms and ranked hits, and the engine map drawn from this pool ({}
+    # until one is built).
+    local_search: dict[str, Any] = field(default_factory=lambda: {"terms": [], "hits": []})
+    engine_map: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -166,6 +190,8 @@ class CandidatePool:
             "cards": [candidate.to_dict() for candidate in self.cards],
             "queries": [query.to_dict() for query in self.queries],
             "diagnostics": self.diagnostics,
+            "local_search": self.local_search,
+            "engine_map": self.engine_map,
         }
 
     @classmethod
@@ -175,8 +201,8 @@ class CandidatePool:
             raise ValueError("Expected a version-1 candidate pool")
         spec = ground_spec(DeckSpec.from_dict(data.get("spec")), store)
         raw_cards = data.get("cards")
-        if not isinstance(raw_cards, list) or len(raw_cards) > 400:
-            raise ValueError("A candidate pool must contain at most 400 cards")
+        if not isinstance(raw_cards, list) or len(raw_cards) > MAX_POOL:
+            raise ValueError(f"A candidate pool must contain at most {MAX_POOL} cards")
         cards: list[Candidate] = []
         seen: set[str] = set()
         for raw in raw_cards:
@@ -209,7 +235,16 @@ class CandidatePool:
         diagnostics = data.get("diagnostics", [])
         if not isinstance(diagnostics, list) or len(diagnostics) > 40:
             raise ValueError("Invalid discovery diagnostics")
-        return cls(spec, cards, queries, diagnostics)
+        local = data.get("local_search", {"terms": [], "hits": []})
+        validate_json(local, LOCAL_SEARCH_SCHEMA)
+        engine = data.get("engine_map") or {}
+        if engine:
+            # A saved map is re-checked like the cards: only names still in this pool remain.
+            engine = {"searches": [], **engine}
+            validate_json(engine, map_schema(stored=True))
+            nonlands = [c.card["name"] for c in cards if not is_land(c.card)]
+            engine = clean_map(engine, nonlands, spec.commander, spec.brief["asks"], notes=False)
+        return cls(spec, cards, queries, diagnostics, local, engine)
 
 
 def eligible(card: Card, spec: DeckSpec) -> bool:
@@ -245,14 +280,25 @@ def build_candidate_pool(
     store: OracleStore,
     *,
     limit: int = 350,
-    results_per_query: int = 500,
+    results_per_query: int | None = None,
     model: JSONModel | None = None,
     max_query_repairs: int = 4,
+    local_search: dict[str, Any] | None = None,
 ) -> CandidatePool:
-    if type(limit) is not int or not 1 <= limit <= 400:
-        raise ValueError("Candidate limit must be from 1 to 400")
-    if type(results_per_query) is not int or not 1 <= results_per_query <= 1000:
-        raise ValueError("Results per query must be from 1 to 1000")
+    """The candidate pool, filled in order: required cards and basics, preferred lands, the
+    theme search's hits, each query's most-played cards (so every role stays covered), then
+    every other result by fit.
+
+    Fit counts the queries that found a card, each weighted by how narrow it is: a card that
+    both the Treasure search and the dice search found outranks the next most-played card of
+    "t:creature". `results_per_query=None` keeps every result, which the local BulkSearch
+    returns at no cost; the live API pages 175 cards per rate-limited request."""
+    if type(limit) is not int or not 1 <= limit <= POOL_LIMIT:
+        raise ValueError(f"Candidate limit must be from 1 to {POOL_LIMIT}")
+    if results_per_query is not None and (
+        type(results_per_query) is not int or not 1 <= results_per_query <= 100_000
+    ):
+        raise ValueError("Results per query must be from 1 to 100000, or None for all")
     if type(max_query_repairs) is not int or not 0 <= max_query_repairs <= 8:
         raise ValueError("Query repair budget must be from 0 to 8")
     spec = ground_spec(spec, store)
@@ -273,7 +319,7 @@ def build_candidate_pool(
         def execute(text):
             try:
                 scoped = constrain_query(text, spec.color_identity)
-                activity.tool("scryfall search", f"{query.role}: {text}")
+                activity.tool("card search", f"{query.role}: {text}")
                 found = client.search_cards(scoped, max_results=results_per_query, order="edhrec")
                 history.append({"query": scoped, "returned": len(found), "error": None if found else "zero_results"})
                 return scoped, found
@@ -333,7 +379,7 @@ def build_candidate_pool(
                 "eligible": len(bucket),
                 "missing_from_snapshot": missing,
                 "ineligible": dropped,
-                "result_limit_reached": len(found) == results_per_query,
+                "result_limit_reached": results_per_query is not None and len(found) == results_per_query,
             }
         )
 
@@ -373,13 +419,65 @@ def build_candidate_pool(
             selected.append(key)
             selected_set.add(key)
             land_budget -= 1
-    # Round-robin across queries prevents a broad generic search from crowding out themes.
-    for row in zip_longest(*buckets):
+    def take(key: str) -> None:
+        if key not in selected_set and len(selected) < limit:
+            selected.append(key)
+            selected_set.add(key)
+
+    # The theme search's best hits join outright; the rest add their relevance to fit below.
+    local_search = local_search or {"terms": [], "hits": []}
+    local_fit: dict[str, float] = {}
+    top_score = max((hit["score"] for hit in local_search["hits"]), default=0) or 1
+    for hit in local_search["hits"]:
+        card = store.get_card(hit["name"])
+        if card is None or is_land(card) or not eligible(card, spec):
+            continue
+        key = name_key(card["name"])
+        candidates.setdefault(key, Candidate(card)).roles.add("theme")
+        local_fit[key] = LOCAL_FIT * hit["score"] / top_score
+        if len(local_fit) <= LOCAL_FIRST:
+            take(key)
+
+    # Each query's most-played cards first, taking turns, so a broad generic search cannot
+    # crowd out a theme and every role keeps its staples: three times a role's target across
+    # its queries, a few for every other query, within three quarters of the remaining room.
+    found = [(query.role, bucket) for query, bucket in zip(queries, buckets) if bucket]
+    per_role = Counter(role for role, _ in found)
+    targets = spec.role_targets
+
+    def wanted(role: str, bucket: list[str]) -> int:
+        target = targets.get(role, 0) if role != "lands" else 0
+        share = max(ROLE_FLOOR, math.ceil(3 * target / per_role[role])) if target else THEME_FLOOR
+        return min(len(bucket), share)
+
+    floors = [wanted(role, bucket) for role, bucket in found]
+    room = (limit - len(selected)) * 3 / 4
+    if sum(floors) > room:
+        floors = [max(1, int(f * room / sum(floors))) for f in floors]
+    before = len(selected)
+    for row in zip_longest(*(bucket[:f] for (_, bucket), f in zip(found, floors))):
         for key in row:
-            if key is not None and key not in selected_set and len(selected) < limit:
-                selected.append(key)
-                selected_set.add(key)
-    log.info("discovery: %d candidates", len(selected))
+            if key is not None:
+                take(key)
+    floored = len(selected) - before
+    # The rest by fit. Every query that found a card adds its weight (more for a narrower
+    # query), faded by how far down that query's most-played order the card sits, and
+    # theme-search relevance adds to it: a card deep in two theme searches outranks the next
+    # most-played card of one broad search.
+    total = len({key for _, bucket in found for key in bucket})
+    fit: dict[str, float] = dict(local_fit)
+    first: dict[str, int] = {key: index for index, key in enumerate(local_fit)}
+    for _, bucket in found:
+        weight = math.log(1 + total / len(bucket))
+        for position, key in enumerate(bucket):
+            fit[key] = fit.get(key, 0.0) + weight / (1 + position / FIT_FADE)
+            first.setdefault(key, len(first))
+
+    for key in sorted(fit, key=lambda key: (-fit[key], first[key])):
+        take(key)
+    log.info("discovery: %d candidates (%d from query floors, %d by fit)",
+             len(selected), floored, len(selected) - before - floored)
     return CandidatePool(
-        spec, [candidates[key] for key in selected], normalized_queries, diagnostics
+        spec, [candidates[key] for key in selected], normalized_queries, diagnostics,
+        local_search,
     )
