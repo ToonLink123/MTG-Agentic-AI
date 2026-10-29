@@ -1,6 +1,6 @@
 # Ring
 
-In Depth docs [https://ring-2.gitbook.io/ring-docs](here)
+In Depth docs [here](https://ring-2.gitbook.io/ring-docs)
 
 Ring builds Commander decks for Magic: The Gathering from a few words. Name a commander,
 describe the deck you want, answer a few questions about playstyle, and a team of agents
