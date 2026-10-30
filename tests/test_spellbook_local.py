@@ -39,6 +39,8 @@ VARIANTS = [
     variant("6-7-8", use("Kiki-Jiki, Mirror Breaker"), use("Zealous Conscripts"), use("Sol Ring")),
     variant("9-10", use("Kiki-Jiki, Mirror Breaker", commander=True), use("Pestermite")),
     variant("11-12", use("Basalt Monolith"), use("Power Artifact"), status="NR"),
+    variant("13-14-15-16", use("Sol Ring"), use("Pestermite"), use("Basalt Monolith"),
+            use("Zealous Conscripts")),
 ]
 EXPORT = json.dumps({"timestamp": "today", "version": "7", "variants": VARIANTS})
 
@@ -60,9 +62,10 @@ class SpellbookLocalTests(unittest.TestCase):
         with self.assertRaises(SourceError):
             list(stream_variants(io.StringIO('{"timestamp": "today"}')))
 
-    def test_only_valid_variants_of_two_cards_or_fewer_are_kept_without_images(self):
+    def test_only_valid_variants_of_three_cards_or_fewer_are_kept_without_images(self):
         kept = [compact_variant(v) for v in VARIANTS]
-        self.assertEqual([k["id"] if k else None for k in kept], ["1-2", "3-4", "5", None, "9-10", None])
+        self.assertEqual([k["id"] if k else None for k in kept],
+                         ["1-2", "3-4", "5", "6-7-8", "9-10", None, None])
         self.assertEqual(kept[0]["uses"][0]["card"], {"name": "Basalt Monolith"})
         self.assertEqual(kept[0]["uses"][0]["zoneLocations"], ["B"])
         self.assertEqual(kept[2]["requires"], [{"template": True}])
@@ -78,6 +81,15 @@ class SpellbookLocalTests(unittest.TestCase):
         self.assertTrue(found["combos"][0]["game_winning"])
         self.assertTrue(found["complete"])
         self.assertEqual(found["source"], SPELLBOOK_EXPORT)
+        # The bracket rules ask for two-card combos; maps and discovery also read three-card ones.
+        three = {"Zealous Conscripts": 1, "Sol Ring": 1, "Pestermite": 1}
+        self.assertEqual(
+            [c["id"] for c in spellbook.find_combos(three, "Kiki-Jiki, Mirror Breaker")["combos"]],
+            ["9-10"],
+        )
+        found = spellbook.find_combos(three, "Kiki-Jiki, Mirror Breaker", max_cards=3)
+        self.assertEqual(sorted(c["id"] for c in found["combos"]), ["6-7-8", "9-10"])
+        self.assertIn("two- to 3-card", found["scope"])
         # Kiki-Jiki in the 99 is not the commander the variant needs.
         found = spellbook.find_combos({"Kiki-Jiki, Mirror Breaker": 1, "Pestermite": 1}, "Sol Ring")
         self.assertEqual(found["combos"], [])
@@ -94,7 +106,8 @@ class SpellbookLocalTests(unittest.TestCase):
             info = spellbook.download_variants(self.store)
             self.assertEqual(spellbook.download_variants(self.store), info)
         self.assertEqual(fetch.call_count, 1)
-        self.assertEqual((info["combo_count"], info["source"]), (4, SPELLBOOK_EXPORT))
+        self.assertEqual((info["combo_count"], info["source"]), (5, SPELLBOOK_EXPORT))
+        self.assertEqual(self.store.combo_cards, 3)
         self.assertEqual(len(self.store.combo_candidates(["Basalt Monolith"])), 1)
 
     def test_without_the_export_or_a_cache_there_is_no_silent_empty_answer(self):

@@ -24,7 +24,7 @@ from .roles import role_policy
 from .schema import DRAFT_TIERS, NAME_SCHEMA, OUTSIDE_SCHEMA, TIER_PICKS, object_schema
 from .scryfall import ScryfallError
 from .sources import SourceError
-from .toolbox import CARDS_INPUT, SEARCH_INPUT, CardTools, Toolbox
+from .toolbox import CARDS_INPUT, SEARCH_INPUT, SIMILAR_INPUT, CardTools, Toolbox
 
 log = logging.getLogger(__name__)
 PICKS_INPUT = object_schema({
@@ -143,6 +143,9 @@ def agentic_draft(
              guarded(lambda a: tools.search_cards(a["query"]))),
         Tool("card", "Oracle text, roles and whether each named card may be picked, up to 10.",
              CARDS_INPUT, guarded(lambda a: tools.card(a["cards"]))),
+        Tool("similar_cards", "Cards that do what the named card does (shared function tags, "
+             "keywords and combos); each may be picked.", SIMILAR_INPUT,
+             guarded(lambda a: tools.similar_cards(a["card"]))),
         Tool("combos", "Known Commander Spellbook combos among these picks and the commander.",
              PICKS_INPUT, guarded(combos)),
         Tool("finish", "Your final picks. Code builds them, runs every check and the safety "

@@ -7,6 +7,7 @@ from typing import Any
 
 from . import activity
 from .brackets import SpellbookClient
+from .card_graph import CardGraph, similar, universe
 from .cards import Card, trim_card
 from .discovery import constrain_query, eligible
 from .mana import is_land
@@ -20,6 +21,7 @@ from .spec import DeckSpec
 QUERY = {"type": "string", "minLength": 1, "maxLength": 900}
 CARD_NAMES = {"type": "array", "items": NAME_SCHEMA, "minItems": 1, "maxItems": 10}
 SEARCH_INPUT = object_schema({"query": QUERY})
+SIMILAR_INPUT = object_schema({"card": NAME_SCHEMA})
 CARDS_INPUT = object_schema({"cards": CARD_NAMES})
 RULES_INPUT = object_schema({"query": QUERY, "cards": {**CARD_NAMES, "minItems": 0, "maxItems": 6}})
 
@@ -49,6 +51,7 @@ class CardTools:
     def __init__(self, tools: Toolbox, spec: DeckSpec):
         self.tools, self.store, self.spec = tools, tools.store, spec
         self.addable: dict[str, Card] = {}
+        self._graph: CardGraph | None = None  # Built on the first similar_cards call.
 
     def taken(self, name: str) -> bool:
         """Whether `name` is already in the deck, so it cannot be added again."""
@@ -133,6 +136,32 @@ class CardTools:
         return {"evidence": [
             {"id": e["id"], "kind": e["kind"], "text": clip(e["text"], 600)} for e in evidence
         ]}
+
+    def similar_cards(self, name: str, limit: int = 12) -> dict[str, Any]:
+        """Cards that do what `name` does, by a card-graph walk from it alone (shared Tagger
+        tags, keywords and combos), among eligible cards not already taken. Each becomes
+        addable."""
+        card = self.lookup(name)
+        if card is None:
+            return {"error": f"No card named {name}."}
+        activity.tool("similar cards", card["name"])
+        if self._graph is None or card["name"] not in self._graph:
+            cards = universe(self.spec, self.store)
+            if all(c["name"] != card["name"] for c in cards):
+                cards.append(card)
+            self._graph = CardGraph(self.store, cards)
+        allowed = [n for n in self._graph.names if not self.taken(n) and n != card["name"]]
+        rows = []
+        for hit in similar(self._graph, card["name"], allowed, limit=limit):
+            found = self.store.get_card(hit["name"])
+            if found is None or not self.offer(found):
+                continue
+            rows.append({
+                "name": found["name"], "mana_cost": found["mana_cost"],
+                "roles": sorted(oracle_roles(found)), "shares": hit["shares"],
+                "addable": self.pickable(found["name"]),
+            })
+        return {"card": card["name"], "similar": rows}
 
     def combos(self, cards: dict[str, int]) -> dict[str, Any]:
         if self.tools.spellbook is None:

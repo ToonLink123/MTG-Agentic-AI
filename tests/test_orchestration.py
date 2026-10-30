@@ -306,7 +306,7 @@ class NativeFollowUpTests(Fixture):
         self.assertEqual(result["edit"]["tools"], ["card", "check_deck"])
         self.assertTrue(model.results(2)[0]["is_error"])  # Spell 1 is already in the deck.
         self.assertEqual(model.calls[0][0][0]["content"], prompts.EDIT_NATIVE)
-        self.assertEqual(len(model.calls[0][1]), 7)
+        self.assertEqual(len(model.calls[0][1]), 8)
 
     def test_the_polish_pass_keeps_a_valid_improvement_and_flags_code_cards(self):
         deck = self.deck(60)

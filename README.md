@@ -13,7 +13,10 @@ illegal one that passes.
 - **Interview and quoted asks.** Ring asks about playstyle, then keeps your exact words in
   front of every agent and checks the finished deck serves each of them.
 - **Local card search.** Scryfall's card data, tags and rulings and Commander Spellbook's combos
-  are downloaded once, so a 1,000-card candidate pool builds in about two seconds.
+  (up to three cards) are downloaded once, so a 1,000-card candidate pool builds in seconds.
+  Discovery fuses a word search over rules text, a card-graph walk from the commander (shared
+  tags, keywords and combos) and, with the card index setup builds, EmbeddingGemma's sense of
+  what the deck is about. Deck roles come from Scryfall's human-made tags first.
 - **Engine map and council.** A model traces the deck's resource loop; an orchestrator sets the
   plan and the role counts it needs, and three members rank their picks in parallel and debate
   only the cards they disagree on. The council is on by default.
@@ -24,7 +27,9 @@ illegal one that passes.
   lands, problems) and searches the card data before it commits, then the orchestrator polishes
   the finished deck once.
 - **Checked results.** Legality, a code-built mana base, a bracket review, and rules answers
-  that must quote the Comprehensive Rules they rely on.
+  that must quote the Comprehensive Rules they rely on. The engine map's own links are checked
+  against the rules before anyone drafts; on Claude the judge looks rules up by number or topic
+  itself, and settled answers are remembered across reviews and sessions.
 - **Follow-ups.** Ask about the deck or for changes; every swap is checked again and saved as a
   new version.
 

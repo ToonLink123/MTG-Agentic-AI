@@ -8,6 +8,7 @@ import json
 import math
 import re
 import sqlite3
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from . import activity, prompts
+from .agent import Finish, Tool, ToolError, run_tools, supports_tools
 from .cards import Card, name_key
 from .llm import HTTPJSONModel, JSONModel, request_json
 from .oracle import OracleStore
@@ -26,6 +28,7 @@ from .rules_graph import (
     build_graph,
     headline,
     in_family,
+    parent,
     stems,
 )
 from .rules_index import PrebuiltIndex, inputs_sha256, write_index
@@ -203,6 +206,7 @@ INTERACTION_SCHEMA = object_schema(
 # missing rule it names. A player's /ask gets more; a deck review repeats on every draft attempt.
 ASK_PASSES = 5
 REVIEW_PASSES = 2
+SETTLED = ("supported", "contradicted")  # Statuses the ledger keeps.
 # Evidence items per rules question: half for the cards' text and rulings, half for rules.
 # 18 leaves 9 rule slots, which found 87% of the benchmark's correct rules; 36 found 96%.
 EVIDENCE = 18
@@ -287,7 +291,9 @@ class RulesStore:
     ):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
+        # Parallel judges look rules up from worker threads; `lock` serializes every such use.
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.lock = threading.RLock()
         self.embedder = embedder
         self.prebuilt = prebuilt
         self._docs: list[_Doc] | None = None
@@ -307,6 +313,9 @@ class RulesStore:
             );
             CREATE TABLE IF NOT EXISTS rule_terms (
                 term TEXT, node TEXT, df INTEGER, origin TEXT, PRIMARY KEY (term, node)
+            );
+            CREATE TABLE IF NOT EXISTS verdicts (
+                key TEXT PRIMARY KEY, status TEXT, data TEXT, created TEXT
             );
         """)
         identity = self._meta("embedding")
@@ -685,13 +694,136 @@ class RulesStore:
         total = sum(self._idf(t) for t in words) or 1.0
         return sum(self._idf(t) for t in words & doc.stems) / total
 
+    def ledger_key(self, cards: list[tuple[str, str]], question: str) -> str:
+        """The ledger key of a question: its cards (name and Oracle text, so errata ask again),
+        its words, and the rules version."""
+        material = json.dumps([
+            sorted((name_key(name), text) for name, text in cards), " ".join(question.split()),
+            self._meta("effective_date"), self._meta("graph_version"),
+        ])
+        return hashlib.sha256(material.encode()).hexdigest()
+
+    def recall(self, key: str) -> dict[str, Any] | None:
+        """A settled answer to this exact question, from any earlier review."""
+        with self.lock:
+            row = self.db.execute("SELECT data FROM verdicts WHERE key=?", (key,)).fetchone()
+        return {**json.loads(row[0]), "from_ledger": True} if row else None
+
+    def remember(self, key: str, result: dict[str, Any]) -> None:
+        """Keep a settled answer. Unsupported ones are not kept: another look (or a stronger
+        judge) may still settle them."""
+        if result.get("status") not in SETTLED or result.get("errors"):
+            return
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT OR REPLACE INTO verdicts VALUES (?,?,?,?)",
+                (key, result["status"], json.dumps(result), utc_now()),
+            )
+
+    def rules_by_id(self, ids: list[str]) -> dict[str, Any]:
+        """Comprehensive Rules by number ("702.19b", "CR 118.9"), each with its parent rule and
+        its subrules, so a judge can follow the hierarchy."""
+        with self.lock:
+            docs = {d.node: d for d in self._corpus() if d.kind == "rule"}
+        found, missing, related = [], [], {}
+        for raw in ids:
+            node = " ".join(raw.split()).removeprefix("CR").strip().rstrip(".")
+            doc = docs.get(node)
+            if doc is None:
+                missing.append(raw)
+                continue
+            found.append(doc.evidence())
+            up = parent(node, docs)
+            related[doc.id] = {
+                "parent": f"CR {up}" if up in docs else None,
+                "subrules": [f"CR {n}" for n in docs if n != node and in_family(n, node)][:12],
+            }
+        return {"rules": found, "missing": missing, "related": related}
+
+    def card_documents(self, cards: list[str]) -> list[dict[str, str]]:
+        """The cards' Oracle text and publisher rulings, as evidence."""
+        keys = {name_key(n) for n in cards}
+        with self.lock:
+            return [d.evidence() for d in self._corpus() if d.kind != "rule" and d.card in keys]
+
+    def judge_with_tools(
+        self, cards: list[str], question: str, model: Any, *, limit: int = EVIDENCE,
+        card_text: bool = False, max_steps: int = 8,
+    ) -> dict[str, Any]:
+        """The judge with native tools (see agent.run_tools): it starts from the usual retrieval
+        and looks up what a step still needs, by rule number, by topic or in the cards' rulings,
+        before it answers. Every quote is checked against everything it was shown."""
+        with self.lock:
+            messages, evidence = self.interaction_request(cards, question, limit=limit, card_text=card_text)
+        seen = {e["id"]: e for e in evidence}
+        fixes = []
+
+        def shown(docs: list[dict[str, str]]) -> list[dict[str, str]]:
+            new = [d for d in docs if d["id"] not in seen]
+            seen.update((d["id"], d) for d in new)
+            return [{"id": d["id"], "kind": d["kind"], "text": d["text"]} for d in docs]
+
+        def get_rule(args: dict[str, Any]) -> dict[str, Any]:
+            activity.tool("rules lookup", ", ".join(args["ids"])[:80])
+            found = self.rules_by_id(args["ids"])
+            return {**found, "rules": shown(found["rules"])}
+
+        def search_rules(args: dict[str, Any]) -> dict[str, Any]:
+            activity.tool("rules lookup", args["query"][:80])
+            with self.lock:
+                docs = self.retrieve(cards, args["query"], limit=12)
+            return {"evidence": shown(docs)}
+
+        def rulings(args: dict[str, Any]) -> dict[str, Any]:
+            activity.tool("rulings", " + ".join(n.split(",")[0] for n in cards))
+            return {"evidence": shown(self.card_documents(cards))}
+
+        def finish(args: dict[str, Any]) -> Finish:
+            result = self.judge_interaction(cards, question, list(seen.values()), args)
+            if result["errors"] and not fixes:
+                fixes.append(result["errors"])
+                raise ToolError({
+                    "problems": result["errors"],
+                    "instruction": "Cite only ids from the evidence and tool results, with quotes "
+                    "copied character for character, each claim with a rule or ruling; then "
+                    "finish again.",
+                })
+            return Finish(result)
+
+        ids = {"type": "array", "minItems": 1, "maxItems": 8,
+               "items": {"type": "string", "minLength": 3, "maxLength": 20}}
+        query = {"type": "string", "minLength": 3, "maxLength": 200}
+        tools = [
+            Tool("get_rule", "Comprehensive Rules by number, with each rule's parent and subrules.",
+                 object_schema({"ids": ids}), get_rule),
+            Tool("search_rules", "Rules and rulings most relevant to what a step covers, in rules "
+                 "vocabulary.", object_schema({"query": query}), search_rules),
+            Tool("rulings", "The question's cards: Oracle text and publisher rulings.",
+                 object_schema({}), rulings),
+            Tool("finish", "Your answer: claims with exact citations, conditions, status, the "
+                 "answer, and lookup (the step still missing, for unsupported).",
+                 INTERACTION_SCHEMA, finish),
+        ]
+        conversation = [{"role": "system", "content": prompts.INTERACTION_TOOLS}, messages[-1]]
+        task = "judge " + " + ".join(n.split(",")[0] for n in cards)
+        done = run_tools(model, conversation, tools, max_steps=max_steps, agent="judges", task=task)
+        if done["value"] is None:
+            return self.judge_interaction(cards, question, list(seen.values()), {
+                "claims": [], "conditions": [], "status": "unsupported",
+                "lookup": "the judge ran out of steps", "answer": "No answer within the step limit.",
+            })
+        return {**done["value"], "tools": done["tools"]}
+
     def check_interaction(
         self, cards: list[str], question: str, model: JSONModel, *, limit: int = EVIDENCE,
         passes: int = ASK_PASSES,
     ) -> dict[str, Any]:
         """A player's own question. It is often short, so the cards' text is ranked too. While
         the judge cannot settle it, each missing rule it names is looked up and it answers
-        again, for at most `passes` answers."""
+        again, for at most `passes` answers; a judge with native tools looks things up itself."""
+        if supports_tools(model):
+            return self.judge_with_tools(cards, question, model, limit=limit, card_text=True,
+                                         max_steps=2 * passes)
         messages, evidence = self.interaction_request(cards, question, limit=limit, card_text=True)
         answer = request_json(model, messages, INTERACTION_SCHEMA)
         looks: list[dict[str, Any]] = []

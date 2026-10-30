@@ -17,11 +17,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
-from .oracle import OracleStore
+from .card_graph import card_identity, index_ready
+from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION, FORMAT_VERSION
+from .oracle import COMBO_CARDS, OracleStore
 
 STEPS = (
     "Card data", "Oracle tags", "Rulings", "Commander Spellbook", "Rules index", "Embedding model",
+    "Card index",
 )
 RULES_INDEX = "rules-embeddinggemma-2.sqlite3"  # The default embedding backend's rules index.
 ALREADY = "already here"
@@ -65,9 +67,15 @@ def fetch_model() -> str:
     return snapshot_download(EMBEDDINGGEMMA_MODEL, revision=EMBEDDINGGEMMA_REVISION)
 
 
+def card_index_identity() -> str:
+    """The identity of the card index setup builds, without loading the model."""
+    return card_identity(EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION, FORMAT_VERSION)
+
+
 def status(data_dir: Path, rules_index: str = RULES_INDEX) -> dict[str, bool]:
-    """Which setup steps are done. The model counts as done when this Python could not use it
-    anyway, so a start does not run setup for it; setup itself says why it skips it."""
+    """Which setup steps are done. The model and the card index count as done when this Python
+    could not use them anyway, so a start does not run setup for them; setup itself says why it
+    skips them."""
     done = dict.fromkeys(STEPS, False)
     oracle = data_dir / "oracle.sqlite3"
     if oracle.is_file():
@@ -75,7 +83,12 @@ def status(data_dir: Path, rules_index: str = RULES_INDEX) -> dict[str, bool]:
             done["Card data"] = store.ready and store.current
             done["Oracle tags"] = store.tags_ready
             done["Rulings"] = store.rulings_ready
-            done["Commander Spellbook"] = store.combos_ready
+            # An export from before three-card combos were kept is downloaded again.
+            done["Commander Spellbook"] = store.combos_ready and store.combo_cards >= COMBO_CARDS
+            # Like the model, the card index counts as done when this Python cannot embed.
+            done["Card index"] = (
+                embedding_problem() is not None or index_ready(store, card_index_identity())
+            )
     rules = data_dir / rules_index
     if rules.is_file():
         with contextlib.suppress(sqlite3.Error), contextlib.closing(

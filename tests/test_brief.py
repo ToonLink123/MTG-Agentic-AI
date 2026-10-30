@@ -152,7 +152,8 @@ class LocalSearchTests(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.records = [*records(), *DICE]
         self.store.import_cards(self.records)
-        self.spec = make_spec(themes=["dice rolling"], brief=brief("Treasure from dice rolls"))
+        self.spec = make_spec(themes=["dice rolling"], search_terms=["treasure"],
+                              brief=brief("Treasure from dice rolls"))
 
     def test_the_text_index_stems_quotes_safely_and_follows_a_new_snapshot(self):
         self.assertEqual(self.store.text_count("treasure tokens"), 2)
@@ -162,12 +163,15 @@ class LocalSearchTests(unittest.TestCase):
         self.store.import_cards([*self.records, card("Dice Tower", text="Roll a die twice.")])
         self.assertEqual(self.store.text_count("roll"), 3)
 
-    def test_terms_come_from_the_player_and_the_commander_minus_common_words(self):
+    def test_terms_come_from_the_spec_and_the_commander_minus_common_words(self):
         leader = card("Dice Lord, Gambler", colors="R", types="Legendary Creature — Human",
                       text="Whenever you roll a die, Dice Lord deals 1 damage to target opponent.")
-        spec = make_spec(brief=brief("Dice Lord with Treasure from dice rolls"))
+        spec = make_spec(themes=["Dice Lord rolls"], search_terms=["Treasure token"],
+                         brief=brief("Certain chances of a heavy boost"))
         terms = search_terms(spec, leader)
-        self.assertEqual(terms["treasure"], ("treasure", 1.5))
+        self.assertEqual(terms["treasure token"], ("treasure token", 1.5))  # Searched whole.
+        # The raw request is never searched: its words matched card names, not mechanics.
+        self.assertFalse({"certain", "chance", "heavy", "boost"} & set(terms))
         self.assertNotIn("lord", terms)  # Nor is it a theme when the player names it.
         self.assertIn("roll", terms)  # "rolls" and the commander's "roll" are one term.
         self.assertEqual(terms["roll"][1], 1.5)  # The player's words outrank the commander's.
@@ -178,12 +182,13 @@ class LocalSearchTests(unittest.TestCase):
     def test_cards_matching_more_rare_terms_rank_first_and_lands_stay_out(self):
         found = local_search(self.spec, self.store)
         names = [hit["name"] for hit in found["hits"]]
-        # Each matches two of the player's rare terms; a land or a card matching none never shows.
-        self.assertEqual(set(names), {"Treasure Roller", "Dice Scholar"})
+        # Rare terms rank a card; a land or a card matching none never shows.
+        self.assertEqual(names, ["Treasure Roller", "Dice Scholar"])
         rolls = ({"rolls", "rolling"} & {t["term"] for t in found["terms"]}).pop()
         matched = {hit["name"]: sorted(hit["matched"]) for hit in found["hits"]}
         self.assertEqual(matched["Treasure Roller"], sorted([rolls, "treasure"]))
-        self.assertEqual(matched["Dice Scholar"], ["dice", rolls])
+        # Names are flavor, never searched: "dice" is in Dice Scholar's name, not its rules.
+        self.assertEqual(matched["Dice Scholar"], [rolls])
         # "rolls" and "rolling" stem alike and find the same cards, so they count once.
         self.assertEqual(len({"rolls", "rolling"} & {t["term"] for t in found["terms"]}), 1)
         self.assertTrue(all(isinstance(hit["score"], int) for hit in found["hits"]))
@@ -206,7 +211,7 @@ class FakeSpellbook:
     def __init__(self, combos=(), error=None):
         self.combos, self.error, self.calls = list(combos), error, []
 
-    def find_combos(self, cards, commander):
+    def find_combos(self, cards, commander, max_cards=2):
         self.calls.append((cards, commander))
         if self.error:
             raise self.error
@@ -248,7 +253,7 @@ class EngineMapTests(unittest.TestCase):
             asks=[{"ask": "A1", "cards": ["Spell 1", "Spell 1 "], "note": ""}],
         )
         model = FakeModel(reply)
-        spellbook = FakeSpellbook([{"cards": ["Spell 1", "Spell 2"], "results": ["Infinite"]}])
+        spellbook = FakeSpellbook([{"id": "1-2", "cards": ["Spell 1", "Spell 2"], "results": ["Infinite"]}])
         engine = self.mapped(model, spellbook=spellbook)
         self.assertEqual([s["stage"] for s in engine["stages"]], ["makes", "pays_off"])
         self.assertEqual([c["name"] for c in engine["stages"][1]["cards"]], ["Spell 1"])

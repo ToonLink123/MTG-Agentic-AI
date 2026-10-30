@@ -16,6 +16,7 @@ from . import bootstrap
 from .agent import supports_tools
 from .brackets import BracketChecker, SpellbookClient, bracket_rules
 from .bulk_search import BulkSearch
+from .card_graph import CARD_DIMENSION, index_cards, index_ready
 from .council import MEMBER, ORCHESTRATOR, council_draft
 from .discovery import POOL_MODES, CandidatePool
 from .edit import Toolbox, edit_deck, polish_deck
@@ -36,10 +37,11 @@ from .mentions import find_cards, lookup, name_index
 from .oracle import DEFAULT_DATA_DIR, OracleStore
 from .pipeline import build_deck, discover, draft_deck, draft_from_request
 from .playability import spec_for_deck, validate_playability
-from .review import DeckReviewer
+from .review import DeckReviewer, Judge
 from .revision import revise_deck
 from .rules import EVIDENCE as RULES_EVIDENCE
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore
+from .rules_graph import GRAPH_VERSION
 from .rules_index import DEFAULT_REPO as DEFAULT_RULES_INDEX
 from .rules_index import PrebuiltIndex
 from .schema import BRACKET3_MODES, SPEC_SCHEMA, SchemaError, load_json
@@ -269,6 +271,38 @@ def _polish(args, deck, pool, model, toolbox, reviewer) -> dict[str, Any]:
     return polish_deck(deck, pool, model, tools=toolbox, reviewer=reviewer)
 
 
+def _card_embedder(args, store):
+    """The card index's embedder, when setup built the index and this Python can embed."""
+    if bootstrap.embedding_problem() or not index_ready(store, bootstrap.card_index_identity()):
+        return None
+    from .embeddings import EmbeddingGemmaEmbedder
+
+    try:
+        return EmbeddingGemmaEmbedder(dimension=CARD_DIMENSION)
+    except ValueError as exc:
+        logging.getLogger("mtg_agentic").warning("card search: no meaning ranking (%s)", exc)
+        return None
+
+
+def _map_judge(args, stack, store, client, model):
+    """The rules judge that checks an engine map's links, or None when setup has not built the
+    rules index here (a map is still useful unchecked). It never downloads the rules itself:
+    setup and the deck review keep them current."""
+    path = _rules_path(args)
+    if not path.is_file():
+        logging.getLogger("mtg_agentic").warning("engine map: no rules index, so links are not checked")
+        return None
+    try:
+        rules = stack.enter_context(_rules_store(args))
+    except (ValueError, OSError) as exc:
+        logging.getLogger("mtg_agentic").warning("engine map: links not checked (%s)", exc)
+        return None
+    if not rules.metadata.get("rule_count") or rules.metadata.get("graph_version") != GRAPH_VERSION:
+        logging.getLogger("mtg_agentic").warning("engine map: the rules index is incomplete; run setup")
+        return None
+    return Judge(rules, model, store, client, evidence=_evidence(args))
+
+
 def _reviewer(args, stack, store, client, model):
     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
     rules = stack.enter_context(_rules_store(args))
@@ -310,6 +344,20 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
             bootstrap.fetch_model()
             return "EmbeddingGemma 2 downloaded"
 
+        def card_index() -> str:
+            if args.embedding_backend != "embeddinggemma":
+                return f"skipped: the {args.embedding_backend} backend embeds no cards"
+            if problem := bootstrap.embedding_problem():
+                return f"skipped: {problem}"
+            if index_ready(store, bootstrap.card_index_identity()) and not args.refresh:
+                return bootstrap.ALREADY
+            from .embeddings import EmbeddingGemmaEmbedder
+
+            embedder = EmbeddingGemmaEmbedder(
+                dimension=CARD_DIMENSION, device=args.embedding_device, batch_size=64,
+            )
+            return f"{index_cards(store, embedder):,} cards embedded"
+
         actions = {
             "Card data": cards,
             "Oracle tags": lambda: f"{client.download_oracle_tags(store, force=args.refresh)['tag_count']:,} tags",
@@ -319,10 +367,11 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "Rules index": rules,
             "Embedding model": model,
+            "Card index": card_index,
         }
         for name in bootstrap.STEPS:
-            # The model step always checks for itself, to say why it skips the download.
-            if done[name] and name != "Embedding model":
+            # The model steps always check for themselves, to say why they skip.
+            if done[name] and name not in {"Embedding model", "Card index"}:
                 bootstrap.stage(name, bootstrap.ALREADY)
                 steps[name] = bootstrap.ALREADY
                 continue
@@ -480,6 +529,11 @@ def main(argv: list[str] | None = None) -> int:
     map_cmd.add_argument(
         "--no-combos", action="store_true", help="Skip the Commander Spellbook combo lookup"
     )
+    map_cmd.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip checking the map's central links against the rules before drafting",
+    )
+    _embedding_options(map_cmd)
     _model_options(map_cmd)
     draft_cmd = commands.add_parser(
         "draft", help="Choose spells, calculate lands, validate and repair"
@@ -937,10 +991,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
                     spellbook = None if args.no_combos else SpellbookClient(sources, store=store)
+                    judge = None if args.no_verify else _map_judge(args, stack, store, client, model)
                     try:
                         pool = build_engine_map(
                             pool, model, store, spellbook=spellbook,
-                            search=BulkSearch(store, client),
+                            search=BulkSearch(store, client), judge=judge,
                         )
                         result = pool.to_dict()
                     except SchemaError as exc:
@@ -951,6 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
                     result = discover(
                         spec, model, client, store, pool_limit=args.pool_limit,
                         search=BulkSearch(store, client), pool_mode=args.pool_mode,
+                        embedder=_card_embedder(args, store),
                     ).to_dict()
                 elif args.command == "draft":
                     pool = CandidatePool.from_dict(

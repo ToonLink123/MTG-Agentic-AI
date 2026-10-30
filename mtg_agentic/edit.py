@@ -31,11 +31,11 @@ from .schema import NAME_SCHEMA, SchemaError, object_schema
 from .scryfall import ScryfallError
 from .sources import SourceError
 from .spec import DeckSpec
-from .toolbox import CARDS_INPUT, RULES_INPUT, SEARCH_INPUT, CardTools, Toolbox
+from .toolbox import CARDS_INPUT, RULES_INPUT, SEARCH_INPUT, SIMILAR_INPUT, CardTools, Toolbox
 
 __all__ = ["Toolbox", "edit_deck", "polish_deck"]
 
-TOOLS = ("search_cards", "card", "rulings", "rules", "check_deck", "combos")
+TOOLS = ("search_cards", "card", "similar_cards", "rulings", "rules", "check_deck", "combos")
 CARD_REF = re.compile(r"\[\[(.+?)\]\]")
 MAX_SWAPS = 15
 POLISH_SWAPS = 8
@@ -106,7 +106,7 @@ class _Session(CardTools):
             try:
                 review = self.reviewer.check(
                     built["cards"], self.spec.commander, self.spec.bracket,
-                    bracket3_mode=self.spec.bracket3_mode,
+                    bracket3_mode=self.spec.bracket3_mode, engine_map=self.pool.engine_map or None,
                 )
             except SchemaError as exc:
                 review = {"status": "needs_revision", "errors": [{
@@ -138,6 +138,11 @@ class _Session(CardTools):
 
     def _tool_card(self, action: dict[str, Any]) -> dict[str, Any]:
         return self.card(action["cards"])
+
+    def _tool_similar_cards(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not action["cards"]:
+            return {"error": "Name the card to find similar cards for in cards."}
+        return self.similar_cards(action["cards"][0])
 
     def _tool_rulings(self, action: dict[str, Any]) -> dict[str, Any]:
         return self.rulings(action["cards"])
@@ -334,6 +339,9 @@ def _edit_with_tools(
              "in.", SEARCH_INPUT, guarded(lambda a: session.search_cards(a["query"]))),
         Tool("card", "Oracle text, roles and whether each named card can be added, up to 10.",
              CARDS_INPUT, guarded(lambda a: session.card(a["cards"]))),
+        Tool("similar_cards", "Cards that do what the named card does (shared function tags, "
+             "keywords and combos), not in the deck; each can be swapped in.", SIMILAR_INPUT,
+             guarded(lambda a: session.similar_cards(a["card"]))),
         Tool("rulings", "Publisher rulings for up to 5 named cards.", CARDS_INPUT,
              guarded(lambda a: session.rulings(a["cards"]))),
         Tool("rules", "The Comprehensive Rules and rulings most relevant to a rules question "

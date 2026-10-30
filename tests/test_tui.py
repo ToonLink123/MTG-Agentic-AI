@@ -680,11 +680,12 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_first_start_downloads_the_local_data_before_any_deck_request(self):
         lines = [
-            "setup: 1/6 Card data: downloading", "setup: 1/6 Card data: 33,000 cards",
-            "setup: 2/6 Oracle tags: already here", "setup: 3/6 Rulings: already here",
-            "setup: 4/6 Commander Spellbook: downloading",
-            "setup: 4/6 Commander Spellbook: skipped: --skip-combos",
-            "setup: 5/6 Rules index: already here", "setup: 6/6 Embedding model: already here",
+            "setup: 1/7 Card data: downloading", "setup: 1/7 Card data: 33,000 cards",
+            "setup: 2/7 Oracle tags: already here", "setup: 3/7 Rulings: already here",
+            "setup: 4/7 Commander Spellbook: downloading",
+            "setup: 4/7 Commander Spellbook: skipped: --skip-combos",
+            "setup: 5/7 Rules index: already here", "setup: 6/7 Embedding model: already here",
+            "setup: 7/7 Card index: downloading", "setup: 7/7 Card index: 28,000 cards embedded",
         ]
         gate = asyncio.Event()
         cli = FakeCli({"setup": (0, {"ready": True, "steps": {}}),

@@ -8,8 +8,13 @@ dropped, checks every card ask against the map, and records what the pool could 
 
 The map can also fill its own gaps: the model writes a few searches for what is missing,
 code runs them over the whole local card database (free, no rate limit), adds the eligible
-finds to the pool, and the model places them on the map in one more call. Drafters and
-every council member then build from the same map.
+finds to the pool, and the model places them on the map in one more call. With a rules judge,
+the map's central links are then checked against the rules: one they contradict leaves the map
+before anyone drafts, and the others are marked supported or unverified. Drafters and every
+council member then build from the same map.
+
+A large pool reaches the mapper as a shortlist with full text (the local search's hits first)
+and one line for every other card, with Commander Spellbook combos of up to three cards.
 """
 
 from __future__ import annotations
@@ -20,9 +25,10 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from . import activity, prompts
-from .cards import name_key, trim_card
-from .llm import JSONModel, request_json
+from .cards import name_key, prompt_card
+from .llm import JSONModel, LLMError, request_json
 from .mana import is_land
+from .review import check_links
 from .schema import MAP_STAGES, SchemaError, map_schema
 from .scryfall import ScryfallError
 from .sources import SourceError
@@ -35,6 +41,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 GAP_SEARCHES = 6  # Searches the mapper may run for its gaps, each adding at most:
 PER_SEARCH = 8
+MAP_FULL_TEXT = 400  # Candidates the mapper reads in full; the rest get one line each.
 
 
 def clean_map(
@@ -72,7 +79,8 @@ def clean_map(
         # A "combo" link must be a pair Commander Spellbook actually listed.
         proven = frozenset((name_key(start), name_key(end))) in pairs
         links.append({**link, "from": start, "to": end,
-                      "source": "combo" if link["source"] == "combo" and proven else "oracle"})
+                      "source": "combo" if link["source"] == "combo" and proven else "oracle",
+                      "verified": link.get("verified", "unchecked")})
     entries: dict[str, dict[str, Any]] = {}
     for entry in raw["asks"]:
         if entry["ask"] not in entries:
@@ -136,36 +144,49 @@ def _fill_gaps(
 
 def build_engine_map(
     pool: CandidatePool, model: JSONModel, store: OracleStore, *,
-    spellbook: SpellbookClient | None = None, search: Any = None,
+    spellbook: SpellbookClient | None = None, search: Any = None, judge: Any = None,
 ) -> CandidatePool:
     """The pool with its engine map, plus any cards the map's gap searches found (only with
-    `search`, the local BulkSearch). Raises SchemaError on a malformed first answer."""
+    `search`, the local BulkSearch), and its central links checked against the rules (only
+    with `judge`, a review.Judge). Raises SchemaError on a malformed first answer."""
+    from .discovery import candidate_rows  # It imports this module.
+
     spec = pool.spec
     leader = store.get_card(spec.commander)
     nonlands = [c for c in pool.cards if not is_land(c.card)]
+    hits = pool.local_search.get("hits", [])
     ranks = {
         name_key(hit["name"]): {"rank": rank, "matched": hit["matched"]}
-        for rank, hit in enumerate(pool.local_search.get("hits", []), 1)
+        for rank, hit in enumerate(hits, 1)
     }
+    rows = candidate_rows(pool, full=MAP_FULL_TEXT,
+                          first=[*spec.must_include, *(hit["name"] for hit in hits)])
     candidates = []
-    for candidate in nonlands:
-        row = candidate.to_dict()
-        hit = ranks.get(name_key(candidate.card["name"]))
+    for row in rows["candidates"]:
+        hit = ranks.get(name_key(row["name"]))
         candidates.append({**row, "search": hit} if hit else row)
     combos: list[dict[str, Any]] = []
     if spellbook is not None and nonlands:
         activity.tool("combos", f"Commander Spellbook across {len(nonlands)} candidates")
         try:
-            found = spellbook.find_combos({c.card["name"]: 1 for c in nonlands}, spec.commander)
-            combos = [{"cards": c["cards"], "results": c["results"][:4]} for c in found["combos"]]
+            found = spellbook.find_combos(
+                {c.card["name"]: 1 for c in nonlands}, spec.commander, max_cards=3,
+            )
+            combos = [{"id": c["id"], "cards": c["cards"], "results": c["results"][:4]}
+                      for c in found["combos"]]
         except (SourceError, OSError, ValueError) as exc:
             log.warning("engine map: no Commander Spellbook combos (%s)", exc)
+    # Two-card combos first: they are the ones a link may cite and the bracket rules weigh.
+    combos.sort(key=lambda c: len(c["cards"]))
+    pool = dataclasses.replace(pool, combos=combos[:200])
     asks = spec.brief["asks"]
     messages = [
         {"role": "system", "content": prompts.ENGINE_MAP},
         {"role": "user", "content": json.dumps({
-            "spec": spec.to_dict(), "commander": trim_card(leader) if leader else None,
-            "candidates": candidates, "combos": combos[:40],
+            "spec": spec.to_dict(), "commander": prompt_card(leader) if leader else None,
+            "candidates": candidates, **({"more_candidates": rows["more_candidates"]}
+                                         if "more_candidates" in rows else {}),
+            "combos": [{"cards": c["cards"], "results": c["results"]} for c in combos[:40]],
         })},
     ]
     ask_ids = [a["id"] for a in asks]
@@ -197,7 +218,12 @@ def build_engine_map(
                 log.warning("engine map: the updated map was invalid; keeping the first one")
     nonlands = [c.card["name"] for c in pool.cards if not is_land(c.card)]
     result = clean_map({**raw, "searches": searched}, nonlands, spec.commander, asks,
-                       combos=combos)
+                       combos=[c for c in combos if len(c["cards"]) == 2])
+    if judge is not None:
+        try:
+            result = check_links(result, judge, spec.commander)
+        except (LLMError, SourceError, OSError, ValueError, SchemaError) as exc:
+            log.warning("engine map: links not checked against the rules (%s)", exc)
     on_map = sum(len(stage["cards"]) for stage in result["stages"])
     added = sum(len(entry["added"]) for entry in searched)
     log.info("engine map: %d cards in %d stages, %d gaps, %d cards found by %d gap searches",

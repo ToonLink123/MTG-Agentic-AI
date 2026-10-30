@@ -430,8 +430,10 @@ def render_map(engine: dict[str, Any]) -> Table:
     links = engine.get("links", [])
     if links:
         combos = sum(1 for link in links if link["source"] == "combo")
+        checked = sum(1 for link in links if link.get("verified") == "supported")
         rows.append(("Links", f"{len(links)} connections"
-                              + (f", {combos} Commander Spellbook combos" if combos else "")))
+                              + (f", {combos} Commander Spellbook combos" if combos else "")
+                              + (f", {checked} confirmed by the rules" if checked else "")))
     if engine.get("asks"):
         rows.append(("Asks", Text(" · ".join(
             f"{a['ask']} {len(a['cards'])} card{'s' * (len(a['cards']) != 1)}"
@@ -754,6 +756,12 @@ def render_interaction(result: dict[str, Any]) -> Group:
         parts.append(Text(f"Left out: {'; '.join(claim['problems'])}.", AMBER))
     for number, look in enumerate(result.get("looks") or [], 2):
         parts.append(Text(f"Look {number}: {look['lookup']} (+{len(look['added'])} evidence)", MUTED))
+    if result.get("tools"):
+        used = ", ".join(f"{name} x{count}" if count > 1 else name
+                         for name, count in Counter(result["tools"]).items())
+        parts.append(Text(f"The judge looked up: {used}", MUTED))
+    if result.get("from_ledger"):
+        parts.append(Text("Settled in an earlier review; answered from the ledger.", MUTED))
     if result.get("errors"):
         parts.append(problems(result["errors"]))
     if result.get("answered_by"):
@@ -1985,7 +1993,9 @@ class ChatApp(App[None]):
         pool_path = tab.save(f"{stem}-pool.json", pool)
         turn.finish(2, f"{len(pool['cards'])} candidates")
         turn.add(render_pool(pool))
-        argv = ["engine-map", "--pool", str(pool_path), *self.settings.member_args()]
+        # The map's links are checked against the rules with the review; off, they are not.
+        verify = [] if self.settings.review else ["--no-verify"]
+        argv = ["engine-map", "--pool", str(pool_path), *verify, *self.settings.member_args()]
         mapped = await self.step(turn, 3, argv)
         if mapped is None:
             return None

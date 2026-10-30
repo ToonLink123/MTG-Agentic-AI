@@ -62,6 +62,11 @@ SPEC_SCHEMA = object_schema(
         "role_targets": object_schema(
             {role: {"type": "integer", "minimum": 0, "maximum": 99} for role in TARGET_ROLES}
         ),
+        # Phrases as cards print them ("roll a die", "treasure token"), for local card search.
+        "search_terms": {
+            "type": "array", "maxItems": 12, "uniqueItems": True,
+            "items": {"type": "string", "minLength": 3, "maxLength": 60},
+        },
     }
 )
 # The player's own words travel with the spec: the request, the interview before intake, the
@@ -110,6 +115,7 @@ LOCAL_SEARCH_SCHEMA = object_schema({
     })},
 })
 MAP_STAGES = ("makes", "multiplies", "spends", "pays_off", "protects")
+LINK_CHECKS = ("unchecked", "supported", "unverified")
 
 
 def text(most: int, least: int = 1) -> dict[str, Any]:
@@ -142,6 +148,8 @@ def map_schema(
         "links": {"type": "array", "maxItems": 14, "items": object_schema({
             "from": NAME_SCHEMA, "to": NAME_SCHEMA, "how": text(200),
             "source": {"type": "string", "enum": ["oracle", "combo"]},
+            # A stored map records whether the rules judge checked each link.
+            **({"verified": {"type": "string", "enum": list(LINK_CHECKS)}} if stored else {}),
         })},
         "asks": {"type": "array", "maxItems": len(ask_ids) if ask_ids is not None else 10,
                  "items": object_schema({
