@@ -607,10 +607,20 @@ class BracketChecker:
                 ]
             )
         dangerous = {c["id"] for c in combos["combos"] if c["infinite"] or c["game_winning"]}
+        by_id = {c["id"]: c for c in combos["combos"]}
+        # Uncertainty a drafter can act on, because it names cards: these still fail a review,
+        # while uncertainty that names none (a win-speed estimate, a truncated search) is a warning.
+        flags: dict[str, dict[str, Any]] = {}
         if bracket <= 2 and dangerous:
             warnings.append(
                 "Known two-card infinite/winning combo present; remove or review intent."
             )
+            for combo_id in sorted(dangerous):
+                cards = by_id[combo_id]["cards"]
+                flags[combo_id] = {"cards": cards, "reason": (
+                    f"Two-card infinite or winning combo in Bracket {bracket}: "
+                    + " + ".join(cards)
+                )}
         if bracket == 3 and rules["two_card_combos_restricted"] and any(
             r["id"] in dangerous and r["early_likelihood"] == "likely" for r in reviews
         ):
@@ -628,10 +638,15 @@ class BracketChecker:
         if bracket == 5:
             warnings.append("A decklist alone does not establish cEDH metagame intent.")
         uncertain = bool(warnings) or assessment["fit"] == "uncertain"
-        if rules["two_card_combos_restricted"] and any(
-            r["id"] in dangerous and r["early_likelihood"] == "unknown" for r in reviews
-        ):
-            uncertain = True
+        for review in reviews:
+            if (rules["two_card_combos_restricted"] and review["id"] in dangerous
+                    and review["early_likelihood"] == "unknown"):
+                uncertain = True
+                cards = by_id[review["id"]]["cards"]
+                flags.setdefault(review["id"], {"cards": cards, "reason": (
+                    "Two-card combo whose speed could not be judged, restricted in this bracket: "
+                    + " + ".join(cards)
+                )})
         return {
             "verdict": "mismatch" if errors else "uncertain" if uncertain else "fits",
             "target_bracket": bracket,
@@ -645,5 +660,6 @@ class BracketChecker:
             "reasons": errors + warnings + assessment["reasons"],
             "errors": errors,
             "warnings": warnings,
+            "flags": list(flags.values()),
             "disclaimer": "Advisory pregame aid. Heuristics and LLM estimates, not observed gameplay.",
         }

@@ -141,10 +141,29 @@ class TuiHelperTests(unittest.TestCase):
                 self.assertIn(f"transformers {flagged}", problem)
                 self.assertIn(sys.executable, problem)
 
+    def test_an_uncertain_bracket_and_an_auto_land_count_read_plainly(self):
+        from mtg_agentic.tui import render_spec, unverified
+
+        warning = {"warning": "bracket_uncertain", "detail": "x",
+                   "reasons": ["Likely win speed is unknown"]}
+        shown = plain(unverified([warning, {"cards": ["A", "B"], "missing": "copy rules"}]))
+        self.assertIn("Bracket fit uncertain, not a failure", shown)
+        self.assertIn("Likely win speed is unknown", shown)
+        self.assertIn("Unverified: A + B", shown)
+        spec = {"commander": "Jodah", "color_identity": "WUBRG", "bracket": 3,
+                "playstyle": "midrange", "commander_dependency": "medium",
+                "role_targets": {"ramp": 10, "lands": 0}}
+        self.assertIn("lands auto", plain(render_spec(spec)))
+
+    def test_claude_and_the_council_are_the_defaults(self):
+        settings = Settings()
+        self.assertEqual((settings.provider, settings.orchestrate), ("claude", True))
+        self.assertIn("council", settings.describe())
+
     def test_the_engine_map_runs_on_the_member_model_in_orchestrate_mode(self):
         member = ["--provider", "claude", "--model", "claude-haiku-5-5", "--effort", "high"]
         self.assertEqual(Settings(provider="claude", orchestrate=True).member_args(), member)
-        self.assertEqual(Settings(provider="claude").member_args(), ["--provider", "claude"])
+        self.assertEqual(Settings(provider="claude", orchestrate=False).member_args(), ["--provider", "claude"])
         self.assertEqual(Settings(provider="ollama", orchestrate=True).member_args(),
                          ["--provider", "ollama"])
 
@@ -287,7 +306,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             "card": (0, trim_card(JODAH)), "interview": (0, READY), "intake": (0, SPEC),
             "discover": (0, POOL), "engine-map": (0, MAPPED), "draft": (1, DECK),
         })
-        app = ChatApp(self.data_dir, Settings(provider="ollama"), runner=cli)
+        app = ChatApp(self.data_dir, Settings(provider="ollama", orchestrate=False), runner=cli)
         async with app.run_test() as pilot:
             await self.send(app, pilot, "jodah")
             self.assertEqual(app.commander, JODAH["name"])
@@ -337,7 +356,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_error_envelope_stops_the_pipeline_at_that_step(self):
         error = {"valid": False, "errors": [{"error": "llm", "detail": "Ollama is not running"}]}
         cli = FakeCli({"interview": (0, READY), "intake": (2, error)})
-        app = ChatApp(self.data_dir, Settings(), runner=cli)
+        app = ChatApp(self.data_dir, Settings(orchestrate=False), runner=cli)
         async with app.run_test() as pilot:
             app.commander = JODAH["name"]
             await self.send(app, pilot, "Myojin tribal")
@@ -422,7 +441,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
                 {"error": "schema", "detail": "$.stages must be array"}]}),
             "draft": (1, DECK),
         })
-        app = ChatApp(self.data_dir, Settings(), runner=cli)
+        app = ChatApp(self.data_dir, Settings(orchestrate=False), runner=cli)
         async with app.run_test() as pilot:
             app.commander = JODAH["name"]
             await self.send(app, pilot, "Myojin tribal", settle=False)
@@ -598,7 +617,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             first = argv[argv.index("--request") + 1] == "Myojin tribal"
             return 0, QUESTIONS if first and argv[argv.index("--round") + 1] == "1" else READY
 
-        app = ChatApp(self.data_dir, Settings(), runner=runner)
+        app = ChatApp(self.data_dir, Settings(orchestrate=False), runner=runner)
         async with app.run_test() as pilot:
             app.commander = JODAH["name"]
             await self.send(app, pilot, "Myojin tribal", settle=False)

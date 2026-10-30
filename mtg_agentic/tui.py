@@ -80,7 +80,7 @@ HELP = (
     ("/bracket", "Bracket assessment of the current deck"),
     ("/review", "Bracket plus rules review of the current deck"),
     ("/review on|off", "Whether each draft runs that review itself (on by default)"),
-    ("/orchestrate on|off", "Draft with a council: an orchestrator plans, members debate"),
+    ("/orchestrate on|off", "Draft with a council: an orchestrator plans, members debate (on by default)"),
     ("/deck", "Show the current deck again"),
     ("/load PATH", "Make a saved deck JSON the current deck"),
     ("/export [PATH]", "Save the current deck as a text list, commander first, and copy it"),
@@ -156,11 +156,11 @@ Runner = Callable[[list[str], Path, Callable[[str], None]], Awaitable[tuple[int,
 
 @dataclass
 class Settings:
-    provider: str = "ollama"
+    provider: str = "claude"
     model: str | None = None
     mode: str | None = None  # Bracket 3 house rules; None lets intake read them from the request.
     review: bool = True
-    orchestrate: bool = False
+    orchestrate: bool = True  # Deck requests go to the council: an orchestrator and members.
     pool: str = "mixed"  # How discovery ranks what it finds; see POOL_MODES.
 
     def model_args(self) -> list[str]:
@@ -311,13 +311,20 @@ def problems(errors: list[Any], limit: int = 8) -> Group:
 
 
 def unverified(warnings: list[dict[str, Any]]) -> Group:
-    """Interactions the rules judge could not confirm: shown, but they do not fail a deck."""
-    return Group(*(
-        Text(f"• Unverified: {' + '.join(warning['cards'])}. The rules judge could not confirm "
-             "it from the rules it found; it was not shown to fail."
-             + (f" Missing: {warning['missing']}." if warning.get("missing") else ""), AMBER)
-        for warning in warnings
-    ))
+    """Review warnings: interactions the rules judge could not confirm, and a bracket fit the
+    check could not settle without naming a card. Shown, but they do not fail a deck."""
+    lines = []
+    for warning in warnings:
+        if warning.get("warning") == "bracket_uncertain":
+            reasons = "; ".join(warning.get("reasons", [])[:3])
+            lines.append(Text("• Bracket fit uncertain, not a failure: it names no card to change."
+                              + (f" {reasons}" if reasons else ""), AMBER))
+            continue
+        lines.append(Text(
+            f"• Unverified: {' + '.join(warning.get('cards', []))}. The rules judge could not "
+            "confirm it from the rules it found; it was not shown to fail."
+            + (f" Missing: {warning['missing']}." if warning.get("missing") else ""), AMBER))
+    return Group(*lines)
 
 
 def labeled(rows: Iterable[tuple[str, Any]]) -> Table:
@@ -383,7 +390,9 @@ def render_spec(spec: dict[str, Any]) -> Table:
     ):
         if spec.get(key):
             rows.append((label, ", ".join(spec[key])))
-    rows.append(("Targets", " · ".join(f"{k} {v}" for k, v in spec["role_targets"].items())))
+    rows.append(("Targets", " · ".join(
+        f"{k} {'auto' if k == 'lands' and not v else v}" for k, v in spec["role_targets"].items()
+    )))
     rows.append(("Dependency", f"commander dependency {spec['commander_dependency']}"))
     brief = spec.get("brief") or {}
     if brief.get("asks"):
@@ -640,6 +649,10 @@ def render_council(council: dict[str, Any]) -> Table:
                                f"{len(council['contested'])} contested for "
                                f"{council['open_slots']} slots · "
                                f"{len(council['decision']['keep'])} kept"))
+    if council.get("role_targets"):
+        targets = " · ".join(f"{k} {v}" for k, v in council["role_targets"].items())
+        reason = council.get("targets_reason", "")
+        rows.append(("Targets", Text.assemble(targets, (f"  {reason}" if reason else "", MUTED))))
     if council.get("decision", {}).get("notes"):
         rows.append(("Notes", council["decision"]["notes"]))
     if council.get("fallback"):
@@ -1999,6 +2012,9 @@ class ChatApp(App[None]):
         turn.finish(index, status, "done" if deck.get("valid") else "warn")
         if deck.get("council"):
             turn.add(render_council(deck["council"]))
+        polish = deck.get("polish") or {}
+        if polish.get("kept") and polish.get("swaps"):
+            turn.add(render_edit({**polish, "reply": "Polished before you saw it: " + polish.get("reply", "")}))
         turn.add(render_deck(deck, self.lookup, tab.deck_path))
         turn.add(Text("Reply to ask the orchestrator about this deck or for changes. "
                       "/draft starts over, /export saves the list.", MUTED))
@@ -2110,7 +2126,7 @@ def run_tui(
     data_dir: Path, *, provider: str | None = None, model: str | None = None, pool: str = "mixed"
 ) -> int:
     settings = Settings(
-        provider=provider or os.getenv("MTG_LLM_PROVIDER") or "ollama",
+        provider=provider or os.getenv("MTG_LLM_PROVIDER") or "claude",
         model=model or os.getenv("MTG_LLM_MODEL") or None,
         pool=pool,
     )

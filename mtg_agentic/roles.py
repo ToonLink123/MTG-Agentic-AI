@@ -79,13 +79,30 @@ def oracle_roles(card: Card, tags=()) -> set[str]:
     return roles
 
 
+# The range each role's minimum may take. A plan sets its own targets (a spellslinger deck needs
+# few creatures, a go-wide deck few board wipes); code clamps every target into these bounds.
+ROLE_BOUNDS = {
+    "ramp": (6, 16), "draw": (5, 15), "removal": (4, 14), "wipes": (0, 4),
+    "creatures": (0, 40), "protection": (4, 12),
+}
+MAXIMUM_WIPES = 4
+
+
+def bounded_targets(targets: dict[str, int], dependency: str = "medium") -> dict[str, int]:
+    """Role targets clamped into ROLE_BOUNDS; a commander the plan depends on keeps 6 protection."""
+    result = dict(targets)
+    for role, (low, high) in ROLE_BOUNDS.items():
+        if role in result:
+            result[role] = min(max(result[role], low), high)
+    if dependency == "high" and "protection" in result:
+        result["protection"] = max(6, result["protection"])
+    return result
+
+
 def role_policy(spec: DeckSpec) -> dict[str, Any]:
     high = spec.commander_dependency == "high"
-    minimums = dict(spec.role_targets)
-    minimums["creatures"] = max(15, minimums["creatures"])
-    minimums["draw"] = max(8, minimums["draw"])
-    minimums["protection"] = max(6 if high else 4, minimums["protection"])
-    return {"minimums": minimums, "maximum_wipes": 4, "independent_instants": 3 if high else 2, "protection_mechanisms": 2}
+    minimums = bounded_targets(spec.role_targets, spec.commander_dependency)
+    return {"minimums": minimums, "maximum_wipes": MAXIMUM_WIPES, "independent_instants": 3 if high else 2, "protection_mechanisms": 2}
 
 
 def protection_report(cards: dict[str, int], store: OracleStore) -> dict[str, Any]:

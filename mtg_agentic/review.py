@@ -193,15 +193,35 @@ class DeckReviewer:
                     self.rules.judge_interaction(names, question, evidence, answer)
                 )
         errors, warnings = [], []
-        if bracket_report["verdict"] != "fits":
+        verdict, flags = bracket_report["verdict"], bracket_report.get("flags", [])
+        if verdict == "mismatch":
             errors.append(
                 {
                     "error": "bracket_review",
-                    "detail": bracket_report["verdict"],
+                    "detail": verdict,
                     "reasons": bracket_report["reasons"],
                     "instruction": "Remove flagged cards/combos or revise within the fixed target bracket.",
                 }
             )
+        elif flags:
+            # Uncertain, but about named cards the drafter can cut: still a problem to fix.
+            errors.append(
+                {
+                    "error": "bracket_review",
+                    "detail": verdict,
+                    "reasons": [flag["reason"] for flag in flags],
+                    "cards": sorted({name for flag in flags for name in flag["cards"]}),
+                    "instruction": "Remove a card from each flagged combo or revise within the fixed target bracket.",
+                }
+            )
+        elif verdict == "uncertain":
+            # Nothing it names is a card to cut (a win-speed estimate, a truncated combo
+            # search), so no repair could fix it: the player sees it instead.
+            warnings.append({
+                "warning": "bracket_uncertain",
+                "detail": "The bracket check is uncertain, but names no card to change.",
+                "reasons": (bracket_report.get("warnings") or bracket_report["reasons"])[:6],
+            })
         for result in interactions:
             if result["status"] == "contradicted":
                 errors.append(

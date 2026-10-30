@@ -105,23 +105,23 @@ class ClaudeTests(unittest.TestCase):
         )
         self.assertEqual(client.complete_json([], SPEC_SCHEMA), SPEC)
 
-    def test_large_repeated_bucket_enums_are_wire_only_and_checked_after_retry(self):
+    def test_large_repeated_tier_enums_are_wire_only_and_checked_after_retry(self):
         import copy
 
         schema = copy.deepcopy(DRAFT_SCHEMA)
         names = [f"Spell {n}" for n in range(350)]
-        for bucket in schema["properties"]["buckets"]["properties"].values():
-            bucket["items"] = {"type": "string", "enum": names}
+        for tier in schema["properties"]["picks"]["properties"].values():
+            tier["items"] = {"type": "string", "enum": names}
         invalid = draft()
-        invalid["buckets"]["support"] = ["Invented Card"]
+        invalid["picks"]["flex"] = ["Invented Card"]
         client, stream = fake_client(
             reply(text(json.dumps(invalid))), reply(text(json.dumps(invalid))),
         )
         with self.assertRaises(SchemaError):
             client.complete_json([], schema)
         sent = stream.call_args.kwargs["output_config"]["format"]["schema"]
-        self.assertNotIn("enum", sent["properties"]["buckets"]["properties"]["support"]["items"])
-        self.assertEqual(schema["properties"]["buckets"]["properties"]["support"]["items"]["enum"], names)
+        self.assertNotIn("enum", sent["properties"]["picks"]["properties"]["flex"]["items"])
+        self.assertEqual(schema["properties"]["picks"]["properties"]["flex"]["items"]["enum"], names)
         self.assertEqual(stream.call_count, 2)
 
     def test_refusal_and_truncation_are_errors(self):
@@ -197,6 +197,75 @@ class ClaudeTests(unittest.TestCase):
         self.assertNotIn("enum", wire["properties"]["swaps"]["items"]["properties"]["add"])
         self.assertEqual(wire["properties"]["tool"]["enum"], ["card", "finish"])
         self.assertEqual(len(schema["properties"]["keep"]["items"]["enum"]), 200)  # Not mutated.
+
+    def test_a_shared_pool_message_becomes_a_cached_system_block(self):
+        client, stream = fake_client(reply(text(json.dumps(SPEC))))
+        client.complete_json([
+            {"role": "system", "content": "POOL"},
+            {"role": "system", "content": "Draft."},
+            {"role": "user", "content": "spec"},
+        ], SPEC_SCHEMA)
+        self.assertEqual(stream.call_args.kwargs["system"], [
+            {"type": "text", "text": "POOL", "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "Draft."},
+        ])
+
+    def test_tool_turns_send_strict_tools_and_return_calls_with_thinking(self):
+        thinking = SimpleNamespace(type="thinking", thinking="Check first.", signature="sig")
+        call = SimpleNamespace(type="tool_use", id="toolu_1", name="card", input={"cards": ["X"]})
+        client, stream = fake_client(reply(thinking, text("Looking."), call, stop_reason="tool_use"))
+        tool = {"name": "card", "description": "Card text.", "input_schema": {
+            "type": "object", "properties": {"cards": {"type": "array", "items": {"type": "string"}}},
+            "required": ["cards"], "additionalProperties": False,
+        }}
+        turn = client.tool_turn([{"role": "system", "content": "Edit."},
+                                 {"role": "user", "content": "go"}], [tool])
+        self.assertEqual(turn["calls"], [{"id": "toolu_1", "name": "card", "input": {"cards": ["X"]}}])
+        self.assertEqual(turn["content"], [
+            {"type": "thinking", "thinking": "Check first.", "signature": "sig"},
+            {"type": "text", "text": "Looking."},
+            {"type": "tool_use", "id": "toolu_1", "name": "card", "input": {"cards": ["X"]}},
+        ])
+        kwargs = stream.call_args.kwargs
+        self.assertTrue(kwargs["tools"][0]["strict"])
+        self.assertEqual(kwargs["tool_choice"], {"type": "auto"})
+        self.assertEqual(kwargs["output_config"], {"effort": "high"})
+        self.assertEqual(kwargs["system"], "Edit.")
+
+    def test_parallel_calls_on_one_shared_prefix_wait_for_the_first_to_start(self):
+        import threading
+
+        client = claude.ClaudeClient(api_key="test-key")
+        order, started, waiting = [], threading.Event(), threading.Event()
+
+        def first():
+            with client._prefix("pool") as begin:
+                order.append("first sent")
+                waiting.wait(5)  # The second request is waiting at its gate now.
+                order.append("first answers")
+                begin()
+                started.set()
+
+        def second():
+            with client._prefix("pool"):
+                order.append("second sent")
+
+        one = threading.Thread(target=first)
+        one.start()
+        while not client._warming:
+            pass
+        two = threading.Thread(target=second)
+        two.start()
+        two.join(0.2)
+        self.assertTrue(two.is_alive())  # Held until the first one starts answering.
+        waiting.set()
+        one.join(5)
+        two.join(5)
+        self.assertEqual(order, ["first sent", "first answers", "second sent"])
+        with client._prefix("pool") as begin:  # Warm now: no wait at all.
+            begin()
+        with client._prefix(None) as begin:
+            begin()
 
     def test_api_errors_are_clear_and_do_not_echo_the_key(self):
         sdk = claude.anthropic

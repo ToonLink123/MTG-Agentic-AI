@@ -14,8 +14,15 @@ illegal one that passes.
   front of every agent and checks the finished deck serves each of them.
 - **Local card search.** Scryfall's card data, tags and rulings and Commander Spellbook's combos
   are downloaded once, so a 1,000-card candidate pool builds in about two seconds.
-- **Engine map and council.** A model traces the deck's resource loop; an orchestrator and three
-  members draft in parallel and debate only the cards they disagree on.
+- **Engine map and council.** A model traces the deck's resource loop; an orchestrator sets the
+  plan and the role counts it needs, and three members rank their picks in parallel and debate
+  only the cards they disagree on. The council is on by default.
+- **Picks code respects.** Drafters rank their cards as core, strong and flex. Code fills the
+  deck in that order, swaps only flex picks to reach a role count, and tells a repair every pick
+  it left out and why. Lands follow the deck's curve.
+- **Drafting with checks.** On Claude, the drafter checks its picks with code (roles, curve,
+  lands, problems) and searches the card data before it commits, then the orchestrator polishes
+  the finished deck once.
 - **Checked results.** Legality, a code-built mana base, a bracket review, and rules answers
   that must quote the Comprehensive Rules they rely on.
 - **Follow-ups.** Ask about the deck or for changes; every swap is checked again and saved as a
@@ -37,24 +44,24 @@ Requires Python 3.10 or newer.
 git clone https://github.com/ToonLink123/MTG-Agentic-AI.git
 cd MTG-Agentic-AI
 python -m pip install -e ".[tui,embeddings,claude]"
-python -m mtg_agentic tui --provider claude
+python -m mtg_agentic tui
 ```
 
 On its first start, Ring downloads what it reads locally, about 2.3 GB, with a checklist
 (run `python -m mtg_agentic setup` to do it ahead of time). Then type a commander's name and
 describe your deck.
 
-For Claude, put `CLAUDE_API=<your key>` in a `.env` file at the repository root; it is ignored
-by Git. To stay free and offline, skip `--provider claude` and use a local model through
-[Ollama](https://ollama.com) (`ollama pull qwen2.5:7b`).
+Claude is the default: put `CLAUDE_API=<your key>` in a `.env` file at the repository root; it
+is ignored by Git. To stay free and offline, pass `--provider ollama` and use a local model
+through [Ollama](https://ollama.com) (`ollama pull qwen2.5:7b`).
 
 ## Models
 
 | Provider | Runs on | Default model | Candidate pool |
 | --- | --- | --- | --- |
-| `ollama` (default) | Your machine | `qwen2.5:7b` | 350 cards |
+| `ollama` | Your machine | `qwen2.5:7b` | 350 cards |
 | `llama-cpp` | Your machine | LFM3 1.7B | 350 cards |
-| `claude` | Anthropic's API | `claude-haiku-5-5`; the council uses Sonnet 5.5 to lead | 1,000 cards |
+| `claude` (default) | Anthropic's API | `claude-haiku-5-5`; the council uses Sonnet 5.5 to lead | 1,000 cards |
 | `openai-compatible` | Any compatible API | the one you name | 350 cards |
 
 Rules embeddings always run locally with Google's EmbeddingGemma 2.
@@ -69,7 +76,7 @@ last one wrote:
 python -m mtg_agentic intake --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal" --output spec.json
 python -m mtg_agentic discover --spec spec.json --output pool.json
 python -m mtg_agentic engine-map --pool pool.json --output mapped.json
-python -m mtg_agentic council --pool mapped.json --provider claude --output deck.json
+python -m mtg_agentic council --pool mapped.json --output deck.json
 ```
 
 Results are JSON, files are never overwritten, and `validate` exits with `1` for a deck that

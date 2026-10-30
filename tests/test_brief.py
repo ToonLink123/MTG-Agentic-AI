@@ -313,11 +313,11 @@ class EngineMapTests(unittest.TestCase):
         banned = card("Banned Engine", colors="U", legal="banned")
         self.store.import_cards([*self.records, engine, banned])
         pool = make_pool(self.store)
-        picks = [{"name": "outside engine", "reason": "draws and ramps"},
-                 {"name": "Banned Engine", "reason": "x"},
-                 {"name": "Made Up Card", "reason": "x"},
-                 {"name": "Plains", "reason": "x"},
-                 {"name": "Spell 3", "reason": "already a candidate"}]
+        picks = [{"name": "outside engine", "tier": "core", "reason": "draws and ramps"},
+                 {"name": "Banned Engine", "tier": "flex", "reason": "x"},
+                 {"name": "Made Up Card", "tier": "flex", "reason": "x"},
+                 {"name": "Plains", "tier": "flex", "reason": "x"},
+                 {"name": "Spell 3", "tier": "strong", "reason": "already a candidate"}]
         model = FakeModel({**draft(), "outside": picks})
         with patch("mtg_agentic.scryfall.urlopen", side_effect=AssertionError("Unexpected HTTP")):
             deck = draft_deck(pool, model, self.client, self.store)
@@ -335,10 +335,11 @@ class EngineMapTests(unittest.TestCase):
             map_reply(asks=[{"ask": "A1", "cards": ["Spell 66"], "note": ""}]),
             [c.card["name"] for c in self.pool.cards], JODAH["name"], self.spec.brief["asks"],
         )
-        self.assertEqual(json.loads(draft_request(self.pool)[1]["content"])["engine_map"],
+        pool_message = draft_request(self.pool)[0]["content"]
+        self.assertEqual(json.loads(pool_message.split("\n", 1)[1])["engine_map"],
                          self.pool.engine_map)
         fixed = draft()
-        fixed["buckets"]["support"] = [f"Spell {n}" for n in (*range(40), *range(41, 63), 66)]
+        fixed["picks"]["flex"] = [f"Spell {n}" for n in (*range(40), *range(41, 63), 66)]
         model = FakeModel(draft(), fixed)
         with patch("mtg_agentic.scryfall.urlopen", side_effect=AssertionError("Unexpected HTTP")):
             deck = draft_deck(self.pool, model, self.client, self.store)
@@ -357,6 +358,9 @@ class EngineMapTests(unittest.TestCase):
                            "asks": [], "gaps": []}
         plan = {"game_plan": "Win.", "non_goals": [], "win_conditions": ["Spell 1"],
                 "game_changers": [], "key_cards": [],
+                "role_targets": {"ramp": 10, "draw": 10, "removal": 8, "wipes": 3,
+                                 "creatures": 15, "protection": 4},
+                "targets_reason": "Usual counts.",
                 "decisions": [{"question": "How much interaction?", "decision": "A moderate amount"}]}
         model = FakeModel(plan)
         result = plan_deck(pool, model, set())
@@ -364,7 +368,8 @@ class EngineMapTests(unittest.TestCase):
         schema = model.calls[0][1]["properties"]["decisions"]
         self.assertEqual((schema["minItems"], schema["items"]["properties"]["question"]["enum"]),
                          (1, ["How much interaction?"]))
-        self.assertEqual(json.loads(model.calls[0][0][1]["content"])["engine_map"], pool.engine_map)
+        pool_message = model.calls[0][0][0]["content"]
+        self.assertEqual(json.loads(pool_message.split("\n", 1)[1])["engine_map"], pool.engine_map)
         model = FakeModel({key: value for key, value in plan.items() if key != "decisions"})
         self.assertEqual(plan_deck(self.pool, model, set())["decisions"], [])
         self.assertNotIn("decisions", model.calls[0][1]["properties"])

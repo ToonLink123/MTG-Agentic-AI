@@ -20,12 +20,15 @@ PLAN = {
     "win_conditions": ["Spell 1"],
     "game_changers": [],
     "key_cards": ["Spell 2", "Spell 3"],
+    "role_targets": {"ramp": 10, "draw": 10, "removal": 8, "wipes": 3, "creatures": 15,
+                     "protection": 4},
+    "targets_reason": "A midrange Myojin deck with the usual counts.",
 }
 
 
 def picks(*numbers):
     selection = draft(count=0)
-    selection["buckets"]["support"] = [f"Spell {n}" for n in numbers]
+    selection["picks"]["flex"] = [f"Spell {n}" for n in numbers]
     return selection
 
 
@@ -38,12 +41,12 @@ class CouncilModel:
         self.calls, self.lock, self.running, self.peak = [], threading.Lock(), 0, 0
 
     def complete_json(self, messages, schema):
-        system = messages[0]["content"]
+        system = "\n".join(m["content"] for m in messages if m["role"] == "system")
         kind = (
-            "plan" if system == prompts.COUNCIL_PLAN
+            "plan" if prompts.COUNCIL_PLAN in system
             else "draft" if prompts.COUNCIL_MEMBER in system
-            else "vote" if system == prompts.COUNCIL_CRITIQUE
-            else "decide" if system == prompts.COUNCIL_DECIDE
+            else "vote" if prompts.COUNCIL_CRITIQUE in system
+            else "decide" if prompts.COUNCIL_DECIDE in system
             else "repair"
         )
         with self.lock:
@@ -122,7 +125,8 @@ class CouncilTests(unittest.TestCase):
                      text="Draw two cards.")
         self.store.import_cards([*self.records, extra])
         self.pool = make_pool(self.store)
-        engine = {**picks(*range(62)), "outside": [{"name": "Outside Engine", "reason": "fits"}]}
+        engine = {**picks(*range(62)),
+                  "outside": [{"name": "Outside Engine", "tier": "flex", "reason": "fits"}]}
         model = CouncilModel({
             "engine": engine, "resilience": picks(*range(63)), "consistency": picks(*range(63)),
         })

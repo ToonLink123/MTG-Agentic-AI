@@ -13,11 +13,12 @@ from pathlib import Path
 from typing import Any
 
 from . import bootstrap
+from .agent import supports_tools
 from .brackets import BracketChecker, SpellbookClient, bracket_rules
 from .bulk_search import BulkSearch
 from .council import MEMBER, ORCHESTRATOR, council_draft
 from .discovery import POOL_MODES, CandidatePool
-from .edit import Toolbox, edit_deck
+from .edit import Toolbox, edit_deck, polish_deck
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .engine_map import build_engine_map
 from .evaluation import evaluation_history, run_evaluation
@@ -56,6 +57,10 @@ POOL_HELP = "Most candidates (up to 1000); default 1000 with claude, 350 otherwi
 # Evidence items per rules question, half of them rules. Claude's context holds twice the
 # default, which raised gold-rule recall on the retrieval benchmark from 87% to 96%.
 EVIDENCE_LIMITS = {"claude": 36}
+POLISH_HELP = (
+    "Skip the polish pass: with a tool-capable model (claude), the orchestrator reviews a valid "
+    "deck once more and swaps cards that do not serve the plan"
+)
 POOL_MODE_HELP = (
     "How discovery ranks the cards its searches find: popular (EDHREC rank only), relevant "
     "(fit to the deck only) or mixed (both, weighted; the default)"
@@ -66,7 +71,7 @@ def _model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         choices=PROVIDERS,
-        default=os.getenv("MTG_LLM_PROVIDER", "ollama"),
+        default=os.getenv("MTG_LLM_PROVIDER", "claude"),
     )
     parser.add_argument("--model", default=os.getenv("MTG_LLM_MODEL"))
     parser.add_argument("--llm-url", default=os.getenv("MTG_LLM_BASE_URL"))
@@ -247,6 +252,23 @@ def _question_cards(args: argparse.Namespace, store: OracleStore, client: Scryfa
     return found
 
 
+def _toolbox(args, stack, store, client, reviewer) -> Toolbox:
+    """What the drafter's and the polish pass's tools reach: local search, combos, rules."""
+    sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
+    return Toolbox(
+        store, client, reviewer.rules if reviewer is not None else None,
+        SpellbookClient(sources, store=store), BulkSearch(store, client),
+        evidence=_evidence(args, 12),
+    )
+
+
+def _polish(args, deck, pool, model, toolbox, reviewer) -> dict[str, Any]:
+    """The polish pass on a valid deck, for a model with native tool use."""
+    if args.no_polish or not deck.get("valid") or not supports_tools(model):
+        return deck
+    return polish_deck(deck, pool, model, tools=toolbox, reviewer=reviewer)
+
+
 def _reviewer(args, stack, store, client, model):
     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
     rules = stack.enter_context(_rules_store(args))
@@ -415,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         "mana-base", help="Generate only lands from a finished spell list, without an LLM or HTTP"
     )
     mana_base.add_argument("deck", type=Path, help="JSON with commander, cards, and optional spec")
-    mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec)")
+    mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec; 0 sets it from the curve)")
     mana_base.add_argument("--output", type=Path, help="Write the mana-base report to a NEW file")
     commands.add_parser("spec-schema", help="Print the fixed intake JSON schema")
     interview_cmd = commands.add_parser(
@@ -469,6 +491,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Explicitly skip bracket/rules safety review (not evaluation-ready)",
     )
+    draft_cmd.add_argument("--no-polish", action="store_true", help=POLISH_HELP)
     _embedding_options(draft_cmd)
     _model_options(draft_cmd)
     council_cmd = commands.add_parser(
@@ -488,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-review", action="store_true",
         help="Explicitly skip bracket/rules safety review (not evaluation-ready)",
     )
+    council_cmd.add_argument("--no-polish", action="store_true", help=POLISH_HELP)
     _embedding_options(council_cmd)
     _model_options(council_cmd)
     edit_cmd = commands.add_parser(
@@ -567,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
     history = commands.add_parser("evaluation-history")
     history.add_argument("--runs-dir", type=Path)
     tui = commands.add_parser("tui", help="Dark terminal chat: pick a commander, describe a deck")
-    tui.add_argument("--provider", choices=PROVIDERS, help="Default: MTG_LLM_PROVIDER or ollama")
+    tui.add_argument("--provider", choices=PROVIDERS, help="Default: MTG_LLM_PROVIDER or claude")
     tui.add_argument("--model", help="Default: MTG_LLM_MODEL or the provider's default")
     tui.add_argument("--pool-mode", choices=POOL_MODES, default="mixed",
                      help="The starting /pool: " + POOL_MODE_HELP)
@@ -856,10 +880,13 @@ def main(argv: list[str] | None = None) -> int:
                 pool = CandidatePool.from_dict(
                     load_json(args.pool.read_text(encoding="utf-8-sig")), store
                 )
+                toolbox = _toolbox(args, stack, store, client, reviewer)
                 result = council_draft(
                     pool, orchestrator, member, client, store,
                     members=args.members, max_repairs=args.repairs, reviewer=reviewer,
+                    toolbox=toolbox,
                 )
+                result = _polish(args, result, pool, orchestrator, toolbox, reviewer)
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
         if args.command in {"interview", "intake", "discover", "engine-map", "draft", "build"}:
@@ -929,9 +956,12 @@ def main(argv: list[str] | None = None) -> int:
                     pool = CandidatePool.from_dict(
                         load_json(args.pool.read_text(encoding="utf-8-sig")), store
                     )
+                    toolbox = _toolbox(args, stack, store, client, reviewer)
                     result = draft_deck(
-                        pool, model, client, store, max_repairs=args.repairs, reviewer=reviewer
+                        pool, model, client, store, max_repairs=args.repairs, reviewer=reviewer,
+                        toolbox=toolbox,
                     )
+                    result = _polish(args, result, pool, model, toolbox, reviewer)
                 else:
                     result = build_deck(
                         args.request,
