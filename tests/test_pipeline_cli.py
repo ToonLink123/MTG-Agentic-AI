@@ -64,6 +64,26 @@ class PipelineCliTests(unittest.TestCase):
                 status, _ = self.run_cli("discover", "--spec", str(spec), "--provider", provider)
             self.assertEqual(status, 0)
             self.assertEqual(run.call_args.kwargs["pool_limit"], limit)
+            self.assertEqual(run.call_args.kwargs["pool_mode"], "mixed")
+
+    def test_claude_gets_twice_the_rules_evidence(self):
+        from argparse import Namespace
+
+        from mtg_agentic.__main__ import _evidence
+
+        self.assertEqual(_evidence(Namespace(provider="claude")), 36)
+        self.assertEqual(_evidence(Namespace(provider="ollama")), 18)
+        self.assertEqual(_evidence(Namespace(provider="ollama"), 12), 12)
+        self.assertEqual(_evidence(Namespace(provider="claude"), 12), 36)
+
+    def test_pool_mode_flag_reaches_discovery(self):
+        spec = self.path / "spec.json"
+        spec.write_text(json.dumps(make_spec().to_dict()), encoding="utf-8")
+        with patch("mtg_agentic.__main__.discover") as run:
+            run.return_value.to_dict.return_value = {"cards": []}
+            status, _ = self.run_cli("discover", "--spec", str(spec), "--pool-mode", "relevant")
+        self.assertEqual(status, 0)
+        self.assertEqual(run.call_args.kwargs["pool_mode"], "relevant")
 
     def test_schema_command_needs_no_model_or_network(self):
         status, schema = self.run_cli("spec-schema")

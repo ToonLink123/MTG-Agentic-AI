@@ -93,13 +93,14 @@ def search_terms(spec: DeckSpec, commander: Card | None) -> dict[str, tuple[str,
     return terms
 
 
-def local_search(
-    spec: DeckSpec, store: OracleStore, *, limit: int = 40, max_terms: int = 16
-) -> dict[str, Any]:
-    """Eligible nonland cards ranked by how well they match the deck's terms."""
+def theme_scores(
+    spec: DeckSpec, store: OracleStore, *, max_terms: int = 16, per_term: int = 300
+) -> tuple[list[dict[str, Any]], dict[str, float], dict[str, list[str]]]:
+    """The deck's useful terms, then each matching card's summed relevance and matched terms,
+    by card name. `per_term` caps how many cards each term contributes."""
     total = store.metadata.get("card_count", 0)
     if not total:
-        return {"terms": [], "hits": []}
+        return [], {}, {}
     common = max(25, int(total * 0.04))
     commander = store.get_card(spec.commander)
     useful = []
@@ -111,7 +112,7 @@ def local_search(
     kept = []
     seen: set[tuple[str, ...]] = set()
     for term in sorted(useful, key=lambda t: (-t["value"], t["term"])):
-        rows = store.search_text(term["term"])
+        rows = store.search_text(term["term"], per_term)
         # The index stems words, so "roll", "rolled" and "rolling" find the same cards: one
         # term, counted once.
         found = tuple(name for name, _ in rows)
@@ -121,13 +122,23 @@ def local_search(
         kept.append({**term, "rows": rows})
         if len(kept) == max_terms:
             break
-    activity.tool("local search", ", ".join(t["term"] for t in kept) or "no useful terms")
     scores: dict[str, float] = {}
     matched: dict[str, list[str]] = {}
     for term in kept:
         for name, relevance in term["rows"]:
             scores[name] = scores.get(name, 0.0) + term["weight"] * relevance
             matched.setdefault(name, []).append(term["term"])
+    return kept, scores, matched
+
+
+def local_search(
+    spec: DeckSpec, store: OracleStore, *, limit: int = 40, max_terms: int = 16
+) -> dict[str, Any]:
+    """Eligible nonland cards ranked by how well they match the deck's terms."""
+    kept, scores, matched = theme_scores(spec, store, max_terms=max_terms)
+    if not store.metadata.get("card_count", 0):
+        return {"terms": [], "hits": []}
+    activity.tool("local search", ", ".join(t["term"] for t in kept) or "no useful terms")
     hits = []
     top = None
     for name in sorted(scores, key=lambda n: (-scores[n], n)):

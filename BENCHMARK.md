@@ -110,6 +110,30 @@ Per question: rank of the first gold rule / share of gold rules in the top 18
 - **Cost:** about 0.3 s per question, mostly the Python cosine over 3,165 vectors.
   Embedding the whole CR takes about 20 seconds, including model load.
 
+## Evidence depth
+
+A review gives half of its evidence slots to the cards' text and rulings, so the old limit of
+18 items left about 9 rule slots. The same 18 questions, with the default retrieval (D), at more
+rule slots:
+
+| Rule slots | hit | recall | Questions still missing a gold rule |
+|---|---|---|---|
+| 9 | 1.00 | 0.87 | 1, 5, 7, 8, 10 |
+| 12 | 1.00 | 0.89 | 1, 5, 7, 8, 10 |
+| 18 | 1.00 | 0.94 | 1, 8, 10 |
+| 27 | 1.00 | 0.96 | 1, 8 |
+| 36 | 1.00 | 0.96 | 1, 8 |
+
+Recall levels off at about 27 rule slots. Reviews on Claude now use 36 items, about 18 rule
+slots; local models keep 18. On a real Reflection of Kiki-Jiki and Village Bell-Ringer combo,
+36 items added the copy rule (707.2) and enters-the-battlefield triggers (603.6a), which 18 did
+not reach.
+
+A judge that still answers `unsupported` because a rule is missing can name it (`lookup`). Code
+looks that up, adds the new evidence and asks again: up to 5 answers for a player's `/ask`, 2
+in a deck review, which repeats on every draft attempt. The looks stop early when the judge
+settles the question, asks for the same thing twice, or a lookup finds nothing new.
+
 ## Known gap: the long Myojin review question
 
 `DeckReviewer` asks one long, multi-part question per Myojin: when it enters

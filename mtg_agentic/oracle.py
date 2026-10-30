@@ -111,6 +111,7 @@ class OracleStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(self.path)
+        self._land_names: list[str] | None = None
         self._db.executescript(
             """
             CREATE TABLE IF NOT EXISTS cards (
@@ -199,6 +200,14 @@ class OracleStore:
         """Every indexed card, one record per Oracle ID."""
         for (data,) in self._db.execute("SELECT data FROM cards"):
             yield json.loads(data)
+
+    def land_names(self) -> list[str]:
+        """Every land's name, read from the snapshot once and again after it changes."""
+        from .mana import is_land  # mana imports this module.
+
+        if self._land_names is None:
+            self._land_names = [card["name"] for card in self.cards() if is_land(card)]
+        return self._land_names
 
     def _side_metadata(self, table: str) -> dict[str, Any]:
         return {key: json.loads(value) for key, value in self._db.execute(f"SELECT * FROM {table}")}
@@ -420,11 +429,15 @@ class OracleStore:
                 "INSERT OR REPLACE INTO metadata VALUES ('text_index', ?)", (json.dumps(count),)
             )
 
-    def text_count(self, phrase: str) -> int:
-        """How many cards contain `phrase` in their name, type line or Oracle text."""
+    def text_count(self, phrase: str, *, column: str | None = None) -> int:
+        """How many cards contain `phrase` in their name, type line or Oracle text, or only in
+        `column` (name, type_line or oracle_text)."""
+        if column not in {None, "name", "type_line", "oracle_text"}:
+            raise ValueError("Unknown text column")
         self._text_index()
+        query = _phrase(phrase) if column is None else f"{column} : {_phrase(phrase)}"
         return self._db.execute(
-            "SELECT count(*) FROM card_text WHERE card_text MATCH ?", (_phrase(phrase),)
+            "SELECT count(*) FROM card_text WHERE card_text MATCH ?", (query,)
         ).fetchone()[0]
 
     def search_text(self, phrase: str, limit: int = 300) -> list[tuple[str, float]]:
@@ -439,6 +452,7 @@ class OracleStore:
         return [(name, score) for name, score in rows]
 
     def _index_card(self, raw: Card) -> bool:
+        self._land_names = None
         if not isinstance(raw, dict) or raw.get("object", "card") != "card":
             raise ValueError("Oracle records must be card objects")
         if raw.get("layout") in {"token", "double_faced_token", "emblem", "art_series"}:

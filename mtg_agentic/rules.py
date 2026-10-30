@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 from . import activity, prompts
-from .cards import name_key
+from .cards import Card, name_key
 from .llm import HTTPJSONModel, JSONModel, request_json
 from .oracle import OracleStore
 from .rules_graph import (
@@ -145,9 +145,36 @@ CITATION_SCHEMA = object_schema(
         },
     }
 )
+def card_document(card: Card) -> str:
+    """A card as rules evidence: each face's name and mana cost, type line with power and
+    toughness, then its rules text, so a judge can see that a back face is a creature."""
+    texts = []
+    for face in card.get("card_faces") or [card]:
+        line = face.get("type_line", "")
+        if face.get("power") or face.get("toughness"):
+            line += f" {face.get('power', '')}/{face.get('toughness', '')}"
+        head = " ".join(filter(None, [face.get("name", ""), face.get("mana_cost", "")]))
+        texts.append("\n".join(filter(None, [head, line, face.get("oracle_text", "")])))
+    return "\n//\n".join(texts)
+
+
+# Typography a model may not copy exactly: curly quotes, dashes, the minus sign and spacing.
+_TYPOGRAPHY = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2013": "-", "\u2014": "-",
+    "\u2212": "-", "\u00a0": " ",
+})
+
+
+def _plain(text: str) -> str:
+    """Text for a quote check: the same words in the same order, typography aside."""
+    return " ".join(text.translate(_TYPOGRAPHY).split())
+
+
+# The judge writes its steps first, then the conditions the question left open, its verdict,
+# and last a direct answer to the question. `lookup` names a rule the evidence lacked, for
+# another look; on the last pass it names the step still not established, which is shown.
 INTERACTION_SCHEMA = object_schema(
     {
-        "status": {"type": "string", "enum": ["supported", "contradicted", "unsupported"]},
         "claims": {
             "type": "array",
             "maxItems": 12,
@@ -163,8 +190,22 @@ INTERACTION_SCHEMA = object_schema(
                 }
             ),
         },
+        "conditions": {
+            "type": "array", "maxItems": 6,
+            "items": {"type": "string", "minLength": 1, "maxLength": 200},
+        },
+        "status": {"type": "string", "enum": ["supported", "contradicted", "unsupported"]},
+        "lookup": {"type": "string", "minLength": 0, "maxLength": 200},
+        "answer": {"type": "string", "minLength": 1, "maxLength": 1200},
     }
 )
+# Passes a judge gets at a question it cannot settle: the first answer, then one more for each
+# missing rule it names. A player's /ask gets more; a deck review repeats on every draft attempt.
+ASK_PASSES = 5
+REVIEW_PASSES = 2
+# Evidence items per rules question: half for the cards' text and rulings, half for rules.
+# 18 leaves 9 rule slots, which found 87% of the benchmark's correct rules; 36 found 96%.
+EVIDENCE = 18
 
 
 RRF_K = 60
@@ -483,7 +524,7 @@ class RulesStore:
                 {
                     "id": f"Oracle {card['name']}",
                     "kind": "oracle",
-                    "text": card["oracle_text"] or card["type_line"],
+                    "text": card_document(card),
                     "source": "https://scryfall.com/card/" + card["id"],
                     "published": oracle.metadata.get("updated_at", "local snapshot")
                     or "local snapshot",
@@ -530,13 +571,17 @@ class RulesStore:
             synced.append(card["name"])
         return {"cards": synced, "count": len(synced), "synced_at": utc_now()}
 
-    def retrieve(self, cards: list[str], question: str, *, limit: int = 18) -> list[dict[str, str]]:
+    def retrieve(
+        self, cards: list[str], question: str, *, limit: int = 18, card_text: bool = False
+    ) -> list[dict[str, str]]:
         """Card evidence first, then rule anchors for specific terms, then fused rule ranking.
 
         Rules are ranked by reciprocal rank fusion of three signals: embedding cosine, IDF-weighted
         stem overlap, and a personalized PageRank walk over the CR graph that starts from the best
         first-stage rules, the rules defining the question's terms, and the cards' keywords. A
-        multi-part question is also ranked per sentence, and the rankings take turns.
+        multi-part question is also ranked per sentence, and the rankings take turns. With
+        `card_text`, each card face's own rules text is ranked too, after the question, so a
+        short question such as "can these loop?" still reaches the rules its cards rely on.
         """
         if not question.strip() or not 1 <= limit <= 40:
             raise ValueError("Question and retrieval limit (1–40) are required")
@@ -552,16 +597,21 @@ class RulesStore:
         ]
         if missing:
             raise ValueError("Ingest rulings for every interaction card before checking")
+        docs = self._corpus()
+        rules = [d for d in docs if d.kind == "rule"]
+        card_docs = [d for d in docs if d.kind != "rule" and d.card in keys]
         # Multi-part questions also rank rules per sentence, so every part gets evidence.
         texts = [question, *_subquestions(question)]
+        if card_text:
+            texts += [
+                " ".join(face.split()) for d in card_docs if d.kind == "oracle"
+                for face in d.text.split("\n//\n") if face.strip()
+            ]
         vectors = _vectors(
             self.embedder.embed([text + " " + " ".join(cards) for text in texts], query=True),
             len(texts),
             int(self._meta("dimension") or 0),
         )
-        docs = self._corpus()
-        rules = [d for d in docs if d.kind == "rule"]
-        card_docs = [d for d in docs if d.kind != "rule" and d.card in keys]
         signals = [self._signals(rules, text, vector) for text, vector in zip(texts, vectors)]
         _, dense_ranks, lexical_ranks = signals[0]
         first = _rrf(dense_ranks, lexical_ranks)
@@ -596,6 +646,13 @@ class RulesStore:
             (t for t in graph.terms_in(question) if not graph.is_hub(t)),
             key=lambda t: (-graph.idf(t), t),
         )
+        if card_text:
+            # Then the terms the cards' own text names, such as haste or untap, which a short
+            # question like "can these loop?" leaves out.
+            specific += sorted(
+                (t for t in graph.terms_in(oracle_text) if not graph.is_hub(t) and t not in specific),
+                key=lambda t: (-graph.idf(t), t),
+            )
         anchors: list[_Doc] = []
         for term in specific:
             chosen = {d.id for d in anchors}
@@ -629,25 +686,76 @@ class RulesStore:
         return sum(self._idf(t) for t in words & doc.stems) / total
 
     def check_interaction(
-        self, cards: list[str], question: str, model: JSONModel
+        self, cards: list[str], question: str, model: JSONModel, *, limit: int = EVIDENCE,
+        passes: int = ASK_PASSES,
     ) -> dict[str, Any]:
-        messages, evidence = self.interaction_request(cards, question)
+        """A player's own question. It is often short, so the cards' text is ranked too. While
+        the judge cannot settle it, each missing rule it names is looked up and it answers
+        again, for at most `passes` answers."""
+        messages, evidence = self.interaction_request(cards, question, limit=limit, card_text=True)
         answer = request_json(model, messages, INTERACTION_SCHEMA)
+        looks: list[dict[str, Any]] = []
+        while len(looks) < passes - 1:
+            final = len(looks) == passes - 2
+            nxt = self.next_look(cards, question, evidence, answer, looks, limit=limit, final=final)
+            if nxt is None:
+                break
+            messages, evidence, look = nxt
+            looks.append(look)
+            answer = request_json(model, messages, INTERACTION_SCHEMA)
+        if looks:
+            answer = {**answer, "looks": looks}
         return self.judge_interaction(cards, question, evidence, answer)
 
     def interaction_request(
-        self, cards: list[str], question: str
+        self, cards: list[str], question: str, *, limit: int = EVIDENCE, card_text: bool = False
     ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         """Retrieve evidence and build the judge's messages. SQLite and the embedder stay on
         the calling thread, so only the model call itself can run in parallel."""
         activity.tool("rules lookup", " + ".join(n.split(",")[0] for n in cards))
-        evidence = self.retrieve(cards, question)
+        evidence = self.retrieve(cards, question, limit=limit, card_text=card_text)
         payload = {"cards": cards, "question": question, "evidence": evidence}
         messages = [
             {"role": "system", "content": prompts.INTERACTION},
             {"role": "user", "content": json.dumps(payload)},
         ]
         return messages, evidence
+
+    def next_look(
+        self,
+        cards: list[str],
+        question: str,
+        evidence: list[dict[str, str]],
+        answer: dict[str, Any],
+        looks: list[dict[str, Any]],
+        *,
+        limit: int = EVIDENCE,
+        final: bool = False,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]], dict[str, Any]] | None:
+        """Another try for an unsupported answer that named a missing rule: look it up, add
+        what is new to the evidence, and ask again; `final` marks the last try. None when the
+        answer is settled, names nothing, repeats an earlier lookup or finds nothing new."""
+        lookup = " ".join(str(answer.get("lookup") or "").split())
+        if answer.get("status") != "unsupported" or not lookup:
+            return None
+        if lookup.casefold() in {look["lookup"].casefold() for look in looks}:
+            return None
+        activity.tool("rules lookup", f"look {len(looks) + 2}: {lookup}")
+        seen = {e["id"] for e in evidence}
+        added = [e for e in self.retrieve(cards, lookup, limit=limit) if e["id"] not in seen]
+        if not added:
+            return None
+        look = {"lookup": lookup, "added": [e["id"] for e in added]}
+        evidence = [*evidence, *added]
+        payload = {
+            "cards": cards, "question": question, "evidence": evidence,
+            "looks": [*looks, look], "final": final,
+        }
+        messages = [
+            {"role": "system", "content": prompts.INTERACTION},
+            {"role": "user", "content": json.dumps(payload)},
+        ]
+        return messages, evidence, look
 
     def judge_interaction(
         self,
@@ -656,24 +764,45 @@ class RulesStore:
         evidence: list[dict[str, str]],
         answer: dict[str, Any],
     ) -> dict[str, Any]:
-        """Accept an answer only if every claim cites retrieved rules or rulings verbatim."""
+        """Accept an answer only if every claim cites retrieved rules or rulings word for word
+        (curly or straight quotes, dashes and spacing aside). An unsupported answer keeps the
+        claims that pass those checks apart, as `established`, and names in `missing` the step
+        the judge could not establish. Claims that fail are kept in `rejected`, with why."""
         by_id = {e["id"]: e for e in evidence}
         problems = []
         if answer["status"] != "unsupported" and not answer["claims"]:
             problems.append("A rules conclusion requires cited claims.")
+        checked, rejected = [], []
         for claim in answer["claims"]:
+            found = []
             has_rule = False
             for citation in claim["citations"]:
                 doc = by_id.get(citation["id"])
-                if doc is None or citation["quote"] not in doc["text"]:
-                    problems.append("Unknown citation or non-verbatim evidence quote.")
+                if doc is None:
+                    found.append(f"{citation['id']} is not in the evidence")
+                elif _plain(citation["quote"]) not in _plain(doc["text"]):
+                    found.append(f"The quote from {citation['id']} is not in its text")
                 elif doc["kind"] in {"rule", "ruling"}:
                     has_rule = True
-            if not has_rule:
-                problems.append("Each claim requires a CR rule or publisher ruling.")
+            if not has_rule and not found:  # Its quotes check out, but none is a rule.
+                found.append("Each claim requires a CR rule or publisher ruling")
+            problems += found
+            if found:
+                rejected.append({**claim, "problems": found})
+            else:
+                checked.append(claim)
         if answer["status"] == "unsupported" or problems:
-            # Never echo unsupported model claims back as facts or repair instructions.
-            answer = {"status": "unsupported", "claims": []}
+            # Never return unproven claims as the answer or as repair instructions; the steps
+            # whose citations check out are only shown as how far the judge got.
+            missing = " ".join(str(answer.get("lookup") or "").split())
+            answer = {
+                "status": "unsupported", "claims": [], "established": checked,
+                "conditions": answer.get("conditions", []), "answer": answer.get("answer", ""),
+                **({"missing": missing} if missing else {}),
+                **({"looks": answer["looks"]} if "looks" in answer else {}),
+            }
+        if rejected:
+            answer = {**answer, "rejected": rejected}
         return {
             **answer,
             "cards": cards,
@@ -686,6 +815,7 @@ class RulesStore:
 
 
 def check_interaction(
-    cards: list[str], question: str, *, rules: RulesStore, model: JSONModel
+    cards: list[str], question: str, *, rules: RulesStore, model: JSONModel,
+    limit: int = EVIDENCE,
 ) -> dict[str, Any]:
-    return rules.check_interaction(cards, question, model)
+    return rules.check_interaction(cards, question, model, limit=limit)

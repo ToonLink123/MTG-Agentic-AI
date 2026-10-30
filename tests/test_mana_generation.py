@@ -227,3 +227,58 @@ class ManaGenerationTests(unittest.TestCase):
         report = validate_mana_base({"Forest": 8, "War Room": 1}, "Green Leader", self.store)
         self.assertFalse(report["valid"])
         self.assertEqual(report["source_counts"], {"G": 8, "C": 1})
+
+    def test_multicolor_takes_fast_popular_nonbasics_first_and_basics_last(self):
+        duals = [
+            card(f"Simic Dual {n}", colors="UG", types="Land", text="{T}: Add {G} or {U}.",
+                 edhrec_rank=100 + n)
+            for n in range(20)
+        ]
+        unpopular = card("Obscure Dual", colors="UG", types="Land",
+                         text="{T}: Add {G} or {U}.", edhrec_rank=5000)
+        self.store.import_cards([*self.cards, *duals, unpopular])
+        result = generate_mana_base(
+            {"Green Pips": 1, "Blue Pips": 1}, self.spec("Simic Leader", "UG"), self.store
+        )
+        self.assertTrue(result["valid"], result["errors"])
+        cards = result["cards"]
+        self.assertTrue({d["name"] for d in duals} <= cards.keys())
+        self.assertTrue({"Tropical Island", "Breeding Pool", "Misty Rainforest",
+                         "Command Tower"} <= cards.keys())
+        # Always tapped, outside EDHREC's most-played lands, or a fetch for a blue-white type.
+        self.assertFalse({"Simic Guildgate", "Obscure Dual", "Flooded Strand"} & cards.keys())
+        # Basics fill only what good nonbasics and two utility lands leave.
+        self.assertEqual(result["basic_reserve"], 2)
+        self.assertEqual(result["basic_count"], 36 - 24 - result["utility_count"])
+
+    def test_with_little_room_the_more_played_land_wins(self):
+        popular = card("Popular Dual", colors="UG", types="Land", text="{T}: Add {G} or {U}.",
+                       edhrec_rank=50)
+        obscure = card("Middling Dual", colors="UG", types="Land", text="{T}: Add {G} or {U}.",
+                       edhrec_rank=1500)
+        self.store.import_cards([*self.cards, popular, obscure])
+        targets = {"ramp": 10, "draw": 10, "removal": 8, "wipes": 3, "lands": 3}
+        result = generate_mana_base(
+            {"Green Pips": 1, "Blue Pips": 1},
+            self.spec("Simic Leader", "UG", role_targets=targets), self.store,
+        )
+        self.assertEqual(result["cards"], {"Forest": 1, "Island": 1, "Popular Dual": 1})
+
+    def test_each_basic_land_search_keeps_another_basic(self):
+        result = generate_mana_base(
+            {"Green Pips": 1, "Blue Pips": 1, "Cultivate": 1},
+            self.spec("Simic Leader", "UG"), self.store,
+        )
+        self.assertEqual(result["basic_reserve"], 3)
+        self.assertGreaterEqual(result["basic_count"], 3)
+
+    def test_plain_basics_come_before_snow_covered_ones(self):
+        # "Snow-Covered Swamp" sorts before "Swamp", which once decided the tie.
+        leader = card("Black Leader", colors="B", types="Legendary Creature — Human",
+                      mana_cost="{B}")
+        snow = card("Snow-Covered Swamp", colors="B", types="Basic Snow Land — Swamp",
+                    text="({T}: Add {B}.)")
+        self.store.import_cards([*self.cards, leader, snow])
+        result = generate_mana_base({}, self.spec("Black Leader", "B"), self.store)
+        self.assertNotIn("Snow-Covered Swamp", result["cards"])
+        self.assertGreaterEqual(result["cards"]["Swamp"], 32)

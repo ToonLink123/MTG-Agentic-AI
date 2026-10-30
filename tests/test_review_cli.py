@@ -137,6 +137,40 @@ class ReviewCliTests(unittest.TestCase):
         self.assertEqual(result["claims"], [])
         service.ingest_deck.assert_called_once()
 
+    @patch("mtg_agentic.__main__.RulesStore")
+    @patch("mtg_agentic.__main__._make_model")
+    def test_a_question_names_its_cards_in_plain_words(self, model, rules):
+        service = rules.return_value.__enter__.return_value
+        service.check_interaction.return_value = {"status": "supported", "claims": []}
+        code, result = self.run_cli(
+            "check-interaction", "--question", "Can jodah cast spell 3 for free?",
+            "--embedding-backend", "hash", "--provider", "ollama",
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(result["answered_by"]["provider"], "ollama")
+        cards = ["Jodah, Archmage Eternal", "Spell 3"]
+        service.ingest_deck.assert_called_once()
+        self.assertEqual(service.ingest_deck.call_args.args[0], cards)
+        self.assertEqual(service.check_interaction.call_args.args[0], cards)
+
+    @patch("mtg_agentic.__main__.ScryfallClient")
+    @patch("mtg_agentic.__main__.RulesStore")
+    @patch("mtg_agentic.__main__._make_model")
+    def test_a_name_no_card_matches_is_refused_before_any_model_call(self, model, rules, scryfall):
+        from mtg_agentic.scryfall import CardNotFound
+
+        client = scryfall.return_value.__enter__.return_value
+        client.get_card.side_effect = CardNotFound("No card", status=404)
+        code, result = self.run_cli(
+            "check-interaction", "No Such Card Anywhere", "--question", "Does it work?",
+            "--embedding-backend", "hash",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("[[No Such Card Anywhere]]", result["errors"][0]["detail"])
+        # Like a commander: Scryfall's exact-then-fuzzy lookup is the last resort.
+        client.get_card.assert_called_once_with("No Such Card Anywhere")
+        rules.return_value.__enter__.return_value.check_interaction.assert_not_called()
+
     def test_empty_history_is_read_only_and_does_not_claim_stability(self):
         code, result = self.run_cli("evaluation-history", "--runs-dir", str(self.path / "runs"))
         self.assertEqual(code, 0)

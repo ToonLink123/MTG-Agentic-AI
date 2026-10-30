@@ -33,7 +33,9 @@ if HAS_TEXTUAL:
         mana,
         parse_question,
         render_deck,
+        render_interaction,
         render_map,
+        render_review,
         render_spec,
         run_cli,
     )
@@ -118,6 +120,15 @@ class TuiHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             settings.choose_review("maybe")
 
+    def test_pool_accepts_only_its_modes(self):
+        settings = Settings()
+        self.assertEqual(settings.pool, "mixed")
+        settings.choose_pool("relevant")
+        self.assertEqual(settings.pool, "relevant")
+        with self.assertRaises(ValueError):
+            settings.choose_pool("random")
+        self.assertEqual(settings.pool, "relevant")
+
     def test_startup_warns_when_this_python_cannot_embed_rules_questions(self):
         from mtg_agentic.tui import embedding_problem
 
@@ -163,6 +174,49 @@ class TuiHelperTests(unittest.TestCase):
         self.assertRegex(text, r'✓ "Myojin" +Sol Ring')
         self.assertRegex(text, r'✗ "removal" +no card in the deck serves it')
         self.assertIn("deck-wide: low power", text)
+
+    def test_an_answer_lists_its_rules_first_then_answers_the_question(self):
+        result = {
+            "status": "unsupported", "claims": [], "question": "Can these loop?",
+            "cards": ["Reflection", "Bell-Ringer"],
+            "established": [
+                {"claim": "The token copy has the enters ability.", "citations": [
+                    {"id": "Ruling Reflection 1", "quote": "Any enters-the-battlefield abilities"}]},
+                {"claim": "It untaps.", "citations": [
+                    {"id": "Ruling Reflection 1", "quote": "Any enters-the-battlefield abilities"},
+                    {"id": "CR 701.26b", "quote": "To untap a permanent, rotate it back"}]},
+            ],
+            "answer": "Only with mana each time; the mana is not established.",
+            "conditions": ["Reflection has been under your control since your turn began"],
+            "missing": "mana from the two creatures",
+            "rejected": [{"claim": "x", "citations": [],
+                          "problems": ["The quote from CR 1.1 is not in its text"]}],
+            "answered_by": {"provider": "claude", "model": "claude-haiku-5-5", "effort": "high"},
+        }
+        text = plain(render_interaction(result))
+        self.assertIn("Established so far", text)
+        # Each source once, numbered, with what was quoted from it; the steps' prose stays in
+        # the saved file, and the direct answer comes after the rules.
+        self.assertEqual(text.count("Ruling Reflection 1"), 1)
+        self.assertIn("2. CR 701.26b", text)
+        self.assertNotIn("The token copy has the enters ability.", text)
+        self.assertLess(text.index("CR 701.26b"), text.index("Answer"))
+        self.assertIn("Only with mana each time", text)
+        self.assertIn("Provided: Reflection has been under your control", text)
+        self.assertIn("Not established: mana from the two creatures", text)
+        self.assertIn("Left out: The quote from CR 1.1 is not in its text.", text)
+        self.assertIn("Answered by claude-haiku-5-5 (high)", text)
+
+    def test_an_unverified_interaction_is_a_warning_not_a_failure(self):
+        warning = {"warning": "interaction_unverified", "cards": ["Reflection", "Bell-Ringer"],
+                   "question": "Loop?", "detail": "not verified"}
+        review = {"status": "passed", "errors": [], "warnings": [warning],
+                  "interactions": [{"status": "unsupported"}]}
+        text = plain(render_review(review))
+        self.assertIn("✓ Review passed", text)
+        self.assertIn("Unverified: Reflection + Bell-Ringer", text)
+        text = plain(render_deck({**DECK, "review": review}, lambda name: None))
+        self.assertIn("Unverified: Reflection + Bell-Ringer", text)
 
     def test_mana_and_identity_read_in_wubrg_order_with_hybrid_symbols_grouped(self):
         self.assertEqual(mana("{W}{U}{B/P}{R}{G}").plain, "WU(B/P)RG")
@@ -239,6 +293,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.commander, JODAH["name"])
             await self.send(app, pilot, "/review off")
             await self.send(app, pilot, "/mode unrestricted")
+            await self.send(app, pilot, "/pool popular")
             await self.send(app, pilot, "/model ollama qwen3:8b")
             await self.send(app, pilot, "Bracket 3 Myojin tribal")
         interview, intake, discover, engine, draft = cli.calls[1:]
@@ -251,6 +306,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unrestricted", intake)
         self.assertEqual((interview[-4:], intake[-4:], engine[-4:]), (model, model, model))
         self.assertEqual(Path(discover[2]).name, "01-spec.json")
+        self.assertEqual(discover[3:5], ["--pool-mode", "popular"])
         self.assertEqual((engine[0], Path(engine[2]).name), ("engine-map", "01-pool.json"))
         self.assertEqual(Path(draft[2]).name, "01-pool.json")
         self.assertEqual(json.loads((app.session / "01-pool.json").read_text(encoding="utf-8")), MAPPED)
@@ -259,6 +315,24 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([s["name"] for s in app.last.steps], DRAFT_STEPS)
         self.assertEqual([s["state"] for s in app.last.steps], ["done"] * 4 + ["warn"])
         self.assertFalse(app.busy)
+
+    async def test_ask_needs_no_brackets_and_passes_the_commander_for_short_names(self):
+        answer = {"status": "supported", "claims": [], "cards": [JODAH["name"]],
+                  "question": "Can jodah loop?"}
+        cli = FakeCli({"check-interaction": (0, answer)})
+        app = ChatApp(self.data_dir, Settings(provider="ollama"), runner=cli)
+        async with app.run_test() as pilot:
+            app.commander = JODAH["name"]
+            await self.send(app, pilot, "/ask Can jodah loop?")
+            await self.send(app, pilot, "/ask Does [[Doubling Seasn]] work?")
+        plain_words, bracketed = cli.calls
+        self.assertEqual(plain_words[:5], ["check-interaction", "--question", "Can jodah loop?",
+                                           "--commander", JODAH["name"]])
+        self.assertEqual(bracketed[:3], ["check-interaction", "Doubling Seasn", "--question"])
+        # Each answer is kept in the session, evidence and all, for a later look.
+        for name in ("ask-01.json", "ask-02.json"):
+            saved = json.loads((app.session / name).read_text(encoding="utf-8"))
+            self.assertEqual(saved, answer)
 
     async def test_an_error_envelope_stops_the_pipeline_at_that_step(self):
         error = {"valid": False, "errors": [{"error": "llm", "detail": "Ollama is not running"}]}

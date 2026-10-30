@@ -12,11 +12,44 @@ from .brackets import BracketChecker
 from .cards import name_key
 from .llm import JSONModel, concurrency, parallel, request_json
 from .oracle import OracleStore
-from .rules import INTERACTION_SCHEMA, RulesStore
+from .rules import EVIDENCE, INTERACTION_SCHEMA, REVIEW_PASSES, RulesStore
 from .schema import SchemaError
 from .scryfall import ScryfallClient
 
 log = logging.getLogger(__name__)
+# Commander Spellbook's zone letters for where a combo piece starts.
+ZONES = {
+    "B": "on the battlefield", "H": "in your hand", "G": "in your graveyard", "E": "in exile",
+    "L": "in your library", "C": "in the command zone",
+}
+
+
+def combo_question(combo: dict[str, Any]) -> str:
+    """A Commander Spellbook combo as a plain rules question. The raw zone and state fields
+    would only add noise words to the rules lookup and the judge's reading. The steps come
+    first: the lookup also ranks rules for each of the first six sentences."""
+    start = []
+    for use in combo["uses"]:
+        zones = " or ".join(ZONES.get(z, z) for z in use.get("zoneLocations") or [])
+        states = [v.strip() for k, v in use.items() if k.endswith("CardState") and v and v.strip()]
+        start.append(" ".join(filter(None, [
+            use["card"]["name"], zones, f"({'; '.join(states)})" if states else "",
+        ])))
+    prerequisites = " ".join(
+        " ".join(p.split()) for p in combo["prerequisites"] if isinstance(p, str) and p.strip()
+    )
+    return "\n".join(filter(None, [
+        f"Steps: {' '.join(combo['steps'].split())}",
+        f"Prerequisites: {prerequisites}" if prerequisites else "",
+        f"Starting state: {'; '.join(start)}." if start else "",
+        f"Claimed results: {'; '.join(combo['results'])}.",
+        # Rules lookup reads words as rules terms: "reached" finds the Reach keyword, and
+        # "Commander Spellbook" the commander rules, so the wording avoids both.
+        "Does this combo work as described? Check each step against the rules: each "
+        "ability's costs and timing, what each triggered ability does, and whether the steps "
+        "can repeat. Do not assume the starting state is achievable or assign a win turn.",
+    ]))
+
 
 
 class DeckReviewer:
@@ -27,8 +60,13 @@ class DeckReviewer:
         model: JSONModel,
         store: OracleStore,
         client: ScryfallClient,
+        *,
+        evidence: int = EVIDENCE,
+        passes: int = REVIEW_PASSES,
     ):
         self.brackets, self.rules, self.model = brackets, rules, model
+        self.evidence = evidence  # Evidence items per rules question.
+        self.passes = passes  # Answers per question, while the judge names missing rules.
         self.store, self.client = store, client
 
     @property
@@ -78,17 +116,7 @@ class DeckReviewer:
                 )
             )
         for combo in bracket_report["spellbook"]["combos"]:
-            jobs.append(
-                (
-                    combo["cards"],
-                    (
-                        "Does this Commander Spellbook interaction work under these exact prerequisites? "
-                        f"Prerequisites: {combo['prerequisites']}. States: {combo['uses']}. "
-                        f"Steps: {combo['steps']}. Claimed results: {combo['results']}. "
-                        "Do not infer the starting state can be reached or assign a win turn."
-                    ),
-                )
-            )
+            jobs.append((combo["cards"], combo_question(combo)))
         if proliferators and not myojin:
             jobs.append(
                 (
@@ -105,7 +133,7 @@ class DeckReviewer:
         for i, (names, question) in enumerate(jobs, 1):
             short = " + ".join(n.split(",")[0] for n in names)
             log.info("review: rules question %d/%d (%s)", i, len(jobs), short)
-            requests.append(self.rules.interaction_request(names, question))
+            requests.append(self.rules.interaction_request(names, question, limit=self.evidence))
         workers = concurrency(self.model)
         answers: list[dict[str, Any] | None] = []
         if jobs:
@@ -123,6 +151,35 @@ class DeckReviewer:
             task = f"{len(jobs)} rules questions, up to {workers} at a time"
             with activity.agent("judges", self.model, task):
                 answers = parallel([partial(ask, messages) for messages, _ in requests], workers)
+        # Another look for each answer left unsupported by a rule it named as missing, round by
+        # round: the lookups run here, then those questions are asked again at once.
+        looks: list[list[dict[str, Any]]] = [[] for _ in jobs]
+        stopped: set[int] = set()
+        for round_number in range(self.passes - 1):
+            final = round_number == self.passes - 2
+            retries = {}
+            for i, ((names, question), (_, evidence), answer) in enumerate(zip(jobs, requests, answers)):
+                if answer is not None and i not in stopped:
+                    nxt = self.rules.next_look(
+                        names, question, evidence, answer, looks[i], limit=self.evidence, final=final,
+                    )
+                    if nxt is not None:
+                        retries[i] = nxt
+            if not retries:
+                break
+            log.info("review: another look for %d unverified question(s)", len(retries))
+            task = f"another look at {len(retries)} unverified question(s)"
+            with activity.agent("judges", self.model, task):
+                finals = parallel(
+                    [partial(self._ask, messages) for messages, _, _ in retries.values()],
+                    workers,
+                )
+            for (i, (messages, evidence, look)), again in zip(retries.items(), finals):
+                if again is None:
+                    stopped.add(i)  # A malformed answer keeps the last good one, with its evidence.
+                    continue
+                looks[i].append(look)
+                requests[i], answers[i] = (messages, evidence), {**again, "looks": looks[i]}
         interactions = []
         for (names, question), (_, evidence), answer in zip(jobs, requests, answers):
             if answer is None:
@@ -135,7 +192,7 @@ class DeckReviewer:
                 interactions.append(
                     self.rules.judge_interaction(names, question, evidence, answer)
                 )
-        errors = []
+        errors, warnings = [], []
         if bracket_report["verdict"] != "fits":
             errors.append(
                 {
@@ -146,7 +203,7 @@ class DeckReviewer:
                 }
             )
         for result in interactions:
-            if result["status"] != "supported":
+            if result["status"] == "contradicted":
                 errors.append(
                     {
                         "error": "interaction_review",
@@ -154,16 +211,28 @@ class DeckReviewer:
                         "detail": result["status"],
                         "question": result["question"],
                         "claims": result["claims"],
-                        "instruction": "Do not rely on this unsupported/contradicted interaction. "
+                        "instruction": "Do not rely on this contradicted interaction. "
                         "Choose an evidenced plan; never fabricate citations.",
                     }
                 )
+            elif result["status"] == "unsupported":
+                # The judge could not prove it from the retrieved rules; that is not evidence
+                # the interaction fails, so it is reported but does not block the deck.
+                warnings.append({
+                    "warning": "interaction_unverified",
+                    "cards": result["cards"],
+                    "question": result["question"],
+                    "detail": "The rules judge could not verify this from the retrieved rules "
+                              "and rulings; it was not shown to fail.",
+                    **({"missing": result["missing"]} if result.get("missing") else {}),
+                })
         return {
             "status": "passed" if not errors else "needs_revision",
             "bracket": bracket_report,
             "rulings_ingestion": ingestion,
             "interactions": interactions,
             "errors": errors,
+            "warnings": warnings,
         }
 
     def _ask(self, messages: list[dict[str, str]]) -> dict[str, Any] | None:

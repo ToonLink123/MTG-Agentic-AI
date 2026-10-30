@@ -26,7 +26,7 @@ from .lands import generate_mana_base, is_land
 from .llm import JSONModel, request_json
 from .oracle import OracleStore
 from .playability import validate_playability
-from .retrieval import local_search
+from .retrieval import local_search, theme_scores
 from .review import DeckReviewer
 from .schema import SchemaError
 from .scryfall import ScryfallClient
@@ -245,12 +245,15 @@ def draft_deck(pool: CandidatePool, model: JSONModel, client: ScryfallClient, st
         if not errors:
             return last
         if attempt < max_repairs:
+            # An interaction the judge only failed to verify is not a problem; showing it here
+            # would invite the drafter to cut a combo that works.
             review_feedback = {
                 "status": review["status"],
                 "bracket_reasons": review.get("bracket", {}).get("reasons", []),
                 "interactions": [
                     {key: result[key] for key in ("status", "cards", "question", "claims", "errors") if key in result}
                     for result in review.get("interactions", [])
+                    if result.get("status") != "unsupported"
                 ],
             }
             messages = messages[:2] + [{"role": "user", "content": json.dumps({
@@ -261,9 +264,14 @@ def draft_deck(pool: CandidatePool, model: JSONModel, client: ScryfallClient, st
     return last
 
 
-def discover(spec: DeckSpec, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, search: Any = None) -> CandidatePool:
+# Each term's best cards that "relevant" pools score; "mixed" reads the theme search's top 40.
+RELEVANT_PER_TERM = 2000
+
+
+def discover(spec: DeckSpec, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, search: Any = None, pool_mode: str = "mixed") -> CandidatePool:
     """Plan queries, then run them: on `search` (the local BulkSearch) when given, otherwise
-    on the client's live Scryfall search."""
+    on the client's live Scryfall search. `pool_mode` is how the results are ranked:
+    "popular", "relevant" or "mixed" (see build_candidate_pool)."""
     grounded = ground_spec(spec, store)
     plan_error = None
     try:
@@ -272,19 +280,24 @@ def discover(spec: DeckSpec, model: JSONModel, client: ScryfallClient, store: Or
         queries = template_queries(grounded)
         plan_error = exc.errors
     found = local_search(grounded, store)
+    relevance = (
+        theme_scores(grounded, store, per_term=RELEVANT_PER_TERM)[1]
+        if pool_mode == "relevant" else None
+    )
     # The live API pages every 175 results at 2 requests a second, so it keeps the old cap.
     pool = build_candidate_pool(
         grounded, queries, search or client, store, limit=pool_limit, model=model,
         local_search=found, results_per_query=None if search is not None else 500,
+        mode=pool_mode, relevance=relevance,
     )
     if plan_error and pool.diagnostics:
         pool.diagnostics[0]["planner_errors"] = plan_error
     return pool
 
 
-def draft_from_request(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, bracket3_mode: str | None = None, search: Any = None) -> dict[str, Any]:
+def draft_from_request(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, bracket3_mode: str | None = None, search: Any = None, pool_mode: str = "mixed") -> dict[str, Any]:
     spec = intake(request, commander, model, client, store, bracket3_mode=bracket3_mode)
-    pool = discover(spec, model, client, store, pool_limit=pool_limit, search=search)
+    pool = discover(spec, model, client, store, pool_limit=pool_limit, search=search, pool_mode=pool_mode)
     try:
         pool = build_engine_map(pool, model, store, search=search)
     except SchemaError:
@@ -292,7 +305,7 @@ def draft_from_request(request: str, commander: str, model: JSONModel, client: S
     return draft_deck(pool, model, client, store, max_repairs=max_repairs, reviewer=reviewer)
 
 
-def build_deck(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, simulator=None, pods=(), games: int = 10, seed: int = 20261025, bracket3_mode: str | None = None, search: Any = None) -> dict[str, Any]:
+def build_deck(request: str, commander: str, model: JSONModel, client: ScryfallClient, store: OracleStore, *, pool_limit: int = 350, max_repairs: int = 3, reviewer: DeckReviewer | None = None, simulator=None, pods=(), games: int = 10, seed: int = 20261025, bracket3_mode: str | None = None, search: Any = None, pool_mode: str = "mixed") -> dict[str, Any]:
     """A completed build requires safety review and at least ten games per pod."""
     if reviewer is None or simulator is None or not 1 <= len(pods) <= 3:
         raise ValueError("A build requires a safety reviewer, Forge simulator and one to three opponent pods; use draft for an untested list")
@@ -303,7 +316,7 @@ def build_deck(request: str, commander: str, model: JSONModel, client: ScryfallC
     deck = draft_from_request(
         request, commander, model, client, store,
         pool_limit=pool_limit, max_repairs=max_repairs, reviewer=reviewer,
-        bracket3_mode=bracket3_mode, search=search,
+        bracket3_mode=bracket3_mode, search=search, pool_mode=pool_mode,
     )
     report = {
         "status": "blocked_by_gates", "required_games_per_pod": games,

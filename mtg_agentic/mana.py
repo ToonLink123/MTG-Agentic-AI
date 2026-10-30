@@ -94,29 +94,49 @@ def mana_profile(
     }
 
 
-def direct_sources(card: Card, identity: str) -> set[str]:
-    """Do not credit opponent-dependent or colored-input filter abilities."""
+def direct_sources(card: Card, identity: str, *, free: bool = False) -> set[str]:
+    """Do not credit opponent-dependent, conditional, spend-restricted or colored-input filter
+    abilities. `free` also drops mana that costs mana or another permanent to make, such as
+    {1}, {T}: Add one mana of any color."""
     if not is_land(card):
         return set()
     allowed = set(identity) | {"C"}
     types = front(card, "type_line").split()
     sources = {c for c, basic in BASIC_LANDS.items() if c != "C" and basic in types}
     text = front(card, "oracle_text")
-    for clause in re.split(r"[.\n]", text):
-        if not re.search(r"\badd\b", clause, re.I):
+    for ability in text.split("\n"):
+        # A typed dual's whole line is reminder text, "({T}: Add {G} or {U}.)"; inside a line
+        # it explains something else, like a Treasure token's mana.
+        if not ability.startswith("("):
+            ability = re.sub(r"\([^)]*\)", "", ability)
+        # The restriction is its own sentence after the mana: "Add one mana of any color.
+        # Spend this mana only to cast a creature spell" or "Activate only if you control an
+        # artifact."
+        if re.search(r"spend this mana only|activate only if", ability, re.I):
             continue
-        cost, _, output = clause.partition(":")
-        if not output:
-            output, cost = cost, ""
-        if any(s in set("WUBRG") for s in SYMBOL.findall(cost)):
-            continue
-        if re.search(r"(?:could produce|opponent|spend this mana only)", output, re.I):
-            continue
-        if re.search(r"mana of any (?:color|type)", output, re.I):
-            sources.update(set(identity) - {"C"})
-            if "any type" in output.lower():
-                sources.add("C")
-        sources.update(s for s in SYMBOL.findall(output) if s in set("WUBRGC"))
+        for clause in ability.split("."):
+            # "If it has a luck counter on it, instead add one mana of any color."
+            if not re.search(r"\badd\b", clause, re.I) or re.match(r"\s*if\b", clause, re.I):
+                continue
+            cost, _, output = clause.partition(":")
+            if not output:
+                output, cost = cost, ""
+            paid = SYMBOL.findall(cost)
+            if any(set(s.split("/")) & set("WUBRG") for s in paid):
+                continue
+            if free and (
+                any(s not in {"T", "Q", "E"} for s in paid)
+                or re.search(r"\bsacrifice an?\b", cost, re.I)
+            ):
+                continue
+            # "Any color among legendary permanents you control" depends on the board.
+            if re.search(r"(?:could produce|opponent|spend this mana only|\bamong\b)", output, re.I):
+                continue
+            if re.search(r"mana of any (?:color|type)", output, re.I):
+                sources.update(set(identity) - {"C"})
+                if "any type" in output.lower():
+                    sources.add("C")
+            sources.update(s for s in SYMBOL.findall(output) if s in set("WUBRGC"))
     # Legacy records without Oracle production clauses. Never use fetch metadata as production.
     if not text.strip():
         sources.update(card.get("produced_mana") or [])

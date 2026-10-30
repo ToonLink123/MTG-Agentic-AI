@@ -10,6 +10,7 @@ from mtg_agentic.lands import (
     land_sources,
     mana_demand,
 )
+from mtg_agentic.mana import direct_sources
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.pipeline import draft_deck
 from mtg_agentic.schema import DRAFT_ROLES
@@ -240,3 +241,30 @@ class LandTests(unittest.TestCase):
         self.assertIn("Misty Rainforest", result["cards"])
         self.assertEqual(len(model.calls), 1)
         self.assertEqual(client.get_calls, [])
+
+    def test_restricted_conditional_and_borrowed_mana_is_not_fixing(self):
+        expected = {
+            "{T}: Add {C}.\n{T}: Add one mana of any color. Spend this mana only to cast a "
+            "creature spell of the chosen type.": {"C"},
+            "{T}: Add {C}.\n{T}, Pay 1 life: Add one mana of any color. Activate only if you "
+            "control an artifact.": {"C"},
+            "{T}: Add {C}. If this land has a luck counter on it, instead add one mana of any "
+            "color.": {"C"},
+            "{T}: Add one mana of any color among legendary permanents you control.": set(),
+            "{T}: Add {C}.\n{1}, {T}: Create a Treasure token. (It's an artifact with \"{T}, "
+            "Sacrifice this token: Add one mana of any color.\")": {"C"},
+            "{T}: Add {C}.\n{R/W}, {T}: Add {R}{R}, {R}{W}, or {W}{W}.": {"C"},
+        }
+        for text, sources in expected.items():
+            with self.subTest(text=text):
+                self.assertEqual(land_sources(card("Land", types="Land", text=text), "WUBRG"),
+                                 sources)
+
+    def test_free_sources_skip_mana_that_costs_mana_or_a_permanent(self):
+        shores = card("Shores", types="Land",
+                      text="{T}: Add {C}.\n{1}, {T}: Add one mana of any color.")
+        quarry = card("Quarry", types="Land",
+                      text="{T}, Sacrifice a creature: Add one mana of any color.")
+        self.assertEqual(direct_sources(shores, "WU"), {"C", "W", "U"})
+        self.assertEqual(direct_sources(shores, "WU", free=True), {"C"})
+        self.assertEqual(direct_sources(quarry, "WU", free=True), set())

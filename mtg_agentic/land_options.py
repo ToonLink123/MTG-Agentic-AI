@@ -10,7 +10,8 @@ from .oracle import OracleStore
 from .spec import DeckSpec
 from .validator import card_errors
 
-# Names are discovery anchors only. Oracle supplies types, abilities and legality.
+# Names only: Oracle supplies types, abilities and legality. Every land in the snapshot is an
+# option; these premium lands are not utility lands.
 PREFERRED_LANDS = (
     "Tundra", "Underground Sea", "Badlands", "Taiga", "Savannah",
     "Scrubland", "Volcanic Island", "Bayou", "Plateau", "Tropical Island",
@@ -32,11 +33,6 @@ UTILITY_LANDS = (
 )
 
 
-def preferred_lands(store: OracleStore) -> list[Card]:
-    """Never invent a missing card or use hard-coded rules text."""
-    return [card for name in PREFERRED_LANDS if (card := store.get_card(name))]
-
-
 def is_utility_land(card: Card) -> bool:
     """Recognize non-fixing utility, not life payments or a fetch ability."""
     return (
@@ -56,8 +52,10 @@ def is_utility_land(card: Card) -> bool:
 def mana_land_options(
     spec: DeckSpec, store: OracleStore, candidate_names: Iterable[str] = ()
 ) -> dict[str, Card]:
-    """Discover lands independently of spell discovery; rehydrate optional names locally."""
-    names = [*candidate_names, *PREFERRED_LANDS, *UTILITY_LANDS, *spec.must_include]
+    """Every eligible land in the local snapshot, not only the pool's: code picks the lands, so
+    the spell searches never limit them. Optional names are rehydrated locally."""
+    names = [*candidate_names, *PREFERRED_LANDS, *UTILITY_LANDS, *spec.must_include,
+             *store.land_names()]
     for color in dict.fromkeys(spec.color_identity + "C"):
         basic = BASIC_LANDS[color]
         names.extend((basic, "Snow-Covered " + basic))

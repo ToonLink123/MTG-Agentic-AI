@@ -16,7 +16,7 @@ from . import bootstrap
 from .brackets import BracketChecker, SpellbookClient, bracket_rules
 from .bulk_search import BulkSearch
 from .council import MEMBER, ORCHESTRATOR, council_draft
-from .discovery import CandidatePool
+from .discovery import POOL_MODES, CandidatePool
 from .edit import Toolbox, edit_deck
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .engine_map import build_engine_map
@@ -31,11 +31,13 @@ from .forge_runner import ForgeSimulator
 from .interview import MAX_ROUNDS, interview_round
 from .lands import generate_mana_base, is_land
 from .llm import PROVIDERS, LlamaCppClient, LLMError, OllamaClient, OpenAICompatibleClient
+from .mentions import find_cards, lookup, name_index
 from .oracle import DEFAULT_DATA_DIR, OracleStore
 from .pipeline import build_deck, discover, draft_deck, draft_from_request
 from .playability import spec_for_deck, validate_playability
 from .review import DeckReviewer
 from .revision import revise_deck
+from .rules import EVIDENCE as RULES_EVIDENCE
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore
 from .rules_index import DEFAULT_REPO as DEFAULT_RULES_INDEX
 from .rules_index import PrebuiltIndex
@@ -51,6 +53,13 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 POOL_LIMITS = {"claude": 1000}
 DEFAULT_POOL_LIMIT = 350
 POOL_HELP = "Most candidates (up to 1000); default 1000 with claude, 350 otherwise"
+# Evidence items per rules question, half of them rules. Claude's context holds twice the
+# default, which raised gold-rule recall on the retrieval benchmark from 87% to 96%.
+EVIDENCE_LIMITS = {"claude": 36}
+POOL_MODE_HELP = (
+    "How discovery ranks the cards its searches find: popular (EDHREC rank only), relevant "
+    "(fit to the deck only) or mixed (both, weighted; the default)"
+)
 
 
 def _model_options(parser: argparse.ArgumentParser) -> None:
@@ -212,12 +221,38 @@ def _rules_path(args: argparse.Namespace) -> Path:
     return args.data_dir / RULES_INDEXES[args.embedding_backend]
 
 
+def _evidence(args: argparse.Namespace, default: int = RULES_EVIDENCE) -> int:
+    return EVIDENCE_LIMITS.get(args.provider, default)
+
+
+def _question_cards(args: argparse.Namespace, store: OracleStore, client: ScryfallClient) -> list[str]:
+    """The cards a rules question is about: the names given, each found like a commander (so
+    loose spellings and typos work), or else the cards the question names in plain words."""
+    prefer = [args.commander] if args.commander else []
+    if args.deck is not None:
+        deck = _deck_json(args.deck)
+        prefer += [deck["commander"], *deck["cards"]]
+    index = name_index(store)
+    if args.cards:
+        cards = [lookup(name, store, client, prefer=prefer, index=index) for name in args.cards]
+        missing = [name for name, card in zip(args.cards, cards) if card is None]
+        if missing:
+            raise ValueError("No card matches " + ", ".join(f"[[{name}]]" for name in missing))
+        return list(dict.fromkeys(card["name"] for card in cards))
+    found, unsettled = find_cards(args.question, store, prefer=prefer, index=index)
+    if unsettled:
+        raise ValueError("; ".join(
+            f"\"{u['name']}\" could be " + " or ".join(u["options"]) for u in unsettled
+        ) + ". Write the full name, or put it in [[double brackets]].")
+    return found
+
+
 def _reviewer(args, stack, store, client, model):
     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
     rules = stack.enter_context(_rules_store(args))
     rules.download_rules(sources)
     brackets = BracketChecker(store, client, sources, model)
-    return DeckReviewer(brackets, rules, model, store, client)
+    return DeckReviewer(brackets, rules, model, store, client, evidence=_evidence(args))
 
 
 def _setup(args: argparse.Namespace) -> dict[str, Any]:
@@ -414,6 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     discover_cmd.add_argument("--spec", required=True, type=Path)
     discover_cmd.add_argument("--pool-limit", type=int, help=POOL_HELP)
+    discover_cmd.add_argument("--pool-mode", choices=POOL_MODES, default="mixed", help=POOL_MODE_HELP)
     _model_options(discover_cmd)
     map_cmd = commands.add_parser(
         "engine-map", help="Map the pool's resource loop for the brief; prints the mapped pool"
@@ -478,6 +514,7 @@ def main(argv: list[str] | None = None) -> int:
     build_cmd.add_argument("--request", required=True)
     _bracket3_options(build_cmd)
     build_cmd.add_argument("--pool-limit", type=int, help=POOL_HELP)
+    build_cmd.add_argument("--pool-mode", choices=POOL_MODES, default="mixed", help=POOL_MODE_HELP)
     build_cmd.add_argument("--repairs", type=int, choices=range(4), default=3)
     _simulation_options(build_cmd, required=True)
     _embedding_options(build_cmd)
@@ -500,8 +537,13 @@ def main(argv: list[str] | None = None) -> int:
         _model_options(cmd)
         _embedding_options(cmd)
     interaction = commands.add_parser("check-interaction", help="Require rule/ruling citations")
-    interaction.add_argument("cards", nargs="+")
+    interaction.add_argument(
+        "cards", nargs="*",
+        help="Card names, spelled loosely or misspelled; without any, the cards the question names",
+    )
     interaction.add_argument("--question", required=True)
+    interaction.add_argument("--commander", help="Settles a short name such as Jodah")
+    interaction.add_argument("--deck", type=Path, help="A deck whose cards settle short names")
     _model_options(interaction)
     _embedding_options(interaction)
     evaluate = commands.add_parser("evaluate", help="Run all four fixed cases with safety reviews")
@@ -509,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
     evaluate.add_argument("--label", default="")
     evaluate.add_argument("--repairs", type=int, choices=range(4), default=3)
     evaluate.add_argument("--pool-limit", type=int, help=POOL_HELP)
+    evaluate.add_argument("--pool-mode", choices=POOL_MODES, default="mixed", help=POOL_MODE_HELP)
     _model_options(evaluate)
     _embedding_options(evaluate)
     _simulation_options(evaluate)
@@ -526,6 +569,8 @@ def main(argv: list[str] | None = None) -> int:
     tui = commands.add_parser("tui", help="Dark terminal chat: pick a commander, describe a deck")
     tui.add_argument("--provider", choices=PROVIDERS, help="Default: MTG_LLM_PROVIDER or ollama")
     tui.add_argument("--model", help="Default: MTG_LLM_MODEL or the provider's default")
+    tui.add_argument("--pool-mode", choices=POOL_MODES, default="mixed",
+                     help="The starting /pool: " + POOL_MODE_HELP)
     register_forge_commands(commands)
     args = parser.parse_args(argv)
     if getattr(args, "pool_limit", 0) is None:
@@ -540,7 +585,8 @@ def main(argv: list[str] | None = None) -> int:
                 {"error": "input", "detail": 'The TUI needs: python -m pip install -e ".[tui]"'}
             ]}))
             return 2
-        return run_tui(args.data_dir, provider=args.provider, model=args.model)
+        return run_tui(args.data_dir, provider=args.provider, model=args.model,
+                       pool=args.pool_mode)
     if args.command in {"evaluate", "evaluation-history"} and args.runs_dir is None:
         args.runs_dir = args.data_dir / "evaluations"
     if args.command == "revise" and args.runs_dir is None:
@@ -637,11 +683,19 @@ def main(argv: list[str] | None = None) -> int:
                     _emit(result, args.output)
                     return 0 if result["verdict"] == "fits" else 1
                 if args.command == "check-interaction":
+                    canonical = _question_cards(args, store, client)
                     rules = stack.enter_context(_rules_store(args))
                     rules.download_rules(sources)
-                    rules.ingest_deck(args.cards, store, client)
-                    canonical = [store.get_card(n)["name"] for n in args.cards]
-                    result = rules.check_interaction(canonical, args.question, model)
+                    rules.ingest_deck(canonical, store, client)
+                    result = rules.check_interaction(
+                        canonical, args.question, model, limit=_evidence(args)
+                    )
+                    name, effort = getattr(model, "model", None), getattr(model, "effort", None)
+                    result["answered_by"] = {
+                        "provider": args.provider,
+                        "model": name if isinstance(name, str) else None,
+                        **({"effort": effort} if isinstance(effort, str) else {}),
+                    }
                     _emit(result, args.output)
                     return 0 if result["status"] == "supported" else 1
                 reviewer = _reviewer(args, stack, store, client, model)
@@ -724,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
                             max_repairs=args.repairs,
                             reviewer=reviewer,
                             search=search,
+                            pool_mode=args.pool_mode,
                         ),
                         store,
                         args.runs_dir,
@@ -734,6 +789,7 @@ def main(argv: list[str] | None = None) -> int:
                             "embedding": reviewer.rules.metadata.get("embedding"),
                             "context_size": getattr(model, "context_size", None),
                             "pool_limit": args.pool_limit,
+                            "pool_mode": args.pool_mode,
                             "max_repairs": args.repairs,
                             "simulation": sim_config,
                         },
@@ -776,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = edit_deck(
                     deck, pool, model, args.request,
                     tools=Toolbox(store, client, rules, SpellbookClient(sources, store=store),
-                                  BulkSearch(store, client)),
+                                  BulkSearch(store, client), evidence=_evidence(args, 12)),
                     reviewer=reviewer, max_steps=args.steps,
                 )
             _emit(result, args.output)
@@ -867,7 +923,7 @@ def main(argv: list[str] | None = None) -> int:
                     spec = DeckSpec.from_dict(load_json(args.spec.read_text(encoding="utf-8-sig")))
                     result = discover(
                         spec, model, client, store, pool_limit=args.pool_limit,
-                        search=BulkSearch(store, client),
+                        search=BulkSearch(store, client), pool_mode=args.pool_mode,
                     ).to_dict()
                 elif args.command == "draft":
                     pool = CandidatePool.from_dict(
@@ -892,6 +948,7 @@ def main(argv: list[str] | None = None) -> int:
                         seed=args.seed,
                         bracket3_mode=args.bracket3_mode,
                         search=BulkSearch(store, client),
+                        pool_mode=args.pool_mode,
                     )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0

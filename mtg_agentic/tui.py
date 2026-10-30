@@ -38,6 +38,7 @@ from .bootstrap import STEPS as SETUP_STEPS
 from .bootstrap import embedding_problem
 from .bootstrap import status as setup_status
 from .council import MEMBER, ORCHESTRATOR
+from .discovery import POOL_MODES
 from .interview import AGENTS_DECIDE, OWN_ANSWER
 from .llm import PROVIDERS
 from .oracle import OracleStore
@@ -73,7 +74,8 @@ HELP = (
     ("/commander NAME", "Switch commanders"),
     ("/card NAME", "Show a card's Oracle text"),
     ("/search QUERY", "Search Scryfall, e.g. t:equipment id:w"),
-    ("/ask [[A]] [[B]] QUESTION", "Rules question, answered with cited rules and rulings"),
+    ("/ask QUESTION", "Rules question about the cards it names, with cited rules and rulings; "
+                      "[[double brackets]] pick cards exactly and catch misspellings"),
     ("/validate", "Offline legality and playability check of the current deck"),
     ("/bracket", "Bracket assessment of the current deck"),
     ("/review", "Bracket plus rules review of the current deck"),
@@ -90,24 +92,27 @@ HELP = (
                              "open a new one, even while a question waits"),
     ("/model [PROVIDER] [MODEL]", "Show or switch the LLM; a provider alone uses its default"),
     ("/mode [MODE]", "Bracket 3 rules: auto (read from the request), " + ", ".join(BRACKET3_MODES)),
+    ("/pool [MODE]", "How discovery ranks the cards it finds: popular (EDHREC rank only), "
+                     "relevant (fit to the deck only) or mixed (both, weighted)"),
     ("/log", "Full progress log of the last run"),
     ("/setup [refresh]", "Download whatever local data is missing (it runs by itself on a "
                          "first start); refresh downloads fresh copies"),
     ("/stop  /clear  /quit", "Also Esc, Ctrl+L and Ctrl+Q; Tab completes a command"),
 )
 SUGGESTIONS = [
-    "/commander ", "/card ", "/search ", "/ask [[", "/validate", "/bracket", "/review",
+    "/commander ", "/card ", "/search ", "/ask ", "/validate", "/bracket", "/review",
     "/review on", "/review off", "/orchestrate on", "/orchestrate off", "/deck", "/load ",
     "/export", "/draft ", "/new", "/close", "/session", "/setup", "/setup refresh",
     *(f"/model {p}" for p in PROVIDERS),
-    *(f"/mode {m}" for m in ("auto", *BRACKET3_MODES)), "/log", "/stop", "/clear", "/help", "/quit",
+    *(f"/mode {m}" for m in ("auto", *BRACKET3_MODES)), *(f"/pool {m}" for m in POOL_MODES),
+    "/log", "/stop", "/clear", "/help", "/quit",
 ]
 # Commands that only read or change chat state, so they stay available during a run.
 # `/review on|off` is one too; `/review` alone starts a deck review.
 # /new, /session and /close move to other tabs, which is how a second run starts.
 WHILE_BUSY = {
-    "/stop", "/help", "/model", "/mode", "/orchestrate", "/log", "/quit", "/new", "/session",
-    "/close",
+    "/stop", "/help", "/model", "/mode", "/pool", "/orchestrate", "/log", "/quit", "/new",
+    "/session", "/close",
 }
 # Every draft starts with the interview, intake, discovery and the engine map.
 PREPARE_STEPS = ["Interview", "Intake", "Discovery", "Engine map"]
@@ -156,6 +161,7 @@ class Settings:
     mode: str | None = None  # Bracket 3 house rules; None lets intake read them from the request.
     review: bool = True
     orchestrate: bool = False
+    pool: str = "mixed"  # How discovery ranks what it finds; see POOL_MODES.
 
     def model_args(self) -> list[str]:
         return ["--provider", self.provider, *(["--model", self.model] if self.model else [])]
@@ -205,6 +211,11 @@ class Settings:
             raise ValueError(f"Mode is one of: auto, {', '.join(BRACKET3_MODES)}")
         self.mode = None if value == "auto" else value
 
+    def choose_pool(self, value: str) -> None:
+        if value not in POOL_MODES:
+            raise ValueError(f"Pool is one of: {', '.join(POOL_MODES)}")
+        self.pool = value
+
     def choose_review(self, value: str) -> None:
         if value not in {"on", "off"}:
             raise ValueError("Use /review on or off; /review alone reviews the current deck")
@@ -218,13 +229,14 @@ class Settings:
     def describe(self) -> str:
         return (
             f"{self.provider} · {self.model or 'default model'} · "
-            f"review {'on' if self.review else 'off'} · mode {self.mode or 'auto'}"
-            + (" · council" if self.orchestrate else "")
+            f"review {'on' if self.review else 'off'} · mode {self.mode or 'auto'} · "
+            f"pool {self.pool}" + (" · council" if self.orchestrate else "")
         )
 
 
 def parse_question(text: str) -> tuple[list[str], str]:
-    """`[[Card]]` marks each card, Scryfall-bot style; the question keeps the names inline."""
+    """`[[Card]]` marks a card, Scryfall-bot style; the question keeps the names inline. With no
+    brackets, the check-interaction command finds the cards the question names itself."""
     cards = [name.strip() for name in CARD_REF.findall(text) if name.strip()]
     return cards, " ".join(CARD_REF.sub(lambda match: match[1].strip(), text).split())
 
@@ -296,6 +308,16 @@ def problems(errors: list[Any], limit: int = 8) -> Group:
     if len(errors) > limit:
         lines.append(Text(f"  + {len(errors) - limit} more in the saved JSON", MUTED))
     return Group(*lines)
+
+
+def unverified(warnings: list[dict[str, Any]]) -> Group:
+    """Interactions the rules judge could not confirm: shown, but they do not fail a deck."""
+    return Group(*(
+        Text(f"• Unverified: {' + '.join(warning['cards'])}. The rules judge could not confirm "
+             "it from the rules it found; it was not shown to fail."
+             + (f" Missing: {warning['missing']}." if warning.get("missing") else ""), AMBER)
+        for warning in warnings
+    ))
 
 
 def labeled(rows: Iterable[tuple[str, Any]]) -> Table:
@@ -443,7 +465,8 @@ def render_asks(asks: list[dict[str, Any]]) -> Table:
 def render_pool(pool: dict[str, Any]) -> Table:
     roles = Counter(role for card in pool["cards"] for role in card.get("roles", []))
     head = Text.assemble(
-        (f"{len(pool['cards'])} candidates", "bold"), f" from {len(pool['queries'])} queries"
+        (f"{len(pool['cards'])} candidates", "bold"), f" from {len(pool['queries'])} queries",
+        (f", ranked {pool.get('pool_mode', 'mixed')}", MUTED),
     )
     rows = [
         ("Pool", head),
@@ -585,6 +608,8 @@ def render_deck(
     parts += [Text(), DeckColumns(ordered)] if columns else []
     if errors:
         parts += [Text(), problems(errors)]
+    if deck.get("review", {}).get("warnings"):
+        parts += [Text(), unverified(deck["review"]["warnings"])]
     if path is not None:
         hint = "" if columns else " · /deck shows the list"
         parts.append(Text(f"Deck file {shown(path)}{hint}", MUTED))
@@ -676,6 +701,8 @@ def render_review(result: dict[str, Any]) -> Group:
         parts.append(labeled([("Interactions", f"{supported}/{len(interactions)} supported")]))
     if result.get("errors"):
         parts.append(problems(result["errors"]))
+    if result.get("warnings"):
+        parts.append(unverified(result["warnings"]))
     return Group(*parts)
 
 
@@ -684,17 +711,42 @@ def render_interaction(result: dict[str, Any]) -> Group:
     parts: list[Any] = [Text.assemble(
         (f"● {status}", f"bold {SUPPORT.get(status, MUTED)}"), "  ", result.get("question", ""),
     )]
-    for claim in result.get("claims", []):
-        parts.append(Text(f"• {claim['claim']}"))
+    cards = result.get("cards")
+    if cards is not None:
+        parts.append(Text("Cards: " + (", ".join(cards) or "none named; a rules question"), MUTED))
+    # The rules and rulings the answer rests on, each once, then the judge's direct answer.
+    claims = result.get("claims") or result.get("established") or []
+    quotes: dict[str, list[str]] = {}
+    for claim in claims:
         for citation in claim.get("citations", []):
             quote = " ".join(citation.get("quote", "").split())
             quote = quote if len(quote) <= 220 else quote[:217] + "..."
-            cited = Text.assemble("    ", (citation.get("id", ""), BLUE), ("  " + quote, MUTED))
-            parts.append(cited)
-    if status == "unsupported" and not result.get("claims"):
+            if quote not in quotes.setdefault(citation.get("id", ""), []):
+                quotes[citation.get("id", "")].append(quote)
+    if quotes:
+        heading = "Established so far" if status == "unsupported" else "Rules"
+        parts.append(Text(heading, "bold"))
+        for number, (source, cited) in enumerate(quotes.items(), 1):
+            parts.append(Text.assemble(f"{number}. ", (source, BLUE)))
+            parts += [Text(f"   {quote}", MUTED) for quote in cited]
+    elif status == "unsupported":
         parts.append(Text("The retrieved rules and rulings did not support an answer.", MUTED))
+    if result.get("answer"):
+        parts.append(Text.assemble(("Answer  ", "bold"), result["answer"]))
+    if result.get("conditions"):
+        parts.append(Text("Provided: " + "; ".join(result["conditions"]), MUTED))
+    if result.get("missing"):
+        parts.append(Text(f"Not established: {result['missing']}", AMBER))
+    for claim in result.get("rejected") or []:
+        parts.append(Text(f"Left out: {'; '.join(claim['problems'])}.", AMBER))
+    for number, look in enumerate(result.get("looks") or [], 2):
+        parts.append(Text(f"Look {number}: {look['lookup']} (+{len(look['added'])} evidence)", MUTED))
     if result.get("errors"):
         parts.append(problems(result["errors"]))
+    if result.get("answered_by"):
+        by = result["answered_by"]
+        effort = f" ({by['effort']})" if by.get("effort") else ""
+        parts.append(Text(f"Answered by {by.get('model') or by.get('provider')}{effort}", MUTED))
     if result.get("disclaimer"):
         parts.append(Text(result["disclaimer"], MUTED))
     return Group(*parts)
@@ -1433,17 +1485,21 @@ class ChatApp(App[None]):
             self.launch(["Search"], job)
         elif command == "/ask":
             cards, question = parse_question(rest)
-            if not cards or not question:
+            if not question:
                 await self.reply(Text(
-                    "Mark each card in double brackets: /ask Does [[Doubling Season]] "
-                    "double proliferate with [[Atraxa, Praetors' Voice]]?", AMBER,
+                    "Ask about cards in plain words: /ask Can Fable of the Mirror-Breaker loop "
+                    "with Village Bell-Ringer? Put a misspelled name in [[double brackets]].",
+                    AMBER,
                 ))
                 return
             argv = ["check-interaction", *cards, "--question", question]
-            job = self.single([*argv, *self.settings.model_args()], render_interaction,
-                              lambda r: r["status"])
-            self.launch(["Rules check"], job)
-        elif command in {"/model", "/mode", "/orchestrate"} or (command == "/review" and rest):
+            # The session's commander and deck settle short names such as Jodah or Atraxa.
+            if tab.commander:
+                argv += ["--commander", tab.commander]
+            if tab.deck_path is not None:
+                argv += ["--deck", str(tab.deck_path)]
+            self.launch(["Rules check"], self.ask_job(tab, [*argv, *self.settings.model_args()]))
+        elif command in {"/model", "/mode", "/pool", "/orchestrate"} or (command == "/review" and rest):
             await self.change_setting(command, rest)
         elif command in {"/validate", "/bracket", "/review", "/deck"}:
             await self.deck_command(command)
@@ -1673,7 +1729,7 @@ class ChatApp(App[None]):
         ))
 
     async def change_setting(self, command: str, value: str) -> None:
-        """`/model`, `/mode`, `/orchestrate` and `/review on|off`; alone they show the choice.
+        """`/model`, `/mode`, `/pool`, `/orchestrate` and `/review on|off`; alone they show the choice.
         Settings are shared by every tab and apply to the next run started."""
         s = self.settings
         try:
@@ -1681,6 +1737,8 @@ class ChatApp(App[None]):
                 s.choose_model(value.split())
             elif command == "/mode" and value:
                 s.choose_mode(value.lower())
+            elif command == "/pool" and value:
+                s.choose_pool(value.lower())
             elif command == "/orchestrate" and value:
                 s.choose_orchestrate(value.lower())
             elif command == "/review":
@@ -1698,6 +1756,15 @@ class ChatApp(App[None]):
             rows = [
                 ("mode", s.mode or "auto: read from the request"),
                 ("modes", Text(", ".join(("auto", *BRACKET3_MODES)), MUTED)),
+            ]
+        elif command == "/pool":
+            rows = [
+                ("pool", {
+                    "popular": "popular: the most-played cards the searches find (EDHREC rank)",
+                    "relevant": "relevant: the cards that best fit the deck, however popular",
+                    "mixed": "mixed: fit and popularity, weighted together",
+                }[s.pool]),
+                ("modes", Text(", ".join(POOL_MODES), MUTED)),
             ]
         elif command == "/orchestrate":
             lead, members = s.council_roles()
@@ -1772,6 +1839,23 @@ class ChatApp(App[None]):
             if result is not None:
                 turn.finish(0, detail(result))
                 turn.add(render(result))
+
+        return job
+
+    def ask_job(self, tab: Tab, argv: list[str]) -> Callable[[Turn], Awaitable[None]]:
+        """A rules question. The whole answer, with its evidence and every extra look, is saved
+        in the session as ask-01.json, ask-02.json..."""
+        async def job(turn: Turn) -> None:
+            result = await self.step(turn, 0, argv)
+            if result is None:
+                return
+            number = len(list(tab.session.glob("ask-*.json"))) + 1
+            path = tab.save(f"ask-{number:02d}.json", result)
+            turn.finish(0, result["status"])
+            turn.add(render_interaction(result))
+            turn.add(Text(f"Saved as {path.name}", MUTED))
+            tab.note("player", "/ask " + argv[argv.index("--question") + 1])
+            tab.note("assistant", f"Rules answer: {result['status']} ({path.name}).")
 
         return job
 
@@ -1881,7 +1965,8 @@ class ChatApp(App[None]):
         spec_path = tab.save(f"{stem}-spec.json", spec)
         turn.finish(1, f"{''.join(spec['color_identity'])} · Bracket {spec['bracket']}")
         turn.add(render_spec(spec))
-        pool = await self.step(turn, 2, ["discover", "--spec", str(spec_path), *lead])
+        argv = ["discover", "--spec", str(spec_path), "--pool-mode", self.settings.pool, *lead]
+        pool = await self.step(turn, 2, argv)
         if pool is None:
             return None
         pool_path = tab.save(f"{stem}-pool.json", pool)
@@ -2021,10 +2106,13 @@ class ChatApp(App[None]):
         self.chat.remove_children()
 
 
-def run_tui(data_dir: Path, *, provider: str | None = None, model: str | None = None) -> int:
+def run_tui(
+    data_dir: Path, *, provider: str | None = None, model: str | None = None, pool: str = "mixed"
+) -> int:
     settings = Settings(
         provider=provider or os.getenv("MTG_LLM_PROVIDER") or "ollama",
         model=model or os.getenv("MTG_LLM_MODEL") or None,
+        pool=pool,
     )
     ChatApp(data_dir, settings, setup=True).run()
     return 0

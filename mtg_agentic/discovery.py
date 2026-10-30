@@ -15,9 +15,8 @@ from . import activity, prompts
 from .brackets import land_denial_forbidden
 from .cards import Card, name_key, trim_card
 from .engine_map import clean_map
-from .land_options import preferred_lands
 from .llm import JSONModel, request_json
-from .mana import BASIC_LANDS, is_land
+from .mana import is_land
 from .oracle import OracleStore
 from .schema import (
     LOCAL_SEARCH_SCHEMA,
@@ -43,12 +42,14 @@ FIT_FADE = 30  # A card this far down a query's most-played order earns half its
 LOCAL_FIRST = 15  # Theme-search hits that join outright; the rest compete on fit.
 LOCAL_FIT = 4.0  # Fit the best theme-search hit adds; the others in proportion to their score.
 ROLE_FLOOR = 10  # At least this many most-played cards per role query (ramp, draw, removal...).
+# How discovery ranks what its searches found: by EDHREC rank alone, by relevance to the deck
+# alone, or the weighted mix of both.
+POOL_MODES = ("popular", "relevant", "mixed")
 DEFAULT_QUERIES = {
     "ramp": "otag:ramp",
     "draw": "otag:draw",
     "removal": "otag:removal",
     "wipes": "otag:board-wipe",
-    "lands": "t:land",
     "creatures": "t:creature",
     "protection": 't:instant (o:hexproof or o:indestructible or o:"protection from" or o:"phase out" or o:"counter target spell" or (o:exile o:return o:battlefield))',
 }
@@ -182,11 +183,13 @@ class CandidatePool:
     # until one is built).
     local_search: dict[str, Any] = field(default_factory=lambda: {"terms": [], "hits": []})
     engine_map: dict[str, Any] = field(default_factory=dict)
+    mode: str = "mixed"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": 1,
             "spec": self.spec.to_dict(),
+            "pool_mode": self.mode,
             "cards": [candidate.to_dict() for candidate in self.cards],
             "queries": [query.to_dict() for query in self.queries],
             "diagnostics": self.diagnostics,
@@ -237,6 +240,9 @@ class CandidatePool:
             raise ValueError("Invalid discovery diagnostics")
         local = data.get("local_search", {"terms": [], "hits": []})
         validate_json(local, LOCAL_SEARCH_SCHEMA)
+        mode = data.get("pool_mode", "mixed")
+        if mode not in POOL_MODES:
+            raise ValueError(f"Pool mode must be one of: {', '.join(POOL_MODES)}")
         engine = data.get("engine_map") or {}
         if engine:
             # A saved map is re-checked like the cards: only names still in this pool remain.
@@ -244,7 +250,7 @@ class CandidatePool:
             validate_json(engine, map_schema(stored=True))
             nonlands = [c.card["name"] for c in cards if not is_land(c.card)]
             engine = clean_map(engine, nonlands, spec.commander, spec.brief["asks"], notes=False)
-        return cls(spec, cards, queries, diagnostics, local, engine)
+        return cls(spec, cards, queries, diagnostics, local, engine, mode)
 
 
 def eligible(card: Card, spec: DeckSpec) -> bool:
@@ -284,17 +290,27 @@ def build_candidate_pool(
     model: JSONModel | None = None,
     max_query_repairs: int = 4,
     local_search: dict[str, Any] | None = None,
+    mode: str = "mixed",
+    relevance: dict[str, float] | None = None,
 ) -> CandidatePool:
-    """The candidate pool, filled in order: required cards and basics, preferred lands, the
-    theme search's hits, each query's most-played cards (so every role stays covered), then
-    every other result by fit.
+    """The candidate pool of nonlands (lands only when required), filled in order: required
+    cards, the theme search's hits, each query's most-played cards (so every role stays
+    covered), then every other result by fit.
 
     Fit counts the queries that found a card, each weighted by how narrow it is: a card that
     both the Treasure search and the dice search found outranks the next most-played card of
     "t:creature". `results_per_query=None` keeps every result, which the local BulkSearch
-    returns at no cost; the live API pages 175 cards per rate-limited request."""
+    returns at no cost; the live API pages 175 cards per rate-limited request.
+
+    That is the "mixed" `mode`. "popular" ranks the found nonlands by EDHREC rank alone, and
+    "relevant" by relevance alone: the narrowness of every query that found a card plus
+    `relevance`, the theme search's score for every card matching the deck's terms (by name;
+    cards it scores that no query found may join). Both keep each query's floor, taken in
+    their own order."""
     if type(limit) is not int or not 1 <= limit <= POOL_LIMIT:
         raise ValueError(f"Candidate limit must be from 1 to {POOL_LIMIT}")
+    if mode not in POOL_MODES:
+        raise ValueError(f"Pool mode must be one of: {', '.join(POOL_MODES)}")
     if results_per_query is not None and (
         type(results_per_query) is not int or not 1 <= results_per_query <= 100_000
     ):
@@ -393,42 +409,22 @@ def build_candidate_pool(
         key = name_key(card["name"])
         candidates.setdefault(key, Candidate(card, {"support"}))
         required.append(key)
-    # Basic lands must be available without depending on popularity-ranked land results.
-    for color in dict.fromkeys(spec.color_identity + "C"):
-        name = BASIC_LANDS[color]
-        for option in (name, "Snow-Covered " + name):
-            card = store.get_card(option)
-            if card and eligible(card, spec):
-                key = name_key(card["name"])
-                candidates.setdefault(key, Candidate(card)).roles.add("lands")
-                required.append(key)
     required = list(dict.fromkeys(required))
     if len(required) > limit:
-        raise ValueError("Candidate cap is smaller than the required cards and basic land options")
+        raise ValueError("Candidate cap is smaller than the required cards")
     selected = list(required)
     selected_set = set(selected)
-    # Retain premium fixing even when broad EDHREC searches or the model omit it.
-    # Leave room for a complete nonland selection in smaller pools.
-    land_budget = max(0, limit - len(selected) - (99 - spec.role_targets["lands"]))
-    for card in preferred_lands(store):
-        key = name_key(card["name"])
-        if key in selected_set or not eligible(card, spec):
-            continue
-        candidates.setdefault(key, Candidate(card)).roles.add("lands")
-        if land_budget:
-            selected.append(key)
-            selected_set.add(key)
-            land_budget -= 1
     def take(key: str) -> None:
         if key not in selected_set and len(selected) < limit:
             selected.append(key)
             selected_set.add(key)
 
-    # The theme search's best hits join outright; the rest add their relevance to fit below.
+    # The theme search's best hits join outright, unless the pool is ranked by popularity
+    # alone; in "mixed" the rest add their relevance to fit below.
     local_search = local_search or {"terms": [], "hits": []}
     local_fit: dict[str, float] = {}
     top_score = max((hit["score"] for hit in local_search["hits"]), default=0) or 1
-    for hit in local_search["hits"]:
+    for hit in local_search["hits"] if mode != "popular" else []:
         card = store.get_card(hit["name"])
         if card is None or is_land(card) or not eligible(card, spec):
             continue
@@ -438,10 +434,22 @@ def build_candidate_pool(
         if len(local_fit) <= LOCAL_FIRST:
             take(key)
 
-    # Each query's most-played cards first, taking turns, so a broad generic search cannot
-    # crowd out a theme and every role keeps its staples: three times a role's target across
-    # its queries, a few for every other query, within three quarters of the remaining room.
-    found = [(query.role, bucket) for query, bucket in zip(queries, buckets) if bucket]
+    # Lands are the mana base's to pick from the whole snapshot, so a land joins the pool only
+    # when the player requires it; ranking the rest would spend slots the drafters never see.
+    found = [
+        (query.role, [key for key in bucket if not is_land(candidates[key].card)])
+        for query, bucket in zip(queries, buckets)
+    ]
+    found = [(role, bucket) for role, bucket in found if bucket]
+    order, unfound = None, []
+    if mode != "mixed":
+        order, unfound = _pool_order(mode, found, candidates, spec, store, limit, relevance or {})
+        found = [(role, sorted(bucket, key=order)) for role, bucket in found]
+
+    # Each query's first cards, taking turns, so a broad generic search cannot crowd out a
+    # theme and every role keeps its staples: three times a role's target across its queries,
+    # a few for every other query, within three quarters of the remaining room. "First" is
+    # most-played for "mixed" and "popular", most relevant for "relevant".
     per_role = Counter(role for role, _ in found)
     targets = spec.role_targets
 
@@ -460,24 +468,79 @@ def build_candidate_pool(
             if key is not None:
                 take(key)
     floored = len(selected) - before
-    # The rest by fit. Every query that found a card adds its weight (more for a narrower
-    # query), faded by how far down that query's most-played order the card sits, and
-    # theme-search relevance adds to it: a card deep in two theme searches outranks the next
-    # most-played card of one broad search.
-    total = len({key for _, bucket in found for key in bucket})
-    fit: dict[str, float] = dict(local_fit)
-    first: dict[str, int] = {key: index for index, key in enumerate(local_fit)}
-    for _, bucket in found:
-        weight = math.log(1 + total / len(bucket))
-        for position, key in enumerate(bucket):
-            fit[key] = fit.get(key, 0.0) + weight / (1 + position / FIT_FADE)
-            first.setdefault(key, len(first))
+    if order is not None:
+        # Every card in the mode's order, with the theme search's cards that no query found.
+        ranking = sorted({key for _, bucket in found for key in bucket} | set(unfound), key=order)
+    else:
+        # The rest by fit. Every query that found a card adds its weight (more for a narrower
+        # query), faded by how far down that query's most-played order the card sits, and
+        # theme-search relevance adds to it: a card deep in two theme searches outranks the
+        # next most-played card of one broad search.
+        total = len({key for _, bucket in found for key in bucket})
+        fit: dict[str, float] = dict(local_fit)
+        first: dict[str, int] = {key: index for index, key in enumerate(local_fit)}
+        for _, bucket in found:
+            weight = math.log(1 + total / len(bucket))
+            for position, key in enumerate(bucket):
+                fit[key] = fit.get(key, 0.0) + weight / (1 + position / FIT_FADE)
+                first.setdefault(key, len(first))
+        ranking = sorted(fit, key=lambda key: (-fit[key], first[key]))
 
-    for key in sorted(fit, key=lambda key: (-fit[key], first[key])):
+    for key in ranking:
         take(key)
-    log.info("discovery: %d candidates (%d from query floors, %d by fit)",
-             len(selected), floored, len(selected) - before - floored)
+    log.info("discovery: %d candidates (%d from query floors, %d by %s)",
+             len(selected), floored, len(selected) - before - floored,
+             {"mixed": "fit", "popular": "popularity", "relevant": "relevance"}[mode])
     return CandidatePool(
         spec, [candidates[key] for key in selected], normalized_queries, diagnostics,
-        local_search,
+        local_search, mode=mode,
     )
+
+
+def _pool_order(
+    mode: str,
+    found: list[tuple[str, list[str]]],
+    candidates: dict[str, Candidate],
+    spec: DeckSpec,
+    store: OracleStore,
+    limit: int,
+    relevance: dict[str, float],
+) -> tuple[Any, list[str]]:
+    """The sort key for "popular" (EDHREC rank, unranked last) or "relevant" (relevance, with
+    EDHREC rank only to break exact ties), and for "relevant" the keys of the theme search's
+    eligible nonland cards that no query found, which it adds to `candidates`."""
+
+    def popularity(key: str) -> tuple[bool, int, str]:
+        card = candidates[key].card
+        rank = card.get("edhrec_rank")
+        return rank is None, rank or 0, card["name"]
+
+    if mode == "popular":
+        return popularity, []
+    # A query's weight is its narrowness, as in fit but without fit's fade down the
+    # most-played order; the theme search adds up to LOCAL_FIT for its best card.
+    total = len({key for _, bucket in found for key in bucket})
+    score: dict[str, float] = {}
+    for _, bucket in found:
+        weight = math.log(1 + total / len(bucket))
+        for key in bucket:
+            score[key] = score.get(key, 0.0) + weight
+    top = max(relevance.values(), default=0) or 1
+    unfound = []
+    # Only the best-scored few can make the pool; skip looking the rest up.
+    for name in sorted(relevance, key=lambda n: (-relevance[n], n))[:2 * limit]:
+        key = name_key(name)
+        if key not in score:
+            if key in candidates:
+                continue  # A land, or already in: required, or a theme hit taken outright.
+            card = store.get_card(name)
+            if card is None or is_land(card) or not eligible(card, spec):
+                continue
+            candidates[key] = Candidate(card, {"theme"})
+            unfound.append(key)
+        score[key] = score.get(key, 0.0) + LOCAL_FIT * relevance[name] / top
+
+    def relevant(key: str) -> tuple[float, bool, int, str]:
+        return (-score.get(key, 0.0), *popularity(key))
+
+    return relevant, unfound

@@ -46,6 +46,7 @@ class Toolbox:
     spellbook: SpellbookClient | None = None
     # Searches go here when set (the local BulkSearch), else to the client's live search.
     search: Any = None
+    evidence: int = 12  # Evidence items per rules lookup.
 
 
 def _clip(text: str, limit: int) -> str:
@@ -180,7 +181,7 @@ class _Session:
         question = action["query"].strip()
         activity.tool("rules lookup", _clip(question, 80))
         names = [card["name"] for card in map(self.lookup, action["cards"][:6]) if card]
-        evidence = self.tools.rules.retrieve(names, question, limit=12)
+        evidence = self.tools.rules.retrieve(names, question, limit=self.tools.evidence)
         return {"evidence": [
             {"id": e["id"], "kind": e["kind"], "text": _clip(e["text"], 600)} for e in evidence
         ]}

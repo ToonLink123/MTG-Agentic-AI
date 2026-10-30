@@ -10,7 +10,9 @@ from typing import TYPE_CHECKING, Any
 
 from .land_options import is_utility_land, mana_land_options
 from .mana import (
+    BASIC_LANDS,
     MIN_COLOR_SOURCES,
+    SYMBOL,
     direct_sources,
     front,
     is_land,
@@ -34,6 +36,10 @@ __all__ = [
     "allocate_sources", "calculate_land_base", "generate_mana_base",
     "is_land", "land_sources", "mana_demand",
 ]
+
+# Optional nonbasics must be among about the 2,000 most-played cards on EDHREC; below that sit
+# lands like Unknown Shores that a basic beats. Unranked cards (new printings) still qualify.
+POPULAR_LAND_RANK = 2000
 
 
 def allocate_sources(weights: dict[str, float], total: int) -> dict[str, int]:
@@ -65,6 +71,58 @@ def _land_speed(card: dict[str, Any]) -> float:
     if re.search(r"unless|if you", text, re.I):
         return 0.85
     return 0.7
+
+
+def _popularity(card: dict[str, Any]) -> float:
+    """1 for the most-played cards, falling slowly with EDHREC rank: about 0.77 at rank 100,
+    0.49 at 1,000, and 0.25 for an unranked card."""
+    rank = card.get("edhrec_rank")
+    if type(rank) is not int:
+        return 0.25
+    return 1 / (1 + math.log10(1 + rank / 100))
+
+
+def _free_fetch(card: dict[str, Any]) -> bool:
+    """A land search that costs no mana, like a fetch land's {T}, Pay 1 life, Sacrifice."""
+    match = re.search(r"([^\n:]*):[^\n]*search your library", front(card, "oracle_text"), re.I)
+    selectors = search_selectors(card)
+    return bool(
+        match and selectors and all(s["supported"] for s in selectors)
+        and all(s in {"T", "Q", "E"} for s in SYMBOL.findall(match[1]))
+    )
+
+
+def optional_fixer(card: dict[str, Any], identity: str, colors: set[str]) -> bool:
+    """A nonbasic worth a slot over a basic in a multicolor deck: it enters untapped (or
+    usually does), makes two of the deck's colors without spending mana or fetches them, and
+    is played in many decks. A fetch must name only the deck's own land types, so Polluted
+    Delta (Island or Swamp) stays out of a deck without blue."""
+    rank = card.get("edhrec_rank")
+    own_types = {BASIC_LANDS[c] for c in colors}
+    return (
+        copy_limit(card) is not None
+        and _land_speed(card) >= 0.85
+        and not (type(rank) is int and rank > POPULAR_LAND_RANK)
+        and (
+            len(direct_sources(card, identity, free=True) & colors) >= 2
+            or (_free_fetch(card) and all(
+                set(s["types"]) <= own_types for s in search_selectors(card)
+            ))
+        )
+    )
+
+
+class _Remembered:
+    """The store's card lookups, remembered: the fixing passes rebuild source graphs hundreds
+    of times per mana base."""
+
+    def __init__(self, store: OracleStore):
+        self.store, self.cards = store, {}
+
+    def get_card(self, name: str) -> dict[str, Any] | None:
+        if name not in self.cards:
+            self.cards[name] = self.store.get_card(name)
+        return self.cards[name]
 
 
 def calculate_land_base(spells: dict[str, int], spec: DeckSpec, pool: CandidatePool, store: OracleStore, *, game_changers: set[str] | None = None) -> dict[str, Any]:
@@ -116,8 +174,13 @@ def generate_mana_base(
         chosen[card["name"]] += 1
         reasons.setdefault(card["name"], reason)
         changers += int(changer(card))
+    limits = {}  # copy_limit compiles a pattern per name, and the passes ask thousands of times.
+    def limit_of(card):
+        if card["name"] not in limits:
+            limits[card["name"]] = copy_limit(card)
+        return limits[card["name"]]
     def available(card):
-        limit = copy_limit(card)
+        limit = limit_of(card)
         return (
             (limit is None or chosen[card["name"]] < limit)
             and (not changer(card) or changers < changer_limit)
@@ -131,7 +194,10 @@ def generate_mana_base(
         errors.append({"error": "land_base", "detail": "Required lands exceed the land target"})
     if changers > changer_limit:
         errors.append({"error": "land_base", "detail": "Required cards exceed the bracket Game Changer allowance"})
-    basics = sorted((c for c in options.values() if copy_limit(c) is None), key=lambda c: c["name"])
+    def plain_first(card):
+        # Snow-Covered basics only when something asks for snow.
+        return "Snow" in front(card, "type_line").split(), card["name"]
+    basics = sorted((c for c in options.values() if limit_of(c) is None), key=plain_first)
     # Land tutors search types, not colors. Pin real targets before filling slots,
     # including for an off-color type that is available on an on-color dual land.
     searches = [
@@ -166,7 +232,7 @@ def generate_mana_base(
                 for n, s in missing
             )
             colors = direct_sources(card, spec.color_identity) & set(weights)
-            return (-coverage, -len(colors) * _land_speed(card), card["name"])
+            return (-coverage, -len(colors) * _land_speed(card), *plain_first(card))
         add(min(targets_available, key=target_score), "land_search_target")
     # Seed real targets before evaluating fetches. A hypothetical Forest is never fixing.
     for color in weights:
@@ -176,29 +242,63 @@ def generate_mana_base(
             basic = next((c for c in basics if available(c) and color in direct_sources(c, spec.color_identity)), None)
             if basic:
                 add(basic, "basic")
-    while sum(chosen.values()) < slots:
-        counts = source_graph(chosen, spec.color_identity, store)["source_counts"]
+    # Nonbasics first, basics last. A multicolor deck keeps one basic per color it casts, plus
+    # one for each card that searches for a basic, so fetches and Cultivate still find them;
+    # every other slot goes to fast fixing lands while good ones remain.
+    colors = set(profile["colors"])
+    cards = _Remembered(store)
+    basic_searches = sum(
+        any(selector["basic"] for selector in search_selectors(card))
+        for name in dict.fromkeys([*spells, spec.commander, *chosen])
+        if (card := cards.get_card(name))
+    )
+    reserve = min(slots // 2, len(colors) + basic_searches) if strategy == "multicolor" else 0
+    fixers = (
+        [c for c in options.values() if optional_fixer(c, spec.color_identity, colors)]
+        if strategy == "multicolor" else []
+    )
+    def room():
+        basic_count = sum(q for n, q in chosen.items() if limit_of(options[n]) is None)
+        return sum(chosen.values()) + max(0, reserve - basic_count) < slots
+    # Only a fetch or a land with a basic land type can change another land's sources; any
+    # other land just adds its own, which saves rebuilding the source graph for each one.
+    plain = {
+        c["name"]: direct_sources(c, spec.color_identity) for c in fixers
+        if not search_selectors(c)
+        and not set(front(c, "type_line").split()) & set(BASIC_LANDS.values())
+    }
+    def potential(card, counts):
+        """The colors `card` would make in the deck and the deck's source counts with it, or
+        (None, None) when adding it leaves a land search without a target."""
+        if card["name"] in plain:
+            made = plain[card["name"]]
+            return made & colors, Counter(counts) + Counter(dict.fromkeys(made, 1))
+        trial = dict(chosen)
+        trial[card["name"]] = 1
+        graph = source_graph(trial, spec.color_identity, cards)
+        if graph["errors"]:
+            return None, None
+        return set(graph["land_sources"].get(card["name"], [])) & colors, graph["source_counts"]
+    # First toward each color's source target: the land that closes the most of what is
+    # missing, scaled by how often it enters untapped and how many decks play it.
+    while sum(chosen.values()) < slots and room():
+        counts = source_graph(chosen, spec.color_identity, cards)["source_counts"]
         ranked = []
-        for card in options.values():
-            if copy_limit(card) is None or not available(card):
+        for card in fixers:
+            if not available(card):
                 continue
-            trial = dict(chosen)
-            trial[card["name"]] = 1
-            graph = source_graph(trial, spec.color_identity, store)
-            if graph["errors"]:
-                continue
-            potential = set(graph["land_sources"].get(card["name"], []))
-            if len(potential & set(weights)) < 2:
+            made, trial_counts = potential(card, counts)
+            if made is None or len(made) < 2:
                 continue
             # Count improvements to existing fetches too: adding a typed dual can
             # improve several sources, not only the new land's own production.
             score = sum(
                 min(
                     max(0, targets[c] - counts.get(c, 0)),
-                    max(0, graph["source_counts"].get(c, 0) - counts.get(c, 0)),
+                    max(0, trial_counts.get(c, 0) - counts.get(c, 0)),
                 ) / targets[c]
                 for c in targets
-            ) * _land_speed(card)
+            ) * _land_speed(card) * _popularity(card)
             if score > 0:
                 ranked.append((-score, card["name"], card))
         if not ranked:
@@ -206,7 +306,7 @@ def generate_mana_base(
         add(min(ranked, key=lambda item: item[:2])[2], "multicolor_fixing")
     # Utility is a separate, bounded choice. Mono decks gain no fixing benefit
     # from rainbow lands, and should not pay life or sacrifice lands for it.
-    while sum(chosen.values()) < slots:
+    while sum(chosen.values()) < slots and room():
         utility_count = sum(q for n, q in chosen.items() if is_utility_land(options[n]))
         if utility_count >= utility_limit:
             break
@@ -220,7 +320,7 @@ def generate_mana_base(
                 continue
             trial = dict(chosen)
             trial[card["name"]] = trial.get(card["name"], 0) + 1
-            graph = source_graph(trial, spec.color_identity, store)
+            graph = source_graph(trial, spec.color_identity, cards)
             if graph["errors"]:
                 continue
             remaining = slots - sum(trial.values())
@@ -236,11 +336,28 @@ def generate_mana_base(
                 for c, floor in floors.items()
             ) > remaining:
                 continue
-            sources = direct_sources(card, spec.color_identity) & set(weights)
-            ranked.append((-len(sources), -_land_speed(card), card["name"], card))
+            # Mana that costs a creature or {1} does not make a utility land a better basic.
+            sources = direct_sources(card, spec.color_identity, free=True) & set(weights)
+            ranked.append((-len(sources), -_land_speed(card) * _popularity(card), card["name"], card))
         if not ranked:
             break
         add(min(ranked, key=lambda item: item[:3])[3], "utility")
+    # Past the targets, every fast fixing land left still beats a basic. The ones making more
+    # of what the deck casts go first, until only the basics the deck keeps remain.
+    share = profile["demand_share"]
+    while sum(chosen.values()) < slots and room():
+        counts = source_graph(chosen, spec.color_identity, cards)["source_counts"]
+        ranked = []
+        for card in fixers:
+            if not available(card):
+                continue
+            made, _ = potential(card, counts)
+            if made is not None and len(made) >= 2:
+                score = sum(share[c] for c in made) * _land_speed(card) * _popularity(card)
+                ranked.append((-score, card["name"], card))
+        if not ranked:
+            break
+        add(min(ranked, key=lambda item: item[:2])[2], "multicolor_fixing")
     while sum(chosen.values()) < slots:
         counts = source_graph(chosen, spec.color_identity, store)["source_counts"]
         usable = [c for c in basics if available(c) and direct_sources(c, spec.color_identity) & set(weights)]
@@ -253,7 +370,7 @@ def generate_mana_base(
             colors = direct_sources(card, spec.color_identity) & set(weights)
             floor_deficit = sum(max(0, MIN_COLOR_SOURCES - counts.get(c, 0)) for c in colors if c in spec.color_identity)
             target_deficit = sum(max(0, targets[c] - counts.get(c, 0)) / targets[c] for c in colors)
-            return (-floor_deficit, -target_deficit, -sum(weights[c] / (counts.get(c, 0) + 1) for c in colors), card["name"])
+            return (-floor_deficit, -target_deficit, -sum(weights[c] / (counts.get(c, 0) + 1) for c in colors), *plain_first(card))
         best = min(usable, key=score)
         add(best, "basic" if copy_limit(best) is None else "source_fallback")
     mana = validate_mana_base({**spells, **chosen}, spec.commander, store)
@@ -263,7 +380,7 @@ def generate_mana_base(
         "cards": dict(chosen), "land_count": sum(chosen.values()), "weighted_pips": dict(weights),
         "mana_pips": profile["mana_pips"], "ability_pips": profile["ability_pips"],
         "demand_share": profile["demand_share"], "pip_profile": profile,
-        "utility_limit": utility_limit,
+        "utility_limit": utility_limit, "basic_reserve": reserve,
         "basic_count": sum(q for n, q in chosen.items() if copy_limit(options[n]) is None),
         "utility_count": sum(q for n, q in chosen.items() if is_utility_land(options[n])),
         "selection_reasons": reasons,
@@ -271,7 +388,7 @@ def generate_mana_base(
         "warnings": [
             "Target-aware source counts are not untapped-source or statistical consistency guarantees.",
             "Fetches sharing a target compete for it; source counts do not model draws or depletion.",
-            "Opponent-dependent and colored-input filter abilities are not credited toward hard floors.",
+            "Opponent-dependent, conditional, spend-restricted and colored-input filter abilities are not credited toward hard floors.",
             "Premium lands use local Oracle data; prices, ownership and budget are not modeled.",
         ] + (["Weighted source targets not all met"] if any(mana["source_counts"].get(c, 0) < n for c, n in targets.items()) else []),
         "errors": errors,

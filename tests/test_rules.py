@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,9 +60,17 @@ class TopicEmbedder:
         return [[1.0, 0.0] if "alternative" in t.lower() else [0.0, 1.0] for t in texts]
 
 
+def unsettled(lookup):
+    return {"status": "unsupported", "claims": [], "lookup": lookup, "conditions": [],
+            "answer": "Not established yet."}
+
+
 def cited(status="supported", id_="CR 701.34a", quote=QUOTE):
     return {
         "status": status,
+        "lookup": "",
+        "conditions": [],
+        "answer": "Yes: proliferate needs a counter already there.",
         "claims": [
             {
                 "claim": "Proliferate requires an existing counter.",
@@ -222,7 +231,8 @@ class RulesTests(unittest.TestCase):
     def test_no_cited_claim_is_not_a_supported_conclusion(self):
         self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
         result = self.rules.check_interaction(
-            [JODAH["name"]], "Counters?", FakeModel({"status": "supported", "claims": []})
+            [JODAH["name"]], "Counters?", FakeModel({"status": "supported", "claims": [], "lookup": "", "conditions": [],
+                                         "answer": "Yes."})
         )
         self.assertEqual(result["status"], "unsupported")
 
@@ -233,12 +243,105 @@ class RulesTests(unittest.TestCase):
         )
         self.assertEqual(result["claims"], [])
 
+    def test_quotes_match_whatever_the_quote_marks_and_failed_steps_say_why(self):
+        self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
+        evidence = [{"id": "CR 1.1", "kind": "rule",
+                     "text": "1.1. A player can\u2019t win \u2014 unless it\u2019s their turn."}]
+        typed = {"claim": "Typed with straight quotes.", "citations": [
+            {"id": "CR 1.1", "quote": "A player can't win - unless it's their turn."}]}
+        invented = {"claim": "Invented.", "citations": [
+            {"id": "CR 1.1", "quote": "A player can always win on any turn at all."}]}
+        answer = {**cited(), "claims": [typed, invented]}
+        result = self.rules.judge_interaction([JODAH["name"]], "Q?", evidence, answer)
+        self.assertEqual(result["established"], [typed])
+        self.assertEqual(result["rejected"],
+                         [{**invented, "problems": ["The quote from CR 1.1 is not in its text"]}])
+        # The judge's direct answer and open conditions are kept even when unsupported.
+        self.assertEqual(result["answer"], cited()["answer"])
+        self.assertEqual(result["conditions"], [])
+
+    def test_card_evidence_shows_every_face_with_its_type_line_and_stats(self):
+        from mtg_agentic.rules import card_document
+
+        fable = {
+            "name": "Fable // Reflection", "type_line": "Enchantment // Enchantment Creature",
+            "card_faces": [
+                {"name": "Fable", "mana_cost": "{2}{R}", "type_line": "Enchantment \u2014 Saga",
+                 "oracle_text": "III \u2014 Transform it.", "power": "", "toughness": ""},
+                {"name": "Reflection", "mana_cost": "", "type_line":
+                 "Enchantment Creature \u2014 Goblin Shaman", "oracle_text": "{1}, {T}: Copy.",
+                 "power": "2", "toughness": "2"},
+            ],
+        }
+        self.assertEqual(card_document(fable), (
+            "Fable {2}{R}\nEnchantment \u2014 Saga\nIII \u2014 Transform it.\n//\n"
+            "Reflection\nEnchantment Creature \u2014 Goblin Shaman 2/2\n{1}, {T}: Copy."
+        ))
+
+    def test_an_unsupported_answer_shows_its_checked_steps_and_what_is_missing(self):
+        self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
+        evidence = self.rules.retrieve([JODAH["name"]], "Counters?")
+        good = cited()["claims"][0]
+        invented = {"claim": "Something else.",
+                    "citations": [{"id": "CR 701.34a", "quote": "An invented quote, not in the rules."}]}
+        answer = {"status": "unsupported", "claims": [good, invented],
+                  "lookup": "mana abilities of creatures"}
+        result = self.rules.judge_interaction([JODAH["name"]], "Counters?", evidence, answer)
+        self.assertEqual(result["status"], "unsupported")
+        self.assertEqual(result["claims"], [])  # Never the answer itself.
+        self.assertEqual(result["established"], [good])
+        self.assertEqual(result["missing"], "mana abilities of creatures")
+        # A "supported" answer with one bad citation is unsupported, keeping its good steps.
+        answer = {"status": "supported", "claims": [good, invented], "lookup": ""}
+        result = self.rules.judge_interaction([JODAH["name"]], "Counters?", evidence, answer)
+        self.assertEqual((result["status"], result["established"]), ("unsupported", [good]))
+        self.assertNotIn("missing", result)
+
     def test_contradicted_cited_interactions_remain_contradicted(self):
         self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
         result = self.rules.check_interaction(
             [JODAH["name"]], "Counters?", FakeModel(cited(status="contradicted"))
         )
         self.assertEqual(result["status"], "contradicted")
+
+    def test_an_unsettled_question_gets_more_looks_until_it_settles(self):
+        self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
+        question = "Does a two-player game begin with only two players?"
+        # Two items: Jodah's text and one rule, so the proliferate rule is missing at first.
+        first = self.rules.retrieve([JODAH["name"]], question, limit=2)
+        self.assertNotIn("CR 701.34a", [e["id"] for e in first])
+        model = FakeModel(unsettled("proliferate"), unsettled("magic rules games"), cited())
+        result = self.rules.check_interaction([JODAH["name"]], question, model, limit=2)
+        self.assertEqual(result["status"], "supported")
+        self.assertEqual(result["looks"], [{"lookup": "proliferate", "added": ["CR 701.34a"]},
+                                           {"lookup": "magic rules games", "added": ["CR 100.1"]}])
+        self.assertIn("CR 701.34a", [e["id"] for e in result["evidence"]])
+        self.assertEqual(len(model.calls), 3)
+
+    def test_looks_stop_at_a_repeat_nothing_new_or_the_last_pass(self):
+        self.rules.ingest_deck([JODAH["name"]], self.store, self.client)
+        question = "Does a two-player game begin with only two players?"
+
+        def ask(*answers, **options):
+            model = FakeModel(*answers)
+            return self.rules.check_interaction([JODAH["name"]], question, model, **options), model
+
+        # Asking for the same thing again ends the looks.
+        result, model = ask(unsettled("proliferate"), unsettled("proliferate"), limit=2)
+        self.assertEqual((len(model.calls), len(result["looks"])), (2, 1))
+        self.assertEqual(result["missing"], "proliferate")
+        # Nothing new to find (18 items already hold every rule), or no lookup named.
+        for answer in (unsettled("two-player game"), unsettled("")):
+            with self.subTest(lookup=answer["lookup"]):
+                result, model = ask(answer)
+                self.assertEqual((result["status"], len(model.calls)), ("unsupported", 1))
+                self.assertNotIn("looks", result)
+        # The last pass is marked final; its lookup is what is still missing, never looked up.
+        result, model = ask(unsettled("proliferate"), unsettled("magic rules games"),
+                            limit=2, passes=2)
+        self.assertEqual(len(model.calls), 2)
+        self.assertTrue(json.loads(model.calls[-1][0][-1]["content"])["final"])
+        self.assertEqual(result["missing"], "magic rules games")
 
     def test_graph_walk_reaches_a_referenced_rule_neither_vectors_nor_words_find(self):
         with RulesStore(self.path / "graph.sqlite3", TopicEmbedder()) as rules:
@@ -247,6 +350,25 @@ class RulesTests(unittest.TestCase):
         # The glossary anchors the defining rule; its "see rule" reference pulls in 601.2f
         # ahead of distractors that tie with it on cosine and stem overlap.
         self.assertEqual(ids, ["CR 118.9", "CR 601.2f", "CR 100.1"])
+
+    def test_card_text_lets_a_short_question_reach_the_rules_its_cards_use(self):
+        self.store.add_verified_card(card(
+            "Alt Spell", types="Instant",
+            text="You may cast this spell for its alternative cost of {0}.",
+        ))
+        with RulesStore(self.path / "graph.sqlite3", TopicEmbedder()) as rules:
+            rules.import_rules(GRAPH_RULES, source="https://example.invalid", fetched_at="today")
+            rules.ingest_deck(["Alt Spell"], self.store, self.client)
+            ids = {
+                card_text: [d["id"] for d in rules.retrieve(
+                    ["Alt Spell"], "Does this work?", limit=4, card_text=card_text
+                )]
+                for card_text in (False, True)
+            }
+        # The question names no rules term; the card's text names "alternative cost".
+        self.assertNotIn("CR 118.9", ids[False])
+        self.assertIn("CR 118.9", ids[True])
+        self.assertEqual(ids[True][0], "Oracle Alt Spell")
 
     def test_old_index_gains_the_graph_on_download_without_reembedding(self):
         with self.rules.db:

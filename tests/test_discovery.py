@@ -8,8 +8,10 @@ from mtg_agentic.discovery import (
     CardQuery,
     build_candidate_pool,
     constrain_query,
+    eligible,
     generate_queries,
 )
+from mtg_agentic.mana import is_land
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.schema import SchemaError
 from tests.fixtures import card
@@ -32,7 +34,8 @@ class DiscoveryTests(unittest.TestCase):
         combined = "\n".join(query.query for query in queries)
         for anchor in ("t:myojin", 'o:"divinity counter"', "otag:proliferate"):
             self.assertIn(anchor, combined)
-        self.assertTrue({"ramp", "draw", "removal", "wipes", "lands"} <= {q.role for q in queries})
+        self.assertTrue({"ramp", "draw", "removal", "wipes"} <= {q.role for q in queries})
+        self.assertNotIn("lands", {q.role for q in queries})  # The mana base reads every land.
         self.assertTrue(all(q.query.endswith("f:commander id<=WUBRG") for q in queries))
         self.assertEqual(len(model.calls), 1)
 
@@ -80,7 +83,7 @@ class DiscoveryTests(unittest.TestCase):
         names = {candidate.card["name"] for candidate in pool.cards}
         self.assertEqual(len(pool.cards), 9)
         self.assertTrue({"Spell 68", "Spell 69"} <= names)
-        self.assertTrue({"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"} <= names)
+        self.assertFalse({"Plains", "Island", "Swamp", "Mountain", "Forest", "Wastes"} & names)
         self.assertEqual(len(client.search_calls), 2)
 
     def test_after_each_querys_top_cards_the_pool_fills_by_fit(self):
@@ -90,13 +93,13 @@ class DiscoveryTests(unittest.TestCase):
         broad = [spell[n] for n in range(10, 50)]
         client = FakeCards([], [narrow_a, narrow_b, broad])
         queries = [CardQuery("theme", "a"), CardQuery("mechanics", "b"), CardQuery("creatures", "c")]
-        pool = build_candidate_pool(make_spec(), queries, client, self.store, limit=13)
+        pool = build_candidate_pool(make_spec(), queries, client, self.store, limit=7)
         names = [c.card["name"] for c in pool.cards]
-        # Six basics, then each query's most-played cards taking turns (the creature role query
-        # goes deeper, toward three times its target), then the best fit: Spell 55 sits deep in
-        # both narrow searches, so it beats the rest of every single search.
-        self.assertEqual(names[6:], ["Spell 0", "Spell 60", "Spell 10", "Spell 11", "Spell 12",
-                                     "Spell 13", "Spell 55"])
+        # Each query's most-played cards taking turns (the creature role query goes deeper,
+        # toward three times its target), then the best fit: Spell 55 sits deep in both narrow
+        # searches, so it beats the rest of every single search.
+        self.assertEqual(names, ["Spell 0", "Spell 60", "Spell 10", "Spell 11", "Spell 12",
+                                 "Spell 13", "Spell 55"])
         self.assertFalse(any(d["result_limit_reached"] for d in pool.diagnostics))
 
     def test_pool_reload_does_not_trust_saved_oracle_or_legality_fields(self):
@@ -121,36 +124,21 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_candidate_pool(make_spec(), [], FakeCards([]), self.store, limit=limit)
 
-    def test_premium_lands_are_reserved_without_model_queries_or_live_results(self):
+    def test_every_pool_slot_goes_to_nonlands_unless_a_land_is_required(self):
         self.store.import_cards([*self.records, *fixing_lands()])
-        client = FakeCards([])
-        pool = build_candidate_pool(make_spec(), [], client, self.store)
-        names = {c.card["name"] for c in pool.cards}
-        self.assertTrue(
-            {"Tropical Island", "Breeding Pool", "Misty Rainforest", "Flooded Strand"} <= names
-        )
-        self.assertEqual(client.search_calls, [])
-        self.assertTrue(all("lands" in c.roles for c in pool.cards))
-        self.assertEqual(CandidatePool.from_dict(pool.to_dict(), self.store).to_dict(), pool.to_dict())
-
-    def test_premium_reservation_does_not_crowd_out_nonlands_in_small_pools(self):
-        self.store.import_cards([*self.records, *fixing_lands()])
-        pool = build_candidate_pool(
-            make_spec(), [CardQuery("theme", "a")], FakeCards(self.records),
-            self.store, limit=70,
-        )
-        self.assertEqual(len(pool.cards), 70)
-        self.assertEqual(sum(c.card["name"].startswith("Spell ") for c in pool.cards), 63)
-
-    def test_local_premium_discovery_filters_off_color_and_excluded_cards(self):
-        leader = card("Green Leader", colors="G", types="Legendary Creature — Elf")
-        self.store.import_cards([*self.records, *fixing_lands(), leader])
-        spec = make_spec(
-            commander=leader["name"], color_identity="G", exclude=["Misty Rainforest"]
-        )
-        pool = build_candidate_pool(spec, [], FakeCards([]), self.store)
-        names = {c.card["name"] for c in pool.cards}
-        self.assertFalse({"Tropical Island", "Breeding Pool", "Misty Rainforest"} & names)
+        spec = make_spec(must_include=["Breeding Pool"])
+        for mode in ("popular", "relevant", "mixed"):
+            with self.subTest(mode=mode):
+                # The search finds every card, lands and basics included.
+                pool = build_candidate_pool(
+                    spec, [CardQuery("theme", "a")], FakeCards([*self.records, *fixing_lands()]),
+                    self.store, limit=71, mode=mode,
+                )
+                lands = [c.card["name"] for c in pool.cards if is_land(c.card)]
+                self.assertEqual(lands, ["Breeding Pool"])
+                self.assertEqual(len(pool.cards), 71)
+                saved = CandidatePool.from_dict(pool.to_dict(), self.store)
+                self.assertEqual(saved.to_dict(), pool.to_dict())
 
     def test_lower_brackets_filter_game_changers(self):
         changer = card("Changer", changer=True)
@@ -176,7 +164,10 @@ class DiscoveryTests(unittest.TestCase):
                     FakeCards(data), self.store,
                 )
                 names = {c.card["name"] for c in pool.cards}
-                self.assertTrue({"Single", "Scorched Ruins"} <= names)
+                self.assertIn("Single", names)
+                # A land never takes a pool slot, but the mana base may still use this one.
+                ruins = self.store.get_card("Scorched Ruins")
+                self.assertTrue(eligible(ruins, make_spec(bracket3_mode=mode)))
                 self.assertEqual("Armageddon" in names, mode == "unrestricted")
                 self.assertEqual("Multi" in names, mode == "unrestricted")
                 self.assertEqual(CandidatePool.from_dict(pool.to_dict(), self.store).spec.bracket3_mode, mode)
@@ -219,3 +210,37 @@ class DiscoveryTests(unittest.TestCase):
         saved = CandidatePool.from_dict(pool.to_dict(), self.store)
         self.assertEqual(saved.diagnostics, pool.diagnostics)
         self.assertEqual(saved.queries, pool.queries)
+
+    def test_popular_and_relevant_pools_each_rank_by_one_signal(self):
+        # Spell 9 is the most played and Spell 0 the least; a theme card no search found.
+        spells = [dict(self.records[7 + n], edhrec_rank=100 - n) for n in range(10)]
+        unsearched = dict(self.records[47], edhrec_rank=99999)  # Spell 40
+        land = card("Popular Land", types="Land", text="{T}: Add {C}.", edhrec_rank=1)
+        self.store.import_cards([*self.records[:7], *spells, *self.records[17:47], unsearched,
+                                 *self.records[48:], land])
+        relevance = {"Spell 40": 50.0, "Spell 2": 25.0}
+        hits = {"terms": [], "hits": [{"name": "Spell 40", "score": 50, "matched": []}]}
+
+        def pool(mode):
+            client = FakeCards([], [[*spells, land]])
+            return build_candidate_pool(
+                make_spec(), [CardQuery("theme", "a")], client, self.store, limit=5,
+                local_search=hits, mode=mode, relevance=relevance,
+            )
+
+        popular = pool("popular")
+        self.assertEqual([c.card["name"] for c in popular.cards],
+                         ["Spell 9", "Spell 8", "Spell 7", "Spell 6", "Spell 5"])
+        # The theme search's hit joins first, though no query found it; floors take the
+        # query's three most relevant (popularity only breaks the tie between cards the search
+        # found equally), then the rest by relevance. A land never comes in.
+        relevant = pool("relevant")
+        names = [c.card["name"] for c in relevant.cards]
+        self.assertEqual(names, ["Spell 40", "Spell 2", "Spell 9", "Spell 8", "Spell 7"])
+        self.assertEqual(relevant.cards[0].roles, {"theme"})
+        saved = CandidatePool.from_dict(relevant.to_dict(), self.store)
+        self.assertEqual((saved.mode, popular.mode), ("relevant", "popular"))
+        # Mixed still lets the theme search's best hits join outright.
+        self.assertIn("Spell 40", [c.card["name"] for c in pool("mixed").cards])
+        with self.assertRaises(ValueError):
+            pool("random")
