@@ -1,10 +1,14 @@
-"""Follow-up edits: the player talks to the orchestrator alone, never the council.
+"""Follow-ups: the player talks to the orchestrator alone, never the council.
 
-The orchestrator works in a bounded loop. Each step it calls one tool (card search, card text,
+The orchestrator works in a bounded loop. Each step it calls tools (card search, card text,
 rulings, rules lookup, a dry-run deck check, a combo search) or finishes with a reply and
 one-for-one nonland swaps. Code applies the swaps exactly, regenerates the lands, validates and
 runs the safety review; any problems go back to the orchestrator, which may use more tools and
-finish again. A question that needs no swaps changes nothing and rebuilds nothing.
+finish again. A question that needs no swaps changes nothing and rebuilds nothing. A model with
+native tool use (Claude) calls the tools directly, several in one turn; any other model names
+one tool per step in its JSON answer.
+
+polish_deck runs the same loop once, unasked, before the player sees a new deck.
 """
 
 from __future__ import annotations
@@ -12,55 +16,46 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-from dataclasses import dataclass
 from typing import Any
 
 from . import activity, prompts
-from .brackets import SpellbookClient
-from .cards import Card, name_key, trim_card
-from .discovery import CandidatePool, constrain_query, eligible
+from .agent import Finish, Tool, ToolError, run_tools, supports_tools
+from .cards import name_key, trim_card
+from .discovery import CandidatePool
 from .lands import is_land
 from .llm import JSONModel, request_json
-from .oracle import OracleStore
 from .pipeline import ask_report, check_cards, game_changer_names, make_lands
 from .review import DeckReviewer
 from .roles import oracle_roles
-from .rules import RulesStore
 from .schema import NAME_SCHEMA, SchemaError, object_schema
-from .scryfall import ScryfallClient, ScryfallError, card_rulings
+from .scryfall import ScryfallError
 from .sources import SourceError
 from .spec import DeckSpec
+from .toolbox import CARDS_INPUT, RULES_INPUT, SEARCH_INPUT, SIMILAR_INPUT, CardTools, Toolbox
 
-TOOLS = ("search_cards", "card", "rulings", "rules", "check_deck", "combos")
+__all__ = ["Toolbox", "edit_deck", "polish_deck"]
+
+TOOLS = ("search_cards", "card", "similar_cards", "rulings", "rules", "check_deck", "combos")
 CARD_REF = re.compile(r"\[\[(.+?)\]\]")
 MAX_SWAPS = 15
+POLISH_SWAPS = 8
+REASON = {"type": "string", "minLength": 1, "maxLength": 300}
+SWAP_SCHEMA = object_schema({"remove": NAME_SCHEMA, "add": NAME_SCHEMA, "reason": REASON})
+SWAPS_INPUT = object_schema({"swaps": {"type": "array", "items": SWAP_SCHEMA, "maxItems": MAX_SWAPS}})
+FINISH_INPUT = object_schema({
+    "reply": {"type": "string", "minLength": 1, "maxLength": 3000},
+    "swaps": {"type": "array", "items": SWAP_SCHEMA, "maxItems": MAX_SWAPS},
+})
 
 
-@dataclass
-class Toolbox:
-    """What the orchestrator's tools reach; a missing one makes its tool report unavailable."""
-
-    store: OracleStore
-    client: ScryfallClient | None = None
-    rules: RulesStore | None = None
-    spellbook: SpellbookClient | None = None
-    # Searches go here when set (the local BulkSearch), else to the client's live search.
-    search: Any = None
-    evidence: int = 12  # Evidence items per rules lookup.
-
-
-def _clip(text: str, limit: int) -> str:
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-class _Session:
+class _Session(CardTools):
     """One follow-up: the deck before it, the cards that may be added, and the tools."""
 
     def __init__(self, deck: dict[str, Any], pool: CandidatePool, tools: Toolbox, reviewer):
-        self.store, self.tools, self.reviewer = tools.store, tools, reviewer
         spec = DeckSpec.from_dict(deck["spec"]) if "spec" in deck else pool.spec
+        super().__init__(tools, spec)
+        self.reviewer = reviewer
         self.pool = dataclasses.replace(pool, spec=spec)
-        self.spec = spec
         records = {name: self.store.get_card(name) for name in deck["cards"]}
         unknown = [name for name, card in records.items() if card is None]
         if unknown:
@@ -68,35 +63,14 @@ class _Session:
         self.nonlands = {n: q for n, q in deck["cards"].items() if not is_land(records[n])}
         self.lands = sorted(n for n in deck["cards"] if is_land(records[n]))
         self.records = records
-        self.addable: dict[str, Card] = {
+        self.addable = {
             c.card["name"]: c.card for c in self.pool.cards
             if not is_land(c.card) and c.card["name"] not in self.nonlands
         }
         self.changers = game_changer_names(self.pool, self.store, reviewer)
 
-    def offer(self, card: Card | None) -> bool:
-        """Make a card addable when it is a legal, eligible nonland not already in the deck."""
-        if card is None or is_land(card) or card["name"] in self.nonlands:
-            return False
-        if not eligible(card, self.spec):
-            return False
-        self.addable.setdefault(card["name"], card)
-        return True
-
-    def lookup(self, name: str) -> Card | None:
-        card = self.store.get_card(name)
-        if card is None and self.tools.client is not None:
-            try:
-                card = self.store.get_card(self.tools.client.get_card(name)["name"])
-            except (ScryfallError, ValueError):
-                card = None
-        return card
-
-    def describe(self, card: Card) -> dict[str, Any]:
-        return {
-            **trim_card(card), "roles": sorted(oracle_roles(card)),
-            "in_deck": card["name"] in self.nonlands, "addable": card["name"] in self.addable,
-        }
+    def taken(self, name: str) -> bool:
+        return name in self.nonlands
 
     def apply(self, swaps: list[dict[str, str]]) -> tuple[dict[str, int], DeckSpec]:
         nonlands = dict(self.nonlands)
@@ -125,6 +99,33 @@ class _Session:
             "playability": playability, "errors": errors, "asks": ask_report(pool, cards),
         }
 
+    def review(self, built: dict[str, Any]) -> dict[str, Any]:
+        """The safety review of a clean build; its problems join the build's."""
+        review = {"status": "not_run", "errors": []}
+        if not built["errors"] and self.reviewer is not None:
+            try:
+                review = self.reviewer.check(
+                    built["cards"], self.spec.commander, self.spec.bracket,
+                    bracket3_mode=self.spec.bracket3_mode, engine_map=self.pool.engine_map or None,
+                )
+            except SchemaError as exc:
+                review = {"status": "needs_revision", "errors": [{
+                    "error": "review_schema", "schema_errors": exc.errors,
+                    "detail": "Safety model returned invalid grounded JSON",
+                }]}
+            built["errors"].extend(review["errors"])
+        built["review"] = review
+        return built
+
+    def unknown_swaps(self, swaps: list[dict[str, str]]) -> list[str]:
+        """Swaps that remove a card not in the deck or add one that is not addable."""
+        return [
+            f"{s['remove']} -> {s['add']}: "
+            + ("remove a nonland in the deck" if s["remove"] not in self.nonlands
+               else "add a card a search, card lookup or the pool made addable")
+            for s in swaps if s["remove"] not in self.nonlands or s["add"] not in self.addable
+        ]
+
     def run(self, action: dict[str, Any]) -> dict[str, Any]:
         tool = action["tool"]
         try:
@@ -133,58 +134,21 @@ class _Session:
             return {"error": str(exc)}
 
     def _tool_search_cards(self, action: dict[str, Any]) -> dict[str, Any]:
-        searcher = self.tools.search or self.tools.client
-        if searcher is None:
-            return {"error": "Card search is unavailable here."}
-        query = action["query"].strip()
-        activity.tool("card search", query)
-        scoped = constrain_query(query, self.spec.color_identity)
-        found = searcher.search_cards(scoped, max_results=20, order="edhrec")
-        rows = []
-        for result in found:
-            card = self.store.get_card(result["name"])
-            self.offer(card)
-            rows.append(
-                {**self.describe(card), "oracle_text": _clip(card["oracle_text"], 400)}
-                if card
-                else {"name": result["name"], "addable": False, "note": "not in local card data"}
-            )
-        return {"query": scoped, "results": rows}
+        return self.search_cards(action["query"])
 
     def _tool_card(self, action: dict[str, Any]) -> dict[str, Any]:
-        rows = []
-        for name in action["cards"][:10]:
-            activity.tool("card", name)
-            card = self.lookup(name)
-            self.offer(card)
-            rows.append(self.describe(card) if card else {"name": name, "error": "No such card"})
-        return {"cards": rows}
+        return self.card(action["cards"])
+
+    def _tool_similar_cards(self, action: dict[str, Any]) -> dict[str, Any]:
+        if not action["cards"]:
+            return {"error": "Name the card to find similar cards for in cards."}
+        return self.similar_cards(action["cards"][0])
 
     def _tool_rulings(self, action: dict[str, Any]) -> dict[str, Any]:
-        if self.tools.client is None and not self.store.rulings_ready:
-            return {"error": "Rulings are unavailable here."}
-        rows = []
-        for name in action["cards"][:5]:
-            activity.tool("rulings", name)
-            card = self.lookup(name)
-            if card is None:
-                rows.append({"name": name, "error": "No such card"})
-                continue
-            rulings = card_rulings(self.store, self.tools.client, card)
-            texts = [_clip(r["comment"] or "", 500) for r in rulings[:12]]
-            rows.append({"name": card["name"], "rulings": texts})
-        return {"rulings": rows}
+        return self.rulings(action["cards"])
 
     def _tool_rules(self, action: dict[str, Any]) -> dict[str, Any]:
-        if self.tools.rules is None:
-            return {"error": "The rules index is unavailable here."}
-        question = action["query"].strip()
-        activity.tool("rules lookup", _clip(question, 80))
-        names = [card["name"] for card in map(self.lookup, action["cards"][:6]) if card]
-        evidence = self.tools.rules.retrieve(names, question, limit=self.tools.evidence)
-        return {"evidence": [
-            {"id": e["id"], "kind": e["kind"], "text": _clip(e["text"], 600)} for e in evidence
-        ]}
+        return self.rules(action["query"], action["cards"])
 
     def _tool_check_deck(self, action: dict[str, Any]) -> dict[str, Any]:
         swaps = _unique(action["swaps"])
@@ -198,14 +162,8 @@ class _Session:
         }
 
     def _tool_combos(self, action: dict[str, Any]) -> dict[str, Any]:
-        if self.tools.spellbook is None:
-            return {"error": "Combo search is unavailable here."}
         nonlands, _ = self.apply(_unique(action["swaps"]))
-        cards = {**nonlands, **dict.fromkeys(self.lands, 1)}
-        activity.tool("commander spellbook", f"combos among {len(cards) + 1} cards")
-        found = self.tools.spellbook.find_combos(cards, self.spec.commander)
-        combos = [{"cards": c["cards"], "results": c["results"]} for c in found["combos"][:15]]
-        return {"complete": found["complete"], "combos": combos}
+        return self.combos({**nonlands, **dict.fromkeys(self.lands, 1)})
 
 
 def _unique(swaps: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -225,7 +183,7 @@ def _schema(session: _Session, final: bool) -> dict[str, Any]:
     swap = object_schema({
         "remove": {"type": "string", "enum": removable},
         "add": {"type": "string", "enum": addable} if addable else NAME_SCHEMA,
-        "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+        "reason": REASON,
     })
     return object_schema({
         "tool": {"type": "string", "enum": ["finish"] if final else [*TOOLS, "finish"]},
@@ -237,16 +195,7 @@ def _schema(session: _Session, final: bool) -> dict[str, Any]:
     })
 
 
-def edit_deck(
-    deck: dict[str, Any], pool: CandidatePool, model: JSONModel, request: str, *,
-    tools: Toolbox, reviewer: DeckReviewer | None = None, max_steps: int = 10,
-    max_repairs: int = 2,
-) -> dict[str, Any]:
-    if not request.strip():
-        raise ValueError("A follow-up needs a request")
-    if type(max_steps) is not int or not 2 <= max_steps <= 30:
-        raise ValueError("max_steps must be from 2 to 30")
-    session = _Session(deck, pool, tools, reviewer)
+def _payload(session: _Session, deck: dict[str, Any], request: str) -> dict[str, Any]:
     named = []
     for name in dict.fromkeys(n.strip() for n in CARD_REF.findall(request)):
         card = session.lookup(name)
@@ -259,7 +208,9 @@ def edit_deck(
         {"name": c.card["name"], "mana_cost": c.card["mana_cost"], "roles": sorted(c.roles)}
         for c in session.pool.cards if c.card["name"] in session.addable
     ]
-    payload = {
+    # Cards code filled in to reach role counts, rather than a drafter's picks.
+    padded = set(deck.get("assembly", {}).get("code_added", []))
+    return {
         "spec": session.spec.to_dict(),
         "plan": {k: deck["council"].get(k, []) for k in ("game_plan", "non_goals", "core",
                                                          "decisions")}
@@ -267,7 +218,8 @@ def edit_deck(
         "engine_map": session.pool.engine_map or None,
         "deck": [
             {**trim_card(session.records[n]), "quantity": q,
-             "roles": sorted(oracle_roles(session.records[n]))}
+             "roles": sorted(oracle_roles(session.records[n])),
+             **({"picked_by": "code"} if n in padded else {})}
             for n, q in session.nonlands.items()
         ],
         "lands": {n: deck["cards"][n] for n in session.lands},
@@ -280,6 +232,21 @@ def edit_deck(
         "pool": pool_rows, "named_cards": named,
         "conversation": deck.get("conversation", [])[-10:], "request": request,
     }
+
+
+def edit_deck(
+    deck: dict[str, Any], pool: CandidatePool, model: JSONModel, request: str, *,
+    tools: Toolbox, reviewer: DeckReviewer | None = None, max_steps: int = 10,
+    max_repairs: int = 2, max_swaps: int = MAX_SWAPS,
+) -> dict[str, Any]:
+    if not request.strip():
+        raise ValueError("A follow-up needs a request")
+    if type(max_steps) is not int or not 2 <= max_steps <= 30:
+        raise ValueError("max_steps must be from 2 to 30")
+    session = _Session(deck, pool, tools, reviewer)
+    payload = _payload(session, deck, request)
+    if supports_tools(model):
+        return _edit_with_tools(session, deck, payload, model, request, max_steps, max_repairs, max_swaps)
     messages = [
         {"role": "system", "content": prompts.EDIT},
         {"role": "user", "content": json.dumps(payload)},
@@ -299,25 +266,11 @@ def edit_deck(
                 "tool_result": action["tool"], "result": result, "steps_left": max_steps - step,
             })})
             continue
-        swaps = _unique(action["swaps"])
+        swaps = _unique(action["swaps"])[:max_swaps]
         reply = action["reply"].strip() or ("Done." if swaps else "No changes.")
         if not swaps:
             return _result(deck, request, reply, [], used, step, model, built=None)
-        built = session.build(swaps)
-        review = {"status": "not_run", "errors": []}
-        if not built["errors"] and reviewer is not None:
-            try:
-                review = reviewer.check(
-                    built["cards"], session.spec.commander, session.spec.bracket,
-                    bracket3_mode=session.spec.bracket3_mode,
-                )
-            except SchemaError as exc:
-                review = {"status": "needs_revision", "errors": [{
-                    "error": "review_schema", "schema_errors": exc.errors,
-                    "detail": "Safety model returned invalid grounded JSON",
-                }]}
-            built["errors"].extend(review["errors"])
-        built["review"] = review
+        built = session.review(session.build(swaps))
         if not built["errors"] or final or repairs >= max_repairs:
             return _result(deck, request, reply, swaps, used, step, model, built=built)
         repairs += 1
@@ -329,6 +282,114 @@ def edit_deck(
             "finish again with the complete swaps from the original deck and an updated reply.",
         })})
     raise AssertionError("the last step always finishes")
+
+
+def _edit_with_tools(
+    session: _Session, deck: dict[str, Any], payload: dict[str, Any], model: Any, request: str,
+    max_steps: int, max_repairs: int, max_swaps: int,
+) -> dict[str, Any]:
+    """The follow-up on native tool use: the same tools, called directly, several per turn."""
+    repairs = 0
+
+    def guarded(run):
+        def call(args: dict[str, Any]) -> Any:
+            try:
+                return run(args)
+            except (ScryfallError, SourceError, ValueError) as exc:
+                raise ToolError({"error": str(exc)}) from None
+        return call
+
+    def swaps_of(args: dict[str, Any]) -> list[dict[str, str]]:
+        swaps = _unique(args["swaps"])
+        unknown = session.unknown_swaps(swaps)
+        if unknown:
+            raise ToolError({"problems": unknown})
+        return swaps
+
+    def check_deck(args: dict[str, Any]) -> dict[str, Any]:
+        return session._tool_check_deck({"swaps": swaps_of(args)})
+
+    def combos(args: dict[str, Any]) -> dict[str, Any]:
+        nonlands, _ = session.apply(swaps_of(args))
+        return session.combos({**nonlands, **dict.fromkeys(session.lands, 1)})
+
+    def finish(args: dict[str, Any]) -> Finish:
+        nonlocal repairs
+        swaps = swaps_of(args)
+        if len(swaps) > max_swaps:
+            raise ToolError({"problems": [f"At most {max_swaps} swaps; you sent {len(swaps)}."]})
+        reply = args["reply"].strip()
+        if not swaps:
+            return Finish((reply, [], None))
+        built = session.review(session.build(swaps))
+        if built["errors"] and repairs < max_repairs:
+            repairs += 1
+            raise ToolError({
+                "problems": built["errors"][:12],
+                "role_counts": built["playability"]["roles"]["role_counts"],
+                "instruction": "Your swaps left these problems. Fix them, using tools if useful, "
+                "then finish again with the complete swaps from the original deck and an "
+                "updated reply.",
+            })
+        return Finish((reply, swaps, built))
+
+    tools = [
+        Tool("search_cards", "A search in Scryfall syntax over the local card data, already "
+             "limited to the deck's colors and Commander legality. Addable results can be swapped "
+             "in.", SEARCH_INPUT, guarded(lambda a: session.search_cards(a["query"]))),
+        Tool("card", "Oracle text, roles and whether each named card can be added, up to 10.",
+             CARDS_INPUT, guarded(lambda a: session.card(a["cards"]))),
+        Tool("similar_cards", "Cards that do what the named card does (shared function tags, "
+             "keywords and combos), not in the deck; each can be swapped in.", SIMILAR_INPUT,
+             guarded(lambda a: session.similar_cards(a["card"]))),
+        Tool("rulings", "Publisher rulings for up to 5 named cards.", CARDS_INPUT,
+             guarded(lambda a: session.rulings(a["cards"]))),
+        Tool("rules", "The Comprehensive Rules and rulings most relevant to a rules question "
+             "about the named cards.", RULES_INPUT,
+             guarded(lambda a: session.rules(a["query"], a["cards"]))),
+        Tool("check_deck", "Dry run of swaps: regenerated lands, role counts and problems.",
+             SWAPS_INPUT, guarded(check_deck)),
+        Tool("combos", "Commander Spellbook combos in the deck after the swaps.", SWAPS_INPUT,
+             guarded(combos)),
+        Tool("finish", "Your answer to the player and the final swaps (none for a question). "
+             "Code applies them and checks the deck; problems come back to fix.",
+             FINISH_INPUT, finish),
+    ]
+    messages = [
+        {"role": "system", "content": prompts.EDIT_NATIVE},
+        {"role": "user", "content": json.dumps(payload)},
+    ]
+    done = run_tools(model, messages, tools, max_steps=max_steps, agent="orchestrator",
+                     task="read the request")
+    if done["value"] is None:
+        reply = "I ran out of steps before finishing, so nothing changed."
+        return _result(deck, request, reply, [], done["tools"], done["steps"], model, built=None)
+    reply, swaps, built = done["value"]
+    reply = reply or ("Done." if swaps else "No changes.")
+    return _result(deck, request, reply, swaps, done["tools"], done["steps"], model, built=built)
+
+
+def polish_deck(
+    deck: dict[str, Any], pool: CandidatePool, model: JSONModel, *, tools: Toolbox,
+    reviewer: DeckReviewer | None = None, max_steps: int = 8,
+) -> dict[str, Any]:
+    """One follow-up nobody asked for, before the player sees a new deck: the orchestrator
+    tightens it toward the plan, replacing cards code filled in that do not serve it. The
+    polished deck is kept only when it still passes every check; otherwise the original stays."""
+    if not deck.get("valid"):
+        return deck
+    result = edit_deck(deck, pool, model, prompts.POLISH, tools=tools, reviewer=reviewer,
+                       max_steps=max_steps, max_repairs=1, max_swaps=POLISH_SWAPS)
+    edit = result.pop("edit")
+    note = {key: edit[key] for key in ("reply", "swaps", "tools", "steps", "model")}
+    if edit["changed"] and not result.get("valid"):
+        return {**deck, "polish": {**note, "kept": False,
+                                   "reason": "The polished deck failed its checks; the draft stays."}}
+    result["conversation"] = deck.get("conversation", [])
+    if edit["changed"] and result.get("assembly"):
+        added = [n for n in result["assembly"].get("code_added", []) if n in result["cards"]]
+        result["assembly"] = {**result["assembly"], "code_added": added}
+    return {**result, "polish": {**note, "kept": edit["changed"]}}
 
 
 def _result(

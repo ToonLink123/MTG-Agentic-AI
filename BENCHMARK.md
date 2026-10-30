@@ -153,6 +153,12 @@ The shorter benchmark question 1 still reaches 118.9, 118.9c and 614.12. A
 candidate fix is anchoring a term to the rule whose text defines it ("An
 alternative cost is…") instead of to the whole section the glossary names.
 
+A judge with native tool use (Claude) no longer depends on retrieval alone: it can fetch a
+rule by number with its parent and subrules (`get_rule`) or search by topic before it answers,
+and every quote is still checked against what it was shown. In a single live check with Haiku,
+the Jodah alternative-cost question looked up 601.2a and 614.1c itself and cited 118.9, 601.2a
+and 614.1c in a supported answer. This is one run, not a benchmark.
+
 ## End to end: LFM3 1.7B drafts
 
 These are single runs, not a benchmark, and they change several things at once:

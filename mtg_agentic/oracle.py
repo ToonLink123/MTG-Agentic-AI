@@ -17,6 +17,20 @@ from .cards import Card, name_key, validation_card
 DEFAULT_DATA_DIR = Path(".cache") / "mtg-agentic"
 # Version 2 keeps colors, keywords and the EDHREC rank, which local search needs.
 INDEX_VERSION = 2
+# Scryfall Tagger tags that say what a card does in a deck. get_card lists the ones a card carries
+# (directly or through a tag below them) as "functions": deck roles read them first, and drafters
+# see them beside the card's text.
+FUNCTION_TAGS = (
+    "ramp", "draw", "impulse-draw", "card-advantage", "removal", "board-wipe", "protection",
+    "counterspell", "tutor", "recursion", "reanimate", "sacrifice-outlet", "blink",
+    "cost-reducer", "extra-land",
+)
+# Commander Spellbook variants of up to this many cards are kept: two-card combos for the bracket
+# rules, three-card ones for engine maps and discovery.
+COMBO_CARDS = 3
+# Free-text columns: the card's name, and its rules text (type line and Oracle text).
+TEXT_COLUMNS = {None: "", "name": "name", "type_line": "type_line", "oracle_text": "oracle_text",
+                "rules": "{type_line oracle_text}"}
 
 
 def tag_key(name: str) -> str:
@@ -112,6 +126,7 @@ class OracleStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(self.path)
         self._land_names: list[str] | None = None
+        self._functions: dict[str, tuple[str, ...]] | None = None
         self._db.executescript(
             """
             CREATE TABLE IF NOT EXISTS cards (
@@ -168,6 +183,14 @@ class OracleStore:
             );
             CREATE INDEX IF NOT EXISTS combo_cards_by_card ON combo_cards (card);
             CREATE TABLE IF NOT EXISTS combo_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS card_vectors (
+                oracle_id TEXT PRIMARY KEY,
+                vector BLOB NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS vector_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
@@ -267,6 +290,11 @@ class OracleStore:
     def combos_ready(self) -> bool:
         return self.combo_metadata.get("combo_count", 0) > 0
 
+    @property
+    def combo_cards(self) -> int:
+        """The most cards a stored combo has: exports from before three-card combos kept two."""
+        return self.combo_metadata.get("max_cards", 2)
+
     def import_combos(
         self, variants: Iterable[dict[str, Any]], *, metadata: dict[str, Any] | None = None
     ) -> int:
@@ -287,7 +315,7 @@ class OracleStore:
                 count += 1
             if count == 0:
                 raise ValueError("The Spellbook export contains no usable variants")
-            info = {**(metadata or {}), "combo_count": count}
+            info = {**(metadata or {}), "combo_count": count, "max_cards": COMBO_CARDS}
             self._db.executemany(
                 "INSERT INTO combo_metadata VALUES (?, ?)",
                 [(key, json.dumps(value)) for key, value in info.items()],
@@ -316,6 +344,13 @@ class OracleStore:
                 if matched[combo_id] == size:
                     found.append(json.loads(data))
         return found
+
+    def combo_index(self) -> dict[str, list[str]]:
+        """Every stored combo's ID for each card in it, by name key."""
+        index: dict[str, list[str]] = {}
+        for combo_id, card in self._db.execute("SELECT combo_id, card FROM combo_cards"):
+            index.setdefault(card, []).append(combo_id)
+        return index
 
     def rulings(self, oracle_id: str) -> list[dict[str, Any]]:
         """A card's rulings, oldest first, shaped like ScryfallClient.get_rulings results."""
@@ -366,6 +401,7 @@ class OracleStore:
                 "INSERT INTO tag_metadata VALUES (?, ?)",
                 [(key, json.dumps(value)) for key, value in info.items()],
             )
+        self._functions = None
         return count
 
     def import_tag_file(self, path: str | Path, *, metadata: dict[str, Any] | None = None) -> int:
@@ -401,12 +437,63 @@ class OracleStore:
             oracle_ids.update(oracle_id for (oracle_id,) in rows)
         return oracle_ids
 
-    def get_card(self, name: str) -> Card | None:
+    def card_tags(self) -> dict[str, list[str]]:
+        """Every Oracle tag slug each card carries directly, by Oracle ID."""
+        index: dict[str, list[str]] = {}
+        for slug, oracle_id in self._db.execute(
+            "SELECT tags.slug, taggings.oracle_id FROM taggings JOIN tags ON tags.id = taggings.tag_id"
+        ):
+            index.setdefault(oracle_id, []).append(slug)
+        return index
+
+    def functions(self) -> dict[str, tuple[str, ...]]:
+        """Each card's FUNCTION_TAGS, by Oracle ID; empty without the Oracle tags."""
+        if self._functions is None:
+            index: dict[str, list[str]] = {}
+            if self.tags_ready:
+                for tag in FUNCTION_TAGS:
+                    for oracle_id in self.tagged(tag) or ():
+                        index.setdefault(oracle_id, []).append(tag)
+            self._functions = {key: tuple(tags) for key, tags in index.items()}
+        return self._functions
+
+    def _raw_card(self, name: str) -> Card | None:
         row = self._db.execute(
             "SELECT cards.data FROM names JOIN cards USING (card_key) WHERE names.name_key = ?",
             (name_key(name),),
         ).fetchone()
         return json.loads(row[0]) if row else None
+
+    def get_card(self, name: str) -> Card | None:
+        card = self._raw_card(name)
+        if card is not None and (functions := self.functions().get(card.get("oracle_id"))):
+            card["functions"] = list(functions)
+        return card
+
+    @property
+    def vector_metadata(self) -> dict[str, Any]:
+        return self._side_metadata("vector_metadata")
+
+    def import_card_vectors(
+        self, rows: Iterable[tuple[str, bytes]], *, metadata: dict[str, Any]
+    ) -> int:
+        """Replace the card index's vectors (float32 bytes by Oracle ID) transactionally."""
+        count = 0
+        with self._db:
+            self._db.execute("DELETE FROM card_vectors")
+            self._db.execute("DELETE FROM vector_metadata")
+            for oracle_id, vector in rows:
+                self._db.execute("INSERT OR REPLACE INTO card_vectors VALUES (?, ?)", (oracle_id, vector))
+                count += 1
+            info = {**metadata, "vector_count": count}
+            self._db.executemany(
+                "INSERT INTO vector_metadata VALUES (?, ?)",
+                [(key, json.dumps(value)) for key, value in info.items()],
+            )
+        return count
+
+    def card_vectors(self) -> Iterator[tuple[str, bytes]]:
+        yield from self._db.execute("SELECT oracle_id, vector FROM card_vectors")
 
     def _text_index(self) -> None:
         """Index names, type lines and Oracle text for full-text search, once per snapshot."""
@@ -431,23 +518,24 @@ class OracleStore:
 
     def text_count(self, phrase: str, *, column: str | None = None) -> int:
         """How many cards contain `phrase` in their name, type line or Oracle text, or only in
-        `column` (name, type_line or oracle_text)."""
-        if column not in {None, "name", "type_line", "oracle_text"}:
+        `column`: name, type_line, oracle_text, or rules (type line and Oracle text)."""
+        if column not in TEXT_COLUMNS:
             raise ValueError("Unknown text column")
         self._text_index()
-        query = _phrase(phrase) if column is None else f"{column} : {_phrase(phrase)}"
+        query = _phrase(phrase) if column is None else f"{TEXT_COLUMNS[column]} : {_phrase(phrase)}"
         return self._db.execute(
             "SELECT count(*) FROM card_text WHERE card_text MATCH ?", (query,)
         ).fetchone()[0]
 
     def search_text(self, phrase: str, limit: int = 300) -> list[tuple[str, float]]:
-        """Card names containing `phrase`, best first, with BM25 relevance: rarer phrases and
-        shorter texts score higher, and a name match counts most, then the type line."""
+        """Card names whose rules text (type line and Oracle text, never the name: a name is
+        flavor) contains `phrase`, best first, with BM25 relevance: rarer phrases and shorter
+        texts score higher."""
         self._text_index()
         rows = self._db.execute(
-            "SELECT name, -bm25(card_text, 4.0, 2.0, 1.0) FROM card_text WHERE card_text MATCH ? "
-            "ORDER BY bm25(card_text, 4.0, 2.0, 1.0) LIMIT ?",
-            (_phrase(phrase), limit),
+            "SELECT name, -bm25(card_text, 0.0, 1.0, 1.0) FROM card_text WHERE card_text MATCH ? "
+            "ORDER BY bm25(card_text, 0.0, 1.0, 1.0) LIMIT ?",
+            (f"{TEXT_COLUMNS['rules']} : {_phrase(phrase)}", limit),
         )
         return [(name, score) for name, score in rows]
 
@@ -479,7 +567,7 @@ class OracleStore:
             if card["layout"] in {"split", "adventure", "flip"}:
                 aliases.update(name_key(face["name"]) for face in faces)
         for alias in aliases:
-            existing = self.get_card(alias)
+            existing = self._raw_card(alias)
             if (
                 existing is None
                 or (
@@ -513,6 +601,7 @@ class OracleStore:
     def import_cards(self, cards: Iterable[Card], *, metadata: dict[str, Any] | None = None) -> int:
         """Replace a snapshot transactionally; failed imports preserve the old data."""
         count = 0
+        self._functions = None
         with self._db:
             self._db.execute("DELETE FROM names")
             self._db.execute("DELETE FROM cards")

@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .events import event
 from .schema import SchemaError, load_json, validate_json
 
 Message = dict[str, str]
@@ -63,6 +64,16 @@ def concurrency(model: JSONModel) -> int:
     """Requests this model takes at once; local servers queue them, so they default to one."""
     value = getattr(model, "concurrency", 1)
     return value if type(value) is int and value > 1 else 1
+
+
+def merge_system(messages: list[Message]) -> list[Message]:
+    """One system message for servers whose chat templates take only one: several leading
+    system messages (shared context, then instructions) are joined in order."""
+    split = next((i for i, m in enumerate(messages) if m["role"] != "system"), len(messages))
+    if split <= 1:
+        return messages
+    joined = "\n\n".join(m["content"] for m in messages[:split])
+    return [{"role": "system", "content": joined}, *messages[split:]]
 
 
 def malformed_kind(exc: SchemaError) -> str:
@@ -129,7 +140,7 @@ class HTTPJSONModel:
 
     def complete_json(self, messages: list[Message], schema: dict[str, Any]) -> Any:
         start = time.monotonic()
-        content, truncated, prompt, output = self._chat(messages, schema)
+        content, truncated, prompt, output = self._chat(merge_system(messages), schema)
         outcome, detail = "ok", ""
         try:
             if truncated:
@@ -158,6 +169,8 @@ class HTTPJSONModel:
         logger.info(
             "  %s | %.1fs | prompt %s tok | out %s | %s | %s so far",
             self.model, elapsed, f"{prompt:,}", f"{output:,}", status, summary,
+            extra=event("usage", model=self.model, input=prompt, cached=0, written=0,
+                        output=output, cost=None, seconds=round(elapsed, 1)),
         )
 
     def report(self) -> None:

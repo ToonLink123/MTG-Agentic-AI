@@ -71,6 +71,20 @@ DECK = {
 }
 
 
+def ev(kind, message="", **fields):
+    """One progress event line, as a command run with --events writes it."""
+    return json.dumps({"type": kind, **fields, "message": message})
+
+
+def stage(scope, index, total, name, detail):
+    return ev("stage", f"{scope}: {index}/{total} {name}: {detail}", scope=scope, index=index,
+              total=total, name=name, detail=detail)
+
+
+def agent(name, state, message="", **fields):
+    return ev("agent", message or f"agent: {name} | {state}", name=name, state=state, **fields)
+
+
 def plain(renderable, width=120):
     console = Console(width=width, file=io.StringIO(), color_system=None)
     console.print(renderable)
@@ -141,10 +155,29 @@ class TuiHelperTests(unittest.TestCase):
                 self.assertIn(f"transformers {flagged}", problem)
                 self.assertIn(sys.executable, problem)
 
+    def test_an_uncertain_bracket_and_an_auto_land_count_read_plainly(self):
+        from mtg_agentic.tui import render_spec, unverified
+
+        warning = {"warning": "bracket_uncertain", "detail": "x",
+                   "reasons": ["Likely win speed is unknown"]}
+        shown = plain(unverified([warning, {"cards": ["A", "B"], "missing": "copy rules"}]))
+        self.assertIn("Bracket fit uncertain, not a failure", shown)
+        self.assertIn("Likely win speed is unknown", shown)
+        self.assertIn("Unverified: A + B", shown)
+        spec = {"commander": "Jodah", "color_identity": "WUBRG", "bracket": 3,
+                "playstyle": "midrange", "commander_dependency": "medium",
+                "role_targets": {"ramp": 10, "lands": 0}}
+        self.assertIn("lands auto", plain(render_spec(spec)))
+
+    def test_claude_and_the_council_are_the_defaults(self):
+        settings = Settings()
+        self.assertEqual((settings.provider, settings.orchestrate), ("claude", True))
+        self.assertIn("council", settings.describe())
+
     def test_the_engine_map_runs_on_the_member_model_in_orchestrate_mode(self):
         member = ["--provider", "claude", "--model", "claude-haiku-5-5", "--effort", "high"]
         self.assertEqual(Settings(provider="claude", orchestrate=True).member_args(), member)
-        self.assertEqual(Settings(provider="claude").member_args(), ["--provider", "claude"])
+        self.assertEqual(Settings(provider="claude", orchestrate=False).member_args(), ["--provider", "claude"])
         self.assertEqual(Settings(provider="ollama", orchestrate=True).member_args(),
                          ["--provider", "ollama"])
 
@@ -287,7 +320,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             "card": (0, trim_card(JODAH)), "interview": (0, READY), "intake": (0, SPEC),
             "discover": (0, POOL), "engine-map": (0, MAPPED), "draft": (1, DECK),
         })
-        app = ChatApp(self.data_dir, Settings(provider="ollama"), runner=cli)
+        app = ChatApp(self.data_dir, Settings(provider="ollama", orchestrate=False), runner=cli)
         async with app.run_test() as pilot:
             await self.send(app, pilot, "jodah")
             self.assertEqual(app.commander, JODAH["name"])
@@ -337,7 +370,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
     async def test_an_error_envelope_stops_the_pipeline_at_that_step(self):
         error = {"valid": False, "errors": [{"error": "llm", "detail": "Ollama is not running"}]}
         cli = FakeCli({"interview": (0, READY), "intake": (2, error)})
-        app = ChatApp(self.data_dir, Settings(), runner=cli)
+        app = ChatApp(self.data_dir, Settings(orchestrate=False), runner=cli)
         async with app.run_test() as pilot:
             app.commander = JODAH["name"]
             await self.send(app, pilot, "Myojin tribal")
@@ -373,19 +406,23 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             "decision": {"keep": ["Spell 1"], "notes": "followed the vote"},
         }
         lines = [
-            "council: 1/5 plan: claude-sonnet-5-5 sets the game plan and core",
-            "agent: orchestrator | start | claude-sonnet-5-5 | game plan and core cards",
-            "agent: orchestrator | done | 3.0s",
-            "council: 2/5 drafts: 3 members draft around 1 core cards",
-            "agent: engine | start | claude-haiku-5-5 | draft around the core",
-            "tool: assemble | 63 nonland slots by role",
-            "agent: engine | done | 2.0s",
-            "council: 3/5 debate: 40 cards agreed; 1 contested for 1 slots",
-            "council: 4/5 decision: claude-sonnet-5-5 settles 1 contested cards",
-            "council: 5/5 final: lands, validation and safety review",
-            "agent: judges | start | claude-haiku-5-5 | 2 rules questions, up to 8 at a time",
-            "agent: judges | progress | 2/2 answered",
-            "agent: judges | done | 4.0s",
+            stage("council", 1, 5, "plan", "claude-sonnet-5-5 sets the game plan and core"),
+            agent("orchestrator", "start", model="claude-sonnet-5-5", task="game plan and core cards"),
+            agent("orchestrator", "done", seconds=3.0),
+            stage("council", 2, 5, "drafts", "3 members draft around 1 core cards"),
+            agent("engine", "start", model="claude-haiku-5-5", task="draft around the core"),
+            ev("tool", "tool: assemble | 63 nonland slots by role", name="assemble",
+               detail="63 nonland slots by role"),
+            ev("usage", "  claude-haiku-5-5 | 2.0s", model="claude-haiku-5-5", input=1000,
+               cached=9000, written=0, output=500, cost=0.0044),
+            agent("engine", "done", seconds=2.0),
+            stage("council", 3, 5, "debate", "40 cards agreed; 1 contested for 1 slots"),
+            stage("council", 4, 5, "decision", "claude-sonnet-5-5 settles 1 contested cards"),
+            stage("council", 5, 5, "final", "lands, validation and safety review"),
+            agent("judges", "start", model="claude-haiku-5-5", task="2 rules questions, up to 8 at a time"),
+            agent("judges", "progress", note="2/2 answered"),
+            agent("judges", "done", seconds=4.0),
+            "A warning that is not an event",
         ]
         cli = FakeCli(
             {"interview": (0, READY), "intake": (0, SPEC), "discover": (0, POOL),
@@ -412,8 +449,16 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
                          {"orchestrator": "done", "engine": "done", "judges": "done"})
         self.assertEqual(turn.agents["judges"]["calls"], 1)
         self.assertEqual(turn.tools, [("assemble", "63 nonland slots by role")])
-        self.assertFalse(any(line.startswith(("agent:", "tool:")) for line in turn.tail))
-        self.assertEqual(turn.lines[-len(lines):], lines)  # /log still has every event
+        self.assertEqual(turn.tail[-1], "A warning that is not an event")
+        self.assertFalse(any(line.startswith(("agent:", "tool:", "{")) for line in turn.tail))
+        # /log keeps every event's words, never its JSON.
+        self.assertEqual(turn.lines[-len(lines)], "council: 1/5 plan: claude-sonnet-5-5 sets the game plan and core")
+        self.assertFalse(any(line.startswith("{") for line in turn.lines))
+        # The cost meter: this run, and the session in the top bar.
+        self.assertEqual((turn.usage["calls"], turn.usage["cached"]), (1, 9000))
+        self.assertIn("90% from cache", plain(turn.render_agents()))
+        self.assertIn("≈ $0.00", plain(turn.render_agents()))
+        self.assertEqual(app.tabs[0].usage["calls"], 1)
 
     async def test_the_interview_asks_until_ready_and_its_answers_reach_intake(self):
         cli = FakeCli({
@@ -422,7 +467,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
                 {"error": "schema", "detail": "$.stages must be array"}]}),
             "draft": (1, DECK),
         })
-        app = ChatApp(self.data_dir, Settings(), runner=cli)
+        app = ChatApp(self.data_dir, Settings(orchestrate=False), runner=cli)
         async with app.run_test() as pilot:
             app.commander = JODAH["name"]
             await self.send(app, pilot, "Myojin tribal", settle=False)
@@ -598,7 +643,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             first = argv[argv.index("--request") + 1] == "Myojin tribal"
             return 0, QUESTIONS if first and argv[argv.index("--round") + 1] == "1" else READY
 
-        app = ChatApp(self.data_dir, Settings(), runner=runner)
+        app = ChatApp(self.data_dir, Settings(orchestrate=False), runner=runner)
         async with app.run_test() as pilot:
             app.commander = JODAH["name"]
             await self.send(app, pilot, "Myojin tribal", settle=False)
@@ -660,13 +705,15 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(first.busy)
 
     async def test_a_first_start_downloads_the_local_data_before_any_deck_request(self):
-        lines = [
-            "setup: 1/6 Card data: downloading", "setup: 1/6 Card data: 33,000 cards",
-            "setup: 2/6 Oracle tags: already here", "setup: 3/6 Rulings: already here",
-            "setup: 4/6 Commander Spellbook: downloading",
-            "setup: 4/6 Commander Spellbook: skipped: --skip-combos",
-            "setup: 5/6 Rules index: already here", "setup: 6/6 Embedding model: already here",
+        steps = [
+            (1, "Card data", "downloading"), (1, "Card data", "33,000 cards"),
+            (2, "Oracle tags", "already here"), (3, "Rulings", "already here"),
+            (4, "Commander Spellbook", "downloading"),
+            (4, "Commander Spellbook", "skipped: --skip-combos"),
+            (5, "Rules index", "already here"), (6, "Embedding model", "already here"),
+            (7, "Card index", "downloading"), (7, "Card index", "28,000 cards embedded"),
         ]
+        lines = [stage("setup", n, 7, name, detail) for n, name, detail in steps]
         gate = asyncio.Event()
         cli = FakeCli({"setup": (0, {"ready": True, "steps": {}}),
                        "card": (0, trim_card(JODAH))}, wait=gate, lines={"setup": lines})

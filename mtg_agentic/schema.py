@@ -20,7 +20,9 @@ ROLES = (
     "support",
 )
 TARGET_ROLES = ("ramp", "draw", "removal", "wipes", "lands", "creatures", "protection")
-DRAFT_ROLES = ("ramp", "draw", "removal", "wipes", "creatures", "protection", "theme", "support")
+# A drafter ranks its picks in three tiers, most important first: code never removes a core
+# pick, keeps strong picks, and may swap a flex pick for a card that reaches a role minimum.
+DRAFT_TIERS = ("core", "strong", "flex")
 
 
 def object_schema(properties: dict[str, Any]) -> dict[str, Any]:
@@ -60,6 +62,11 @@ SPEC_SCHEMA = object_schema(
         "role_targets": object_schema(
             {role: {"type": "integer", "minimum": 0, "maximum": 99} for role in TARGET_ROLES}
         ),
+        # Phrases as cards print them ("roll a die", "treasure token"), for local card search.
+        "search_terms": {
+            "type": "array", "maxItems": 12, "uniqueItems": True,
+            "items": {"type": "string", "minLength": 3, "maxLength": 60},
+        },
     }
 )
 # The player's own words travel with the spec: the request, the interview before intake, the
@@ -108,6 +115,7 @@ LOCAL_SEARCH_SCHEMA = object_schema({
     })},
 })
 MAP_STAGES = ("makes", "multiplies", "spends", "pays_off", "protects")
+LINK_CHECKS = ("unchecked", "supported", "unverified")
 
 
 def text(most: int, least: int = 1) -> dict[str, Any]:
@@ -140,6 +148,8 @@ def map_schema(
         "links": {"type": "array", "maxItems": 14, "items": object_schema({
             "from": NAME_SCHEMA, "to": NAME_SCHEMA, "how": text(200),
             "source": {"type": "string", "enum": ["oracle", "combo"]},
+            # A stored map records whether the rules judge checked each link.
+            **({"verified": {"type": "string", "enum": list(LINK_CHECKS)}} if stored else {}),
         })},
         "asks": {"type": "array", "maxItems": len(ask_ids) if ask_ids is not None else 10,
                  "items": object_schema({
@@ -170,16 +180,20 @@ QUERY_SCHEMA = object_schema(
     }
 )
 OUTSIDE_PICKS = 10  # Cards a drafter may name from outside the pool; code checks each.
+TIER_PICKS = 80  # Room for a full nonland list plus the extras code may swap in.
+OUTSIDE_SCHEMA = {"type": "array", "maxItems": OUTSIDE_PICKS, "items": object_schema({
+    "name": NAME_SCHEMA,
+    "tier": {"type": "string", "enum": list(DRAFT_TIERS)},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 200},
+})}
 DRAFT_SCHEMA = object_schema(
     {
         "commander": NAME_SCHEMA,
-        "buckets": object_schema({
-            role: {"type": "array", "items": NAME_SCHEMA, "maxItems": 63, "uniqueItems": True}
-            for role in DRAFT_ROLES
+        "picks": object_schema({
+            tier: {"type": "array", "items": NAME_SCHEMA, "maxItems": TIER_PICKS, "uniqueItems": True}
+            for tier in DRAFT_TIERS
         }),
-        "outside": {"type": "array", "maxItems": OUTSIDE_PICKS, "items": object_schema({
-            "name": NAME_SCHEMA, "reason": {"type": "string", "minLength": 1, "maxLength": 200},
-        })},
+        "outside": OUTSIDE_SCHEMA,
     }
 )
 
@@ -231,7 +245,9 @@ def validate_json(value: Any, schema: dict[str, Any]) -> None:
             fail(path, f"{path} must be {kind}")
             return
         if "enum" in rule and item not in rule["enum"]:
-            fail(path, f"{path} is not an allowed value")
+            # Naming the value lets a repair see which card name was wrong.
+            shown = f": {item!r}" if isinstance(item, str) and len(item) <= 120 else ""
+            fail(path, f"{path} is not an allowed value{shown}")
         if kind == "object":
             properties = rule.get("properties", {})
             for key in rule.get("required", []):

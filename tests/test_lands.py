@@ -13,7 +13,7 @@ from mtg_agentic.lands import (
 from mtg_agentic.mana import direct_sources
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.pipeline import draft_deck
-from mtg_agentic.schema import DRAFT_ROLES
+from mtg_agentic.schema import DRAFT_TIERS
 from tests.fixtures import card
 from tests.land_fixtures import fixing_lands, land_tutors
 from tests.pipeline_fixtures import FakeCards, FakeModel, make_pool, make_spec, records
@@ -227,8 +227,8 @@ class LandTests(unittest.TestCase):
         pool.cards = [c for c in pool.cards if eligible(c.card, spec)]
         pool.cards.append(Candidate(self.store.get_card("Nature's Lore"), {"ramp"}))
         # A saved pool deliberately has no premium lands, and the model picks none.
-        buckets = {role: [] for role in DRAFT_ROLES}
-        model = FakeModel({"commander": leader["name"], "buckets": buckets, "outside": []})
+        picks = {tier: [] for tier in DRAFT_TIERS}
+        model = FakeModel({"commander": leader["name"], "picks": picks, "outside": []})
         client = FakeCards(data)
         result = draft_deck(pool, model, client, self.store, max_repairs=0)
         self.assertTrue(result["valid"], result["validation"]["errors"])

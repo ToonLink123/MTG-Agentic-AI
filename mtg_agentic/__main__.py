@@ -13,14 +13,17 @@ from pathlib import Path
 from typing import Any
 
 from . import bootstrap
+from .agent import supports_tools
 from .brackets import BracketChecker, SpellbookClient, bracket_rules
 from .bulk_search import BulkSearch
-from .council import MEMBER, ORCHESTRATOR, council_draft
+from .card_graph import CARD_DIMENSION, index_cards, index_ready
+from .council import MEMBER, ORCHESTRATOR, council_draft, plan_deck
 from .discovery import POOL_MODES, CandidatePool
-from .edit import Toolbox, edit_deck
+from .edit import Toolbox, edit_deck, polish_deck
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .engine_map import build_engine_map
 from .evaluation import evaluation_history, run_evaluation
+from .events import JsonLines
 from .forge import ForgeError
 from .forge_cli import load_forge
 from .forge_cli import register_commands as register_forge_commands
@@ -33,12 +36,13 @@ from .lands import generate_mana_base, is_land
 from .llm import PROVIDERS, LlamaCppClient, LLMError, OllamaClient, OpenAICompatibleClient
 from .mentions import find_cards, lookup, name_index
 from .oracle import DEFAULT_DATA_DIR, OracleStore
-from .pipeline import build_deck, discover, draft_deck, draft_from_request
+from .pipeline import build_deck, discover, draft_deck, draft_from_request, game_changer_names
 from .playability import spec_for_deck, validate_playability
-from .review import DeckReviewer
+from .review import DeckReviewer, Judge
 from .revision import revise_deck
 from .rules import EVIDENCE as RULES_EVIDENCE
 from .rules import HashEmbedder, OllamaEmbedder, RulesStore
+from .rules_graph import GRAPH_VERSION
 from .rules_index import DEFAULT_REPO as DEFAULT_RULES_INDEX
 from .rules_index import PrebuiltIndex
 from .schema import BRACKET3_MODES, SPEC_SCHEMA, SchemaError, load_json
@@ -56,6 +60,10 @@ POOL_HELP = "Most candidates (up to 1000); default 1000 with claude, 350 otherwi
 # Evidence items per rules question, half of them rules. Claude's context holds twice the
 # default, which raised gold-rule recall on the retrieval benchmark from 87% to 96%.
 EVIDENCE_LIMITS = {"claude": 36}
+POLISH_HELP = (
+    "Skip the polish pass: with a tool-capable model (claude), the orchestrator reviews a valid "
+    "deck once more and swaps cards that do not serve the plan"
+)
 POOL_MODE_HELP = (
     "How discovery ranks the cards its searches find: popular (EDHREC rank only), relevant "
     "(fit to the deck only) or mixed (both, weighted; the default)"
@@ -66,7 +74,7 @@ def _model_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
         choices=PROVIDERS,
-        default=os.getenv("MTG_LLM_PROVIDER", "ollama"),
+        default=os.getenv("MTG_LLM_PROVIDER", "claude"),
     )
     parser.add_argument("--model", default=os.getenv("MTG_LLM_MODEL"))
     parser.add_argument("--llm-url", default=os.getenv("MTG_LLM_BASE_URL"))
@@ -140,7 +148,8 @@ def _make_model(args: argparse.Namespace):
             api_key=_claude_api_key(),
             timeout=args.llm_timeout,
             effort=args.effort,
-            progress=None if args.quiet else sys.stderr,
+            # The live status line is for a terminal; events carry every call's usage.
+            progress=None if args.quiet or getattr(args, "events", False) else sys.stderr,
         )
     if args.provider != "openai-compatible":
         raise ValueError("Unknown MTG_LLM_PROVIDER")
@@ -247,6 +256,55 @@ def _question_cards(args: argparse.Namespace, store: OracleStore, client: Scryfa
     return found
 
 
+def _toolbox(args, stack, store, client, reviewer) -> Toolbox:
+    """What the drafter's and the polish pass's tools reach: local search, combos, rules."""
+    sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
+    return Toolbox(
+        store, client, reviewer.rules if reviewer is not None else None,
+        SpellbookClient(sources, store=store), BulkSearch(store, client),
+        evidence=_evidence(args, 12),
+    )
+
+
+def _polish(args, deck, pool, model, toolbox, reviewer) -> dict[str, Any]:
+    """The polish pass on a valid deck, for a model with native tool use."""
+    if args.no_polish or not deck.get("valid") or not supports_tools(model):
+        return deck
+    return polish_deck(deck, pool, model, tools=toolbox, reviewer=reviewer)
+
+
+def _card_embedder(args, store):
+    """The card index's embedder, when setup built the index and this Python can embed."""
+    if bootstrap.embedding_problem() or not index_ready(store, bootstrap.card_index_identity()):
+        return None
+    from .embeddings import EmbeddingGemmaEmbedder
+
+    try:
+        return EmbeddingGemmaEmbedder(dimension=CARD_DIMENSION)
+    except ValueError as exc:
+        logging.getLogger("mtg_agentic").warning("card search: no meaning ranking (%s)", exc)
+        return None
+
+
+def _map_judge(args, stack, store, client, model):
+    """The rules judge that checks an engine map's links, or None when setup has not built the
+    rules index here (a map is still useful unchecked). It never downloads the rules itself:
+    setup and the deck review keep them current."""
+    path = _rules_path(args)
+    if not path.is_file():
+        logging.getLogger("mtg_agentic").warning("engine map: no rules index, so links are not checked")
+        return None
+    try:
+        rules = stack.enter_context(_rules_store(args))
+    except (ValueError, OSError) as exc:
+        logging.getLogger("mtg_agentic").warning("engine map: links not checked (%s)", exc)
+        return None
+    if not rules.metadata.get("rule_count") or rules.metadata.get("graph_version") != GRAPH_VERSION:
+        logging.getLogger("mtg_agentic").warning("engine map: the rules index is incomplete; run setup")
+        return None
+    return Judge(rules, model, store, client, evidence=_evidence(args))
+
+
 def _reviewer(args, stack, store, client, model):
     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
     rules = stack.enter_context(_rules_store(args))
@@ -288,6 +346,20 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
             bootstrap.fetch_model()
             return "EmbeddingGemma 2 downloaded"
 
+        def card_index() -> str:
+            if args.embedding_backend != "embeddinggemma":
+                return f"skipped: the {args.embedding_backend} backend embeds no cards"
+            if problem := bootstrap.embedding_problem():
+                return f"skipped: {problem}"
+            if index_ready(store, bootstrap.card_index_identity()) and not args.refresh:
+                return bootstrap.ALREADY
+            from .embeddings import EmbeddingGemmaEmbedder
+
+            embedder = EmbeddingGemmaEmbedder(
+                dimension=CARD_DIMENSION, device=args.embedding_device, batch_size=64,
+            )
+            return f"{index_cards(store, embedder):,} cards embedded"
+
         actions = {
             "Card data": cards,
             "Oracle tags": lambda: f"{client.download_oracle_tags(store, force=args.refresh)['tag_count']:,} tags",
@@ -297,10 +369,11 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "Rules index": rules,
             "Embedding model": model,
+            "Card index": card_index,
         }
         for name in bootstrap.STEPS:
-            # The model step always checks for itself, to say why it skips the download.
-            if done[name] and name != "Embedding model":
+            # The model steps always check for themselves, to say why they skip.
+            if done[name] and name not in {"Embedding model", "Card index"}:
                 bootstrap.stage(name, bootstrap.ALREADY)
                 steps[name] = bootstrap.ALREADY
                 continue
@@ -379,6 +452,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--quiet", action="store_true", help="No live progress on stderr")
+    parser.add_argument(
+        "--events", action="store_true",
+        help="Progress as one JSON event per line on stderr, for the terminal app (see events.py)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     bulk = commands.add_parser(
         "download-oracle",
@@ -415,7 +492,7 @@ def main(argv: list[str] | None = None) -> int:
         "mana-base", help="Generate only lands from a finished spell list, without an LLM or HTTP"
     )
     mana_base.add_argument("deck", type=Path, help="JSON with commander, cards, and optional spec")
-    mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec)")
+    mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec; 0 sets it from the curve)")
     mana_base.add_argument("--output", type=Path, help="Write the mana-base report to a NEW file")
     commands.add_parser("spec-schema", help="Print the fixed intake JSON schema")
     interview_cmd = commands.add_parser(
@@ -458,6 +535,11 @@ def main(argv: list[str] | None = None) -> int:
     map_cmd.add_argument(
         "--no-combos", action="store_true", help="Skip the Commander Spellbook combo lookup"
     )
+    map_cmd.add_argument(
+        "--no-verify", action="store_true",
+        help="Skip checking the map's central links against the rules before drafting",
+    )
+    _embedding_options(map_cmd)
     _model_options(map_cmd)
     draft_cmd = commands.add_parser(
         "draft", help="Choose spells, calculate lands, validate and repair"
@@ -469,6 +551,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Explicitly skip bracket/rules safety review (not evaluation-ready)",
     )
+    draft_cmd.add_argument("--no-polish", action="store_true", help=POLISH_HELP)
     _embedding_options(draft_cmd)
     _model_options(draft_cmd)
     council_cmd = commands.add_parser(
@@ -488,8 +571,24 @@ def main(argv: list[str] | None = None) -> int:
         "--skip-review", action="store_true",
         help="Explicitly skip bracket/rules safety review (not evaluation-ready)",
     )
+    council_cmd.add_argument("--no-polish", action="store_true", help=POLISH_HELP)
+    council_cmd.add_argument(
+        "--plan", type=Path,
+        help="A plan from council-plan, perhaps edited; the orchestrator does not plan again",
+    )
     _embedding_options(council_cmd)
     _model_options(council_cmd)
+    plan_cmd = commands.add_parser(
+        "council-plan",
+        help="Only the council orchestrator's game plan, core and role targets, to check or edit "
+        "before council --plan",
+    )
+    plan_cmd.add_argument("--pool", required=True, type=Path)
+    plan_cmd.add_argument(
+        "--orchestrator-model", help=f"Default: {ORCHESTRATOR[0]} for claude, else --model"
+    )
+    plan_cmd.add_argument("--orchestrator-effort", choices=EFFORTS, default=ORCHESTRATOR[1])
+    _model_options(plan_cmd)
     edit_cmd = commands.add_parser(
         "edit-deck",
         help="Ask the orchestrator about a drafted deck or for changes; it can use tools",
@@ -567,7 +666,7 @@ def main(argv: list[str] | None = None) -> int:
     history = commands.add_parser("evaluation-history")
     history.add_argument("--runs-dir", type=Path)
     tui = commands.add_parser("tui", help="Dark terminal chat: pick a commander, describe a deck")
-    tui.add_argument("--provider", choices=PROVIDERS, help="Default: MTG_LLM_PROVIDER or ollama")
+    tui.add_argument("--provider", choices=PROVIDERS, help="Default: MTG_LLM_PROVIDER or claude")
     tui.add_argument("--model", help="Default: MTG_LLM_MODEL or the provider's default")
     tui.add_argument("--pool-mode", choices=POOL_MODES, default="mixed",
                      help="The starting /pool: " + POOL_MODE_HELP)
@@ -593,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
         args.runs_dir = args.data_dir / "revisions"
     # Stage updates go to stderr so stdout stays clean JSON.
     progress = logging.StreamHandler(sys.stderr)
-    progress.setFormatter(logging.Formatter("%(message)s"))
+    progress.setFormatter(JsonLines() if args.events else logging.Formatter("%(message)s"))
     logger = logging.getLogger("mtg_agentic")
     if not args.quiet:
         logger.setLevel(logging.INFO)
@@ -837,6 +936,25 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
+        if args.command == "council-plan":
+            if args.output is not None and args.output.exists():
+                raise ValueError("Output already exists; choose a new filename")
+            orchestrator = _make_model(argparse.Namespace(**{
+                **vars(args),
+                "model": args.orchestrator_model or (ORCHESTRATOR[0] if args.provider == "claude" else args.model),
+                "effort": args.orchestrator_effort,
+            }))
+            with ExitStack() as stack, OracleStore(args.data_dir / "oracle.sqlite3") as store:
+                if hasattr(orchestrator, "report"):
+                    stack.callback(orchestrator.report)
+                if not store.ready:
+                    raise ValueError("Run download-oracle before using the LLM pipeline")
+                pool = CandidatePool.from_dict(
+                    load_json(args.pool.read_text(encoding="utf-8-sig")), store
+                )
+                result = plan_deck(pool, orchestrator, game_changer_names(pool, store))
+            _emit(result, args.output)
+            return 0
         if args.command == "council":
             if args.output is not None and args.output.exists():
                 raise ValueError("Output already exists; choose a new filename")
@@ -856,10 +974,14 @@ def main(argv: list[str] | None = None) -> int:
                 pool = CandidatePool.from_dict(
                     load_json(args.pool.read_text(encoding="utf-8-sig")), store
                 )
+                toolbox = _toolbox(args, stack, store, client, reviewer)
+                plan = load_json(args.plan.read_text(encoding="utf-8-sig")) if args.plan else None
                 result = council_draft(
                     pool, orchestrator, member, client, store,
                     members=args.members, max_repairs=args.repairs, reviewer=reviewer,
+                    toolbox=toolbox, plan=plan,
                 )
+                result = _polish(args, result, pool, orchestrator, toolbox, reviewer)
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
         if args.command in {"interview", "intake", "discover", "engine-map", "draft", "build"}:
@@ -910,10 +1032,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     sources = stack.enter_context(SourceCache(args.data_dir / "sources.sqlite3"))
                     spellbook = None if args.no_combos else SpellbookClient(sources, store=store)
+                    judge = None if args.no_verify else _map_judge(args, stack, store, client, model)
                     try:
                         pool = build_engine_map(
                             pool, model, store, spellbook=spellbook,
-                            search=BulkSearch(store, client),
+                            search=BulkSearch(store, client), judge=judge,
                         )
                         result = pool.to_dict()
                     except SchemaError as exc:
@@ -924,14 +1047,18 @@ def main(argv: list[str] | None = None) -> int:
                     result = discover(
                         spec, model, client, store, pool_limit=args.pool_limit,
                         search=BulkSearch(store, client), pool_mode=args.pool_mode,
+                        embedder=_card_embedder(args, store),
                     ).to_dict()
                 elif args.command == "draft":
                     pool = CandidatePool.from_dict(
                         load_json(args.pool.read_text(encoding="utf-8-sig")), store
                     )
+                    toolbox = _toolbox(args, stack, store, client, reviewer)
                     result = draft_deck(
-                        pool, model, client, store, max_repairs=args.repairs, reviewer=reviewer
+                        pool, model, client, store, max_repairs=args.repairs, reviewer=reviewer,
+                        toolbox=toolbox,
                     )
+                    result = _polish(args, result, pool, model, toolbox, reviewer)
                 else:
                     result = build_deck(
                         args.request,

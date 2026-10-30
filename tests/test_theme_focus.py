@@ -29,14 +29,23 @@ class ThemeFocusTests(unittest.TestCase):
         spec = make_spec(themes=["tokens"], mechanics=[], win_conditions=["combat"])
         self.assertEqual(theme_priority(card("Tokens", text="Create two tokens."), spec), 0)
 
-    def test_padding_prefers_proliferate_even_when_model_ranks_tokens_first(self):
+    def pool(self):
         spec = make_spec(win_conditions=["Myojin combat"])
-        pool = SimpleNamespace(spec=spec, cards=[
+        return SimpleNamespace(spec=spec, cards=[
             Candidate(validation_card(card(f"Generic {i}")), {"creatures"}) for i in range(63)
         ] + [
             Candidate(validation_card(card("Tokens", text="Create two tokens.")), {"theme"}),
             Candidate(validation_card(card("Engine", text="Proliferate.")), {"theme"}),
         ])
-        result = assemble_nonlands(pool, {"theme": ["Tokens", "Engine"]})
+
+    def test_padding_prefers_proliferate_over_tokens(self):
+        result = assemble_nonlands(self.pool(), {})
         self.assertIn("Engine", result["cards"])
         self.assertNotIn("Tokens", result["cards"])
+
+    def test_a_drafter_that_ranks_tokens_keeps_them(self):
+        # The drafter's own ranking decides; theme priority only orders code's padding.
+        result = assemble_nonlands(self.pool(), {"strong": ["Tokens"]})
+        self.assertIn("Tokens", result["cards"])
+        self.assertIn("Engine", result["cards"])
+        self.assertEqual(result["code_added"], sorted(set(result["cards"]) - {"Tokens"}))

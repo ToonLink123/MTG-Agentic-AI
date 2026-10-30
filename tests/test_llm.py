@@ -35,6 +35,19 @@ class LLMTests(unittest.TestCase):
         self.assertIsNone(request.get_header("Authorization"))
 
     @patch("mtg_agentic.llm.urlopen")
+    def test_a_shared_context_message_joins_the_system_prompt(self, http):
+        http.return_value = io.BytesIO(
+            json.dumps({"done": True, "message": {"content": json.dumps(spec_reply())}}).encode()
+        )
+        request_json(OllamaClient(), [
+            {"role": "system", "content": "POOL"}, {"role": "system", "content": "Draft."},
+            {"role": "user", "content": "Myojin"},
+        ], SPEC_SCHEMA)
+        messages = json.loads(http.call_args.args[0].data)["messages"]
+        self.assertEqual(messages[0], {"role": "system", "content": "POOL\n\nDraft."})
+        self.assertEqual([m["role"] for m in messages], ["system", "user"])
+
+    @patch("mtg_agentic.llm.urlopen")
     def test_openai_adapter_sends_schema_and_explicit_key(self, http):
         http.return_value = io.BytesIO(
             json.dumps(

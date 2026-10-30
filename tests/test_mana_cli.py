@@ -86,7 +86,7 @@ class ManaCliTests(unittest.TestCase):
             self.assertEqual(report["errors"][0]["error"], "input")
 
     def test_impossible_mana_base_returns_errors_and_exit_one(self):
-        status, report = self.run_cli(str(self.deck), "--lands", "0")
+        status, report = self.run_cli(str(self.deck), "--lands", "1")
         self.assertEqual(status, 1)
         self.assertFalse(report["valid"])
         self.assertTrue(report["errors"])
