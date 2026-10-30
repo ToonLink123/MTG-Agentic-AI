@@ -19,6 +19,7 @@ from pathlib import Path
 
 from .card_graph import card_identity, index_ready
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION, FORMAT_VERSION
+from .events import event
 from .oracle import COMBO_CARDS, OracleStore
 
 STEPS = (
@@ -32,8 +33,11 @@ log = logging.getLogger(__name__)
 
 
 def stage(name: str, detail: str) -> None:
-    # The TUI checks off its setup steps on these lines, so keep their shape.
-    log.info("setup: %d/%d %s: %s", STEPS.index(name) + 1, len(STEPS), name, detail)
+    # The TUI checks off its setup steps on these events.
+    index = STEPS.index(name) + 1
+    log.info("setup: %d/%d %s: %s", index, len(STEPS), name, detail, extra=event(
+        "stage", scope="setup", index=index, total=len(STEPS), name=name, detail=detail,
+    ))
 
 
 def embedding_problem() -> str | None:

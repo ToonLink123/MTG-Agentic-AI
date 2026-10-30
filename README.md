@@ -74,14 +74,19 @@ Rules embeddings always run locally with Google's EmbeddingGemma 2.
 ## Terminal app and command line
 
 The terminal app is a chat with live progress, session tabs (Ctrl+N, F6) and `/help` for its
-commands. Every step it runs is also a command you can run yourself, each reading the file the
-last one wrote:
+commands. It shows what each run and session cost in tokens, cache share and estimated dollars,
+and a deck's curve and each color's pips against its land sources. `/why CARD` says who picked a
+card and why; `/versions`, `/diff` and `/undo` walk a deck's saved versions; `/checkpoint on`
+pauses before drafting so you can pin or ban cards and change role targets. Every step it runs is
+also a command you can run yourself, each reading the file the last one wrote (`--events` prints
+its progress as JSON lines, which is how the terminal app reads it):
 
 ```sh
 python -m mtg_agentic intake --commander "Jodah, Archmage Eternal" --request "Bracket 3 Myojin tribal" --output spec.json
 python -m mtg_agentic discover --spec spec.json --output pool.json
 python -m mtg_agentic engine-map --pool pool.json --output mapped.json
-python -m mtg_agentic council --pool mapped.json --output deck.json
+python -m mtg_agentic council-plan --pool mapped.json --output plan.json   # optional
+python -m mtg_agentic council --pool mapped.json --plan plan.json --output deck.json
 ```
 
 Results are JSON, files are never overwritten, and `validate` exits with `1` for a deck that

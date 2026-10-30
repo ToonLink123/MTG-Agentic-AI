@@ -39,9 +39,11 @@ from .bootstrap import embedding_problem
 from .bootstrap import status as setup_status
 from .council import MEMBER, ORCHESTRATOR
 from .discovery import POOL_MODES
+from .events import parse as parse_event
 from .interview import AGENTS_DECIDE, OWN_ANSWER
 from .llm import PROVIDERS
 from .oracle import OracleStore
+from .roles import ROLE_BOUNDS
 from .schema import BRACKET3_MODES
 
 GOLD, BLUE, TEAL = "#d9a441", "#7aa2d6", "#5fb3a1"
@@ -81,7 +83,14 @@ HELP = (
     ("/review", "Bracket plus rules review of the current deck"),
     ("/review on|off", "Whether each draft runs that review itself (on by default)"),
     ("/orchestrate on|off", "Draft with a council: an orchestrator plans, members debate (on by default)"),
+    ("/checkpoint on|off", "Pause after the engine map and the council's plan to pin or ban cards "
+                           "and change role targets, then approve (off by default)"),
     ("/deck", "Show the current deck again"),
+    ("/why CARD", "Why a card is in the deck, or not: who picked it, its roles, its place in "
+                  "the engine map and the council's votes"),
+    ("/versions", "Every saved version of this deck, with what each change did"),
+    ("/diff vN [vM]", "What changed from version N to the current deck, or to version M"),
+    ("/undo", "Go back to the previous version; every version stays saved"),
     ("/load PATH", "Make a saved deck JSON the current deck"),
     ("/export [PATH]", "Save the current deck as a text list, commander first, and copy it"),
     ("/new", "Open a new session in its own tab; runs in other tabs keep going"),
@@ -101,7 +110,8 @@ HELP = (
 )
 SUGGESTIONS = [
     "/commander ", "/card ", "/search ", "/ask ", "/validate", "/bracket", "/review",
-    "/review on", "/review off", "/orchestrate on", "/orchestrate off", "/deck", "/load ",
+    "/review on", "/review off", "/orchestrate on", "/orchestrate off", "/checkpoint on",
+    "/checkpoint off", "/deck", "/why ", "/versions", "/diff ", "/undo", "/load ",
     "/export", "/draft ", "/new", "/close", "/session", "/setup", "/setup refresh",
     *(f"/model {p}" for p in PROVIDERS),
     *(f"/mode {m}" for m in ("auto", *BRACKET3_MODES)), *(f"/pool {m}" for m in POOL_MODES),
@@ -111,8 +121,8 @@ SUGGESTIONS = [
 # `/review on|off` is one too; `/review` alone starts a deck review.
 # /new, /session and /close move to other tabs, which is how a second run starts.
 WHILE_BUSY = {
-    "/stop", "/help", "/model", "/mode", "/pool", "/orchestrate", "/log", "/quit", "/new",
-    "/session", "/close",
+    "/stop", "/help", "/model", "/mode", "/pool", "/orchestrate", "/checkpoint", "/log", "/quit",
+    "/new", "/session", "/close",
 }
 # Every draft starts with the interview, intake, discovery and the engine map.
 PREPARE_STEPS = ["Interview", "Intake", "Discovery", "Engine map"]
@@ -125,20 +135,15 @@ STAGE_LABELS = {
     "makes": "Makes", "multiplies": "Multiplies", "spends": "Spends", "pays_off": "Pays off",
     "protects": "Protects",
 }
-# The council command logs "council: 2/5 drafts: ..." as it moves through its stages.
-# Agent and tool events from mtg_agentic.activity feed the live agent panel.
-AGENT_EVENT = re.compile(
-    r"^agent: (?P<name>[^|]+?) \| (?P<state>start|progress|done|failed) \| (?P<rest>.*)$"
-)
-TOOL_EVENT = re.compile(r"^tool: (?P<name>[^|]+?) \| (?P<detail>.*)$")
+# Every command runs with --events, so its progress arrives as JSON events (see events.py):
+# agent and tool events feed the live agent panel, usage events the cost meter, and stage
+# events (council, setup) advance a turn's checklist.
 LILAC, PINK = "#c49bd6", "#e8a0bf"
 AGENT_COLORS = {
     "orchestrator": GOLD, "drafter": GOLD, "engine": TEAL, "resilience": BLUE,
     "consistency": LILAC, "intake": BLUE, "scout": TEAL, "reviewer": PINK, "judges": PINK,
     "interviewer": GOLD, "mapper": TEAL,
 }
-COUNCIL_STAGE = re.compile(r"council: (\d+)/\d+ \w+: (.*)")
-SETUP_STAGE = re.compile(r"setup: (\d+)/\d+ [^:]+: (.*)")
 SETUP_NOTE = (
     "Downloading what the deck pipeline reads locally, once: card data, tags and rulings from "
     "Scryfall, Commander Spellbook's combos (700 MB), the rules index and the EmbeddingGemma 2 "
@@ -162,6 +167,7 @@ class Settings:
     review: bool = True
     orchestrate: bool = True  # Deck requests go to the council: an orchestrator and members.
     pool: str = "mixed"  # How discovery ranks what it finds; see POOL_MODES.
+    checkpoint: bool = False  # Pause after the map (and the council's plan) for the player.
 
     def model_args(self) -> list[str]:
         return ["--provider", self.provider, *(["--model", self.model] if self.model else [])]
@@ -226,11 +232,17 @@ class Settings:
             raise ValueError("Use /orchestrate on or off")
         self.orchestrate = value == "on"
 
+    def choose_checkpoint(self, value: str) -> None:
+        if value not in {"on", "off"}:
+            raise ValueError("Use /checkpoint on or off")
+        self.checkpoint = value == "on"
+
     def describe(self) -> str:
         return (
             f"{self.provider} · {self.model or 'default model'} · "
             f"review {'on' if self.review else 'off'} · mode {self.mode or 'auto'} · "
             f"pool {self.pool}" + (" · council" if self.orchestrate else "")
+            + (" · checkpoint" if self.checkpoint else "")
         )
 
 
@@ -247,7 +259,8 @@ async def run_cli(
     """Run one CLI command, streaming stderr lines to `on_line`; return (exit code, stdout JSON)."""
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "mtg_agentic", "--data-dir", str(data_dir), *argv,
+        # --events: progress as JSON lines, read by Turn.progress instead of matching text.
+        sys.executable, "-m", "mtg_agentic", "--data-dir", str(data_dir), "--events", *argv,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -500,9 +513,13 @@ def card_type(card: dict[str, Any] | None) -> str:
 
 
 class DeckColumns:
-    """Card groups flowed into as many balanced columns as the width allows."""
+    """Card groups flowed into as many balanced columns as the width allows. `marked` cards
+    (filled in by code) get one dim dot; /why tells the rest."""
 
-    def __init__(self, groups: list[tuple[str, list[tuple[int, str, str]]]]):
+    def __init__(
+        self, groups: list[tuple[str, list[tuple[int, str, str]]]], marked: Iterable[str] = (),
+    ):
+        marked = set(marked)
         self.rows: list[tuple[str, Text, Text]] = []
         for title, cards in groups:
             if self.rows:
@@ -511,7 +528,8 @@ class DeckColumns:
             self.rows.append(("head", Text(f"{title} {count}", f"bold {GOLD}"), Text()))
             for quantity, name, cost in cards:
                 label = Text(f"{quantity} ", MUTED) if quantity > 1 else Text()
-                self.rows.append(("card", label + Text(name), mana(cost)))
+                mark = Text(" ·", MUTED) if name in marked else Text()
+                self.rows.append(("card", label + Text(name) + mark, mana(cost)))
 
     def __rich_console__(self, console, options):
         # Use only as many columns as fit the longest name beside the longest cost (a column's
@@ -602,6 +620,12 @@ def render_deck(
             if target is not None:
                 roles.append(f"/{target}", MUTED)
         parts.append(roles)
+    curve = curve_line(cards, lookup)
+    if curve is not None:
+        parts.append(curve)
+    sources = mana_line(deck.get("land_base") or {})
+    if sources is not None:
+        parts.append(sources)
     if deck.get("asks"):
         parts.append(render_asks(deck["asks"]))
     leader = lookup(deck["commander"])
@@ -616,9 +640,15 @@ def render_deck(
         if kind in groups:
             rows = sorted(groups[kind], key=lambda row: (row[0], row[2]))
             ordered.append((PLURALS.get(kind, kind + "s"), [r[1:] for r in rows]))
-    parts += [Text(), DeckColumns(ordered)] if columns else []
+    padded = [n for n in (deck.get("assembly") or {}).get("code_added", []) if n in cards]
+    parts += [Text(), DeckColumns(ordered, padded)] if columns else []
+    if columns and padded:
+        parts.append(Text("· filled in by code to reach a role count · /why CARD explains any card",
+                          MUTED))
     if errors:
         parts += [Text(), problems(errors)]
+        if (repeated := repeated_problem(deck)) is not None:
+            parts.append(repeated)
     if deck.get("review", {}).get("warnings"):
         parts += [Text(), unverified(deck["review"]["warnings"])]
     if path is not None:
@@ -773,6 +803,294 @@ def render_interaction(result: dict[str, Any]) -> Group:
     return Group(*parts)
 
 
+BARS = "▁▂▃▄▅▆▇█"
+
+
+def curve_line(cards: dict[str, int], lookup: Callable[[str], dict[str, Any] | None]) -> Text | None:
+    """Nonland cards by mana value, 0 to 7+, as small bars with counts."""
+    counts = Counter()
+    for name, quantity in cards.items():
+        card = lookup(name)
+        if card is None or card_type(card) == "Land":
+            continue
+        counts[min(int(card.get("cmc") or 0), 7)] += quantity
+    if not counts:
+        return None
+    top = max(counts.values())
+    line = Text("Curve  ", MUTED)
+    for value in range(8):
+        count = counts.get(value, 0)
+        bar = BARS[max(0, round(count / top * (len(BARS) - 1)))] if count else " "
+        line.append(f"{value}{'+' if value == 7 else ''}", MUTED)
+        line.append(bar, GOLD if count else MUTED)
+        line.append(f"{count} " if count else "  ", "" if count else MUTED)
+    return line
+
+
+def mana_line(land_base: dict[str, Any]) -> Text | None:
+    """Each color's pips in the spells against the lands that make it: amber where the lands
+    fall short of code's target for that color."""
+    pips = land_base.get("mana_pips") or {}
+    sources = land_base.get("source_counts") or {}
+    targets = land_base.get("source_targets") or {}
+    colors = [c for c in "WUBRGC" if pips.get(c) or targets.get(c)]
+    if not colors:
+        return None
+    line = Text("Mana   ", MUTED)
+    for color in colors:
+        have, want = sources.get(color, 0), targets.get(color, 0)
+        line.append(color, f"bold {PIPS.get(color, MUTED)}")
+        line.append(f" {round(pips.get(color, 0))} pips · ", MUTED)
+        line.append(f"{have}", AMBER if want and have < want else "")
+        line.append(f"/{want} sources   " if want else " sources   ", MUTED)
+    return line
+
+
+ROLE_WORDS = {
+    "ramp": "ramp cards", "draw": "card draw", "removal": "removal spells", "wipes": "board wipes",
+    "creatures": "creatures", "protection": "protection pieces",
+}
+# A follow-up a player can send when the same problem keeps coming back, by problem kind.
+FOLLOW_UPS = {
+    "role_target": "Add {short} more {role}",
+    "role_balance": "Cut a board wipe",
+    "ask_uncovered": "Add a card for \"{quote}\"",
+    "protection_speed": "Add instant-speed protection for the commander",
+    "protection_redundancy": "Add a different kind of protection for the commander",
+    "bracket_review": "Make it fit Bracket {bracket}",
+    "interaction_review": "Replace the combo the rules contradict",
+    "game_changers": "Cut a Game Changer",
+}
+
+
+def repeated_problem(deck: dict[str, Any]) -> Text | None:
+    """The same problems ending every attempt so far, with a follow-up to ask for instead."""
+    attempts = deck.get("attempts") or []
+    if len(attempts) < 2:
+        return None
+
+    def signature(errors: list[Any]) -> list[str]:
+        return sorted(problem(e) for e in errors)
+
+    last = signature(attempts[-1].get("errors", []))
+    runs = 0
+    for attempt in reversed(attempts):
+        if signature(attempt.get("errors", [])) != last:
+            break
+        runs += 1
+    if runs < 2 or not last:
+        return None
+    first = next((e for e in attempts[-1]["errors"] if isinstance(e, dict)), {})
+    kind = first.get("error", "")
+    short = ""
+    if kind == "role_target":
+        found = re.findall(r"\d+", str(first.get("detail", "")))
+        short = str(int(found[0]) - int(found[1])) if len(found) >= 2 else "a few"
+    quote = next((a.get("quote", "") for a in deck.get("asks", []) if a.get("id") == first.get("ask")), "")
+    follow = FOLLOW_UPS.get(kind, "").format(
+        short=short, role=ROLE_WORDS.get(first.get("role", ""), first.get("role", "")),
+        quote=quote[:60], bracket=deck.get("bracket", 3),
+    )
+    line = Text(f"Same problem on {runs}/{len(attempts)} attempts: {problem(first)}", AMBER)
+    if follow:
+        line.append("\nTry asking: ", MUTED)
+        line.append(f'"{follow}"', GOLD)
+    return line
+
+
+def _where(deck: dict[str, Any], name: str) -> list[str]:
+    """Why `name` is in the deck, or why not, from what the deck's run recorded."""
+    reasons: list[str] = []
+    cards = deck.get("cards", {})
+    spec = deck.get("spec") or {}
+    council = deck.get("council") or {}
+    assembly = deck.get("assembly") or {}
+    roles_by_list = [(key, label) for key, label in (
+        ("win_conditions", "a win condition"), ("game_changers", "a Game Changer it allowed"),
+        ("key_cards", "a key card"),
+    ) if name in council.get(key, [])]
+    if name in council.get("core", []):
+        why = " and ".join(label for _, label in roles_by_list) or "part of the plan's core"
+        reasons.append(f"The orchestrator put it in the council's core as {why}.")
+    elif name in spec.get("must_include", []):
+        reasons.append("You asked for it: it is a must-include card.")
+    if name in council.get("locked", []) and name not in council.get("core", []):
+        reasons.append("Every council member ranked it within the deck's slots.")
+    vote = (council.get("votes") or {}).get(name)
+    if vote:
+        kept = name in (council.get("decision") or {}).get("keep", [])
+        reasons.append(f"Debated: {vote.get('keep', 0)} keep, {vote.get('cut', 0)} cut. The "
+                       f"orchestrator {'kept it' if kept else 'left it out'}.")
+        reasons += [f"  {reason}" for reason in vote.get("reasons", [])[:4]]
+    tier = next((t for t, names in (deck.get("picks") or {}).items() if name in names), None)
+    if tier:
+        reasons.append(f"The drafter ranked it {tier}.")
+    for entry in (deck.get("outside") or []):
+        if name in entry.get("accepted", []):
+            reasons.append("A drafter named it from outside the candidate pool; code checked it.")
+            break
+    for swap in assembly.get("code_swaps", []):
+        if swap.get("in") == name:
+            reasons.append(f"Code swapped it in for {swap['out']} ({swap['from']}) to reach the role minimums.")
+    if name in assembly.get("code_added", []) and not any(s.get("in") == name for s in assembly.get("code_swaps", [])):
+        reasons.append("Code filled it in to reach a role count; no drafter picked it.")
+    for drop in assembly.get("dropped", []):
+        if drop.get("card") == name:
+            reasons.append(f"Code left it out: {drop['reason']}.")
+    polish = deck.get("polish") or {}
+    for swap in polish.get("swaps", []) if polish.get("kept") else []:
+        if swap.get("add") == name:
+            reasons.append(f"The orchestrator's polish pass added it for {swap['remove']}: {swap['reason']}")
+        if swap.get("remove") == name:
+            reasons.append(f"The orchestrator's polish pass cut it for {swap['add']}: {swap['reason']}")
+    for entry in deck.get("conversation", []):
+        for swap in entry.get("swaps", []):
+            if name in (swap.get("add"), swap.get("remove")):
+                verb = "added" if swap.get("add") == name else "cut"
+                reasons.append(f'You asked "{entry.get("player", "")[:80]}": the orchestrator {verb} '
+                               f"it ({swap.get('reason', '')}).")
+    land = ((deck.get("land_base") or {}).get("selection_reasons") or {}).get(name)
+    if land:
+        reasons.append(f"Lands are code's: chosen as {land.replace('_', ' ')}.")
+    if not reasons:
+        reasons.append("In the deck, with no record of who picked it (a saved or loaded deck)."
+                       if name in cards else "Not in the deck, and no step of this deck's run considered it.")
+    return reasons
+
+
+def render_why(name: str, deck: dict[str, Any], pool: dict[str, Any] | None,
+               lookup: Callable[[str], dict[str, Any] | None]) -> Group:
+    """/why CARD: who picked a card and why, its roles, its place in the engine map, the links
+    and combos it is part of, and the player's asks it serves."""
+    from .roles import oracle_roles
+
+    card = lookup(name)
+    shown_name = card["name"] if card else name
+    inside = shown_name in deck.get("cards", {})
+    head = Table.grid(expand=True)
+    head.add_column()
+    head.add_column(justify="right")
+    head.add_row(Text(shown_name, f"bold {GOLD}"), mana((card or {}).get("mana_cost", "")))
+    parts: list[Any] = [head]
+    status = Text("In the deck" if inside else "Not in the deck", GREEN if inside else AMBER)
+    if card:
+        roles = sorted(oracle_roles(card) - {"lands"})
+        tags = card.get("functions") or []
+        status.append(f"  ·  {card.get('type_line', '')}", MUTED)
+        if roles or tags:
+            status.append("  ·  " + ", ".join(dict.fromkeys([*roles, *tags])), MUTED)
+    parts.append(status)
+    parts += [Text(f"• {reason}") for reason in _where(deck, shown_name)]
+    engine = (pool or {}).get("engine_map") or {}
+    places = [
+        f"{STAGE_LABELS.get(stage['stage'], stage['stage'])} ({entry['tier']}): {entry['role']}"
+        for stage in engine.get("stages", []) for entry in stage["cards"] if entry["name"] == shown_name
+    ]
+    links = [link for link in engine.get("links", []) if shown_name in (link["from"], link["to"])]
+    asks = [ask for ask in deck.get("asks", []) if shown_name in ask.get("cards", [])]
+    combos = [c for c in (pool or {}).get("combos", []) if shown_name in c.get("cards", [])]
+    if places or links or asks or combos:
+        parts.append(Text("Engine", "bold"))
+        parts += [Text(f"  {place}", MUTED) for place in places]
+        for link in links[:6]:
+            mark = {"supported": " ✓ rules", "unverified": " ? rules"}.get(link.get("verified", ""), "")
+            parts.append(Text(f"  {link['from']} → {link['to']}: {link['how']}{mark}", MUTED))
+        parts += [Text(f'  Serves your ask "{ask["quote"][:80]}"', MUTED) for ask in asks]
+        parts += [Text(f"  Combo: {' + '.join(c['cards'])} ({', '.join(c['results'][:2])})", MUTED)
+                  for c in combos[:4]]
+    return Group(*parts)
+
+
+VERSION = re.compile(r"^(?P<base>.+?)(?:-v(?P<number>\d+))?$")
+
+
+def deck_versions(deck_path: Path) -> list[Path]:
+    """Every saved version of the deck at `deck_path` (01-deck.json, 01-deck-v2.json...), oldest
+    first."""
+    base = VERSION.match(deck_path.stem)["base"]
+    found = []
+    for path in deck_path.parent.glob(f"{base}*.json"):
+        match = VERSION.match(path.stem)
+        if match and match["base"] == base:
+            found.append((int(match["number"] or 1), path))
+    return [path for _, path in sorted(found)]
+
+
+def version_number(path: Path) -> int:
+    return int(VERSION.match(path.stem)["number"] or 1)
+
+
+def changes(before: dict[str, int], after: dict[str, int]) -> tuple[list[str], list[str]]:
+    removed = sorted(n for n in before if n not in after)
+    added = sorted(n for n in after if n not in before)
+    removed += sorted(f"{n} ({before[n]} → {after[n]})" for n in before if n in after and after[n] != before[n])
+    return removed, added
+
+
+def render_versions(paths: list[Path], current: Path) -> Table:
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(no_wrap=True)
+    grid.add_column(no_wrap=True)
+    grid.add_column(no_wrap=True, style=MUTED)
+    grid.add_column(overflow="ellipsis", ratio=1, style=MUTED)
+    previous: dict[str, int] | None = None
+    for path in paths:
+        with contextlib.suppress(OSError, ValueError):
+            deck = json.loads(path.read_text(encoding="utf-8"))
+            cards = deck.get("cards", {})
+            removed, added = changes(previous, cards) if previous is not None else ([], [])
+            what = (deck.get("edit") or {}).get("reply") or ("drafted" if previous is None else "")
+            status = Text("✓", GREEN) if deck.get("valid") else Text("✗", RED)
+            label = Text(f"v{version_number(path)}", f"bold {GOLD}" if path == current else "")
+            change = f"+{len(added)} −{len(removed)}" if previous is not None else ""
+            grid.add_row(label + (Text(" (current)", GOLD) if path == current else Text()),
+                         status, change, " ".join(what.split())[:120])
+            previous = cards
+    return grid
+
+
+def render_diff(before: dict[str, Any], after: dict[str, Any], labels: tuple[str, str]) -> Group:
+    removed, added = changes(before.get("cards", {}), after.get("cards", {}))
+    parts: list[Any] = [Text(f"{labels[0]} → {labels[1]}", "bold")]
+    if not removed and not added:
+        parts.append(Text("The same cards.", MUTED))
+    parts += [Text.assemble(("- ", RED), name) for name in removed]
+    parts += [Text.assemble(("+ ", GREEN), (name, GREEN)) for name in added]
+    return Group(*parts)
+
+
+def render_plan(plan: dict[str, Any]) -> Table:
+    """The council orchestrator's plan, before the checkpoint."""
+    rows: list[tuple[str, Any]] = [
+        ("Plan", plan.get("game_plan", "")),
+        ("Core", ", ".join(plan.get("core", [])) or "none"),
+        ("Targets", " · ".join(f"{k} {v}" for k, v in plan.get("role_targets", {}).items())),
+    ]
+    if plan.get("targets_reason"):
+        rows.append(("Why", Text(plan["targets_reason"], MUTED)))
+    if plan.get("non_goals"):
+        rows.append(("Avoid", ", ".join(plan["non_goals"])))
+    return labeled(rows)
+
+
+def apply_checkpoint(pool: dict[str, Any], plan: dict[str, Any] | None, edits: dict[str, Any]) -> None:
+    """A checkpoint's pins, bans and targets, written into the pool (and the council's plan)."""
+    spec = pool["spec"]
+    pins, bans = edits["pins"], edits["bans"]
+    spec["must_include"] = [n for n in dict.fromkeys([*spec["must_include"], *pins]) if n not in bans]
+    spec["exclude"] = [n for n in dict.fromkeys([*spec["exclude"], *bans]) if n not in pins]
+    present = {card["name"] for card in pool["cards"]}
+    pool["cards"] = [c for c in pool["cards"] if c["name"] not in bans] + [
+        {"name": name, "roles": ["support"]} for name in pins if name not in present
+    ]
+    if plan is None:
+        spec["role_targets"].update(edits["targets"])
+        return
+    for key in ("win_conditions", "game_changers", "key_cards", "core"):
+        plan[key] = [n for n in plan.get(key, []) if n not in bans]
+    plan["role_targets"] = {**plan.get("role_targets", {}), **edits["targets"]}
+
+
 def decklist_text(deck: dict[str, Any]) -> str:
     """`1 Card Name` per unique card, commander first: the list most deck sites import."""
     rows = [(1, deck["commander"]), *((qty, name) for name, qty in deck["cards"].items())]
@@ -824,9 +1142,12 @@ def read_session(folder: Path) -> dict[str, Any]:
         with contextlib.suppress(OSError, ValueError):
             saved = json.loads(deck.read_text(encoding="utf-8"))
             commander, valid = saved.get("commander"), saved.get("valid")
+    usage = new_usage()
+    if isinstance(data.get("usage"), dict):
+        usage.update({k: v for k, v in data["usage"].items() if k in usage and isinstance(v, int | float)})
     return {
         "path": folder, "name": folder.name, "commander": commander, "valid": valid,
-        "deck": deck, "decks": len(decks), "turns": data.get("turns", []),
+        "deck": deck, "decks": len(decks), "turns": data.get("turns", []), "usage": usage,
     }
 
 
@@ -867,6 +1188,41 @@ def elapsed(seconds: float) -> str:
     return f"{seconds:.1f}s" if seconds < 60 else f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
 
 
+def new_usage() -> dict[str, Any]:
+    return {"calls": 0, "input": 0, "cached": 0, "written": 0, "output": 0, "cost": 0.0, "priced": 0}
+
+
+def add_usage(usage: dict[str, Any], event: dict[str, Any]) -> None:
+    """Add one usage event (one model call) to a tally."""
+    usage["calls"] += 1
+    for key in ("input", "cached", "written", "output"):
+        value = event.get(key)
+        usage[key] += value if type(value) is int else 0
+    if isinstance(event.get("cost"), int | float):
+        usage["cost"] += event["cost"]
+        usage["priced"] += 1
+
+
+def tokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    return f"{count / 1000:.1f}K" if count >= 1000 else str(count)
+
+
+def usage_line(usage: dict[str, Any]) -> Text | None:
+    """Model calls, tokens in (with the share read from the prompt cache), tokens out, and
+    the estimated dollars of the calls with a known price."""
+    if not usage["calls"]:
+        return None
+    sent = usage["input"] + usage["cached"] + usage["written"]
+    share = usage["cached"] / sent if sent else 0.0
+    line = (f"{usage['calls']} model call{'s' * (usage['calls'] != 1)} · {tokens(sent)} tokens in, "
+            f"{share:.0%} from cache · {tokens(usage['output'])} out")
+    if usage["priced"]:
+        line += f" · ≈ ${usage['cost']:.2f}"
+    return Text(line, MUTED)
+
+
 class Turn(Vertical):
     """One reply: a checklist of CLI steps with a live tail of their progress, then results."""
 
@@ -881,6 +1237,8 @@ class Turn(Vertical):
         self.tail: list[str] = []  # progress that is not an agent or tool event
         self.agents: dict[str, dict[str, Any]] = {}
         self.tools: list[tuple[str, str]] = []
+        self.usage: dict[str, Any] = new_usage()  # This run's model calls, from usage events.
+        self.account: dict[str, Any] | None = None  # The session's, which a run adds to.
         self.frame = 0
         self.ticker: Timer | None = None
 
@@ -906,25 +1264,31 @@ class Turn(Vertical):
     def working(self) -> int:
         return sum(1 for agent in self.agents.values() if agent["state"] == "running")
 
-    def record(self, line: str) -> bool:
-        """Apply an agent or tool event; False for any other progress line."""
-        if match := AGENT_EVENT.match(line):
-            agent = self.agents.setdefault(match["name"], {
+    def record(self, event: dict[str, Any]) -> bool:
+        """Apply an agent, tool or usage event; False for any other event."""
+        kind = event["type"]
+        if kind == "agent":
+            agent = self.agents.setdefault(str(event.get("name", "agent")), {
                 "model": "", "task": "", "state": "running", "start": 0.0, "end": 0.0,
                 "note": "", "calls": 0,
             })
-            state, rest, now = match["state"], match["rest"], time.monotonic()
+            state, now = event.get("state"), time.monotonic()
             if state == "start":
-                model, _, task = rest.partition(" | ")
-                agent.update(model=model, task=task, state="running", start=now, end=0.0,
-                             note="", calls=agent["calls"] + 1)
+                agent.update(model=str(event.get("model", "")), task=str(event.get("task", "")),
+                             state="running", start=now, end=0.0, note="", calls=agent["calls"] + 1)
             elif state == "progress":
-                agent["note"] = rest
-            else:
-                agent.update(state=state, end=now, note="" if state == "done" else rest)
+                agent["note"] = str(event.get("note", ""))
+            elif state in {"done", "failed"}:
+                agent.update(state=state, end=now,
+                             note="" if state == "done" else str(event.get("note", "")))
             return True
-        if match := TOOL_EVENT.match(line):
-            self.tools.append((match["name"], match["detail"]))
+        if kind == "tool":
+            self.tools.append((str(event.get("name", "tool")), str(event.get("detail", ""))))
+            return True
+        if kind == "usage":
+            add_usage(self.usage, event)
+            if self.account is not None:
+                add_usage(self.account, event)
             return True
         return False
 
@@ -952,6 +1316,8 @@ class Turn(Vertical):
                 Text(elapsed((agent["end"] or now) - agent["start"]), MUTED),
             )
         parts: list[Any] = [grid] if self.agents else []
+        if (spent := usage_line(self.usage)) is not None:
+            parts.append(Text.assemble(("  ", ""), spent))
         if self.tools:
             if any(step["state"] == "running" for step in self.steps):
                 for tool, detail in self.tools[-3:]:
@@ -1018,15 +1384,18 @@ class Turn(Vertical):
         self.add(message)
 
     def progress(self, line: str) -> None:
-        self.lines.append(line)
-        if self.record(line):
+        """One stderr line of a run: an event (see events.py), or plain text such as a warning."""
+        event = parse_event(line)
+        text = str(event.get("message", "")).strip() if event else line
+        self.lines.append(text or line)  # /log shows the words, not the JSON.
+        if event is not None and self.record(event):
             self.draw_agents()
-            if line.startswith("agent:"):
+            if event["type"] in {"agent", "usage"}:
                 refresh = getattr(self.app, "refresh_chrome", None)
                 if refresh is not None:
                     refresh()
-        else:
-            self.tail.append(line)
+        elif event is None or event["type"] == "log":
+            self.tail.append(text)
             self.show_tail(4)
 
     def show_tail(self, count: int) -> None:
@@ -1174,6 +1543,94 @@ class QuestionPicker(ModalScreen[dict[str, str] | None]):
 LATER = "later"  # A question put away when the player switches tabs; it is asked again later.
 
 
+class CheckpointScreen(ModalScreen[dict[str, Any] | str | None]):
+    """A pause before drafting. Type pin NAME, ban NAME, unpin NAME, unban NAME or target ROLE N;
+    Enter on an empty line approves, Esc stops the run. `resolve(kind, name)` returns the
+    card's exact name, or None and why it cannot be pinned or banned."""
+
+    DEFAULT_CSS = """
+    CheckpointScreen { align: center middle; }
+    CheckpointScreen > Vertical {
+        width: 100; max-width: 95%; height: auto; max-height: 85%;
+        padding: 1 2; background: $surface; border: tall $primary;
+    }
+    CheckpointScreen Input { margin: 1 0; border: tall $primary; }
+    """
+
+    def __init__(self, title: str, targets: dict[str, int],
+                 resolve: Callable[[str, str], tuple[str | None, str]]):
+        super().__init__()
+        self.title_text, self.resolve = title, resolve
+        self.targets = dict(targets)
+        self.pins: list[str] = []
+        self.bans: list[str] = []
+        self.changed: dict[str, int] = {}
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(Text(self.title_text, f"bold {GOLD}"))
+            yield Static(self.summary(), id="checkpoint-summary")
+            yield Static(Text(""), id="checkpoint-message")
+            yield Input(placeholder="pin NAME · ban NAME · target ROLE N · Enter approves",
+                        max_length=200, id="checkpoint-input")
+            yield Static(Text("Enter on an empty line approves and drafts · Esc stops the run", MUTED))
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def summary(self) -> Text:
+        text = Text.assemble(("Targets  ", MUTED), " · ".join(
+            f"{role} {count}" + ("*" if role in self.changed else "") for role, count in self.targets.items()
+        ))
+        text.append(f"\nPinned   {', '.join(self.pins) or 'none'}")
+        text.append(f"\nBanned   {', '.join(self.bans) or 'none'}")
+        return text
+
+    def say(self, message: str, color: str = MUTED) -> None:
+        self.query_one("#checkpoint-message", Static).update(Text(message, color))
+        self.query_one("#checkpoint-summary", Static).update(self.summary())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()  # Never let a checkpoint command reach the chat as a message.
+        command = event.value.strip()
+        event.input.value = ""
+        verb, _, rest = command.partition(" ")
+        verb, rest = verb.lower(), rest.strip()
+        if not command or verb in {"go", "approve"}:
+            self.dismiss({"pins": self.pins, "bans": self.bans, "targets": self.changed})
+        elif verb in {"pin", "ban"} and rest:
+            name, problem_text = self.resolve(verb, rest)
+            if name is None:
+                self.say(problem_text, AMBER)
+                return
+            mine, other = (self.pins, self.bans) if verb == "pin" else (self.bans, self.pins)
+            if name in other:
+                other.remove(name)
+            if name not in mine:
+                mine.append(name)
+            self.say(f"{'Pinned' if verb == 'pin' else 'Banned'} {name}.")
+        elif verb in {"unpin", "unban"} and rest:
+            names = self.pins if verb == "unpin" else self.bans
+            found = next((n for n in names if n.casefold() == rest.casefold()), None)
+            if found:
+                names.remove(found)
+            self.say(f"{verb.title()}ned {found}." if found else f"{rest} is not {verb[2:]}ned.")
+        elif verb == "target":
+            role, _, value = rest.partition(" ")
+            role = role.lower()
+            bounds = ROLE_BOUNDS.get(role)
+            if bounds is None or not value.strip().isdigit():
+                self.say("Use target ROLE N, with a role among " + ", ".join(ROLE_BOUNDS), AMBER)
+                return
+            count = min(max(int(value), bounds[0]), bounds[1])
+            self.targets[role] = self.changed[role] = count
+            note = "" if count == int(value) else f" (kept within {bounds[0]}-{bounds[1]})"
+            self.say(f"{role} target {count}{note}.")
+        else:
+            self.say("Commands: pin NAME, ban NAME, unpin NAME, unban NAME, target ROLE N; "
+                     "Enter approves.", AMBER)
+
+
 class Tab:
     """One session: its folder, deck, transcript and chat. Only the current tab is on screen;
     the others keep running their jobs out of view. Jobs hold the tab that started them, so
@@ -1188,6 +1645,7 @@ class Tab:
         self.pool_path: Path | None = None
         self.transcript: list[dict[str, str]] = []
         self.last: Turn | None = None
+        self.usage: dict[str, Any] = new_usage()  # Every model call this session made.
         self.runs = 0
         self.busy = False
         self.waiting = False  # An interview question waits for this tab to be on screen.
@@ -1227,7 +1685,7 @@ class Tab:
         self.save_session()
 
     def save_session(self) -> None:
-        if not self.transcript and self.deck_path is None:
+        if not self.transcript and self.deck_path is None and not self.usage["calls"]:
             return
 
         def relative(path: Path | None) -> str | None:
@@ -1241,6 +1699,7 @@ class Tab:
             "valid": self.deck.get("valid") if self.deck else None,
             "deck": relative(self.deck_path), "pool": relative(self.pool_path),
             "updated": datetime.now().isoformat(timespec="seconds"), "turns": self.transcript,
+            "usage": self.usage,
         }
         text = json.dumps(data, indent=2) + "\n"
         (self.session / SESSION_FILE).write_text(text, encoding="utf-8")
@@ -1383,6 +1842,10 @@ class ChatApp(App[None]):
             if working:
                 left.append(f" · {working} working", GOLD)
         right = Text(self.settings.describe(), MUTED)
+        if self.tab.usage["priced"]:
+            # The session's spending comes first: the settings shorten when space runs out.
+            spent = Text(f"≈ ${self.tab.usage['cost']:.2f} this session", GOLD)
+            right = Text.assemble(spent, ("  ·  ", MUTED), right)
         if self.busy:
             working = self.last.working() if self.last is not None else 0
             agents = f" {working} agent{'s' * (working != 1)}" if working else ""
@@ -1413,7 +1876,7 @@ class ChatApp(App[None]):
         """Put `tab` on screen; every other tab keeps running out of view."""
         if tab is self.tab:
             return
-        if isinstance(self.screen, QuestionPicker):
+        if isinstance(self.screen, QuestionPicker | CheckpointScreen):
             self.screen.dismiss(LATER)  # The question waits for its own tab.
         elif isinstance(self.screen, SessionPicker):
             self.screen.dismiss(None)
@@ -1520,8 +1983,18 @@ class ChatApp(App[None]):
             if tab.deck_path is not None:
                 argv += ["--deck", str(tab.deck_path)]
             self.launch(["Rules check"], self.ask_job(tab, [*argv, *self.settings.model_args()]))
-        elif command in {"/model", "/mode", "/pool", "/orchestrate"} or (command == "/review" and rest):
+        elif command in {"/model", "/mode", "/pool", "/orchestrate", "/checkpoint"} or (
+            command == "/review" and rest
+        ):
             await self.change_setting(command, rest)
+        elif command == "/why":
+            await self.why(rest)
+        elif command == "/versions":
+            await self.versions()
+        elif command == "/diff":
+            await self.diff(rest)
+        elif command == "/undo":
+            await self.undo()
         elif command in {"/validate", "/bracket", "/review", "/deck"}:
             await self.deck_command(command)
         elif command == "/load" and rest:
@@ -1548,22 +2021,24 @@ class ChatApp(App[None]):
 
     def setup_job(self, refresh: bool) -> Callable[[Turn], Awaitable[None]]:
         async def job(turn: Turn) -> None:
-            def advance(line: str) -> None:
-                # "setup: 2/6 Oracle tags: downloading", then the same step's result.
-                match = SETUP_STAGE.search(line)
-                if match:
-                    index, detail = int(match[1]) - 1, match[2]
-                    if detail == "downloading":
-                        turn.start(index, "downloading")
-                    else:
-                        state = "warn" if detail.startswith("skipped") else "done"
-                        turn.finish(index, detail, state)
+            def advance(event: dict[str, Any]) -> None:
+                # A setup stage starts ("downloading"), then reports its result.
+                if event["type"] != "stage" or event.get("scope") != "setup":
+                    return
+                index, detail = int(event["index"]) - 1, str(event.get("detail", ""))
+                if not 0 <= index < len(turn.steps):
+                    return
+                if detail == "downloading":
+                    turn.start(index, "downloading")
+                else:
+                    state = "warn" if detail.startswith("skipped") else "done"
+                    turn.finish(index, detail, state)
 
             try:
                 turn.add(Text(SETUP_NOTE if not refresh else
                               "Downloading fresh copies of every local data file.", MUTED))
                 argv = ["setup", *(["--refresh"] if refresh else [])]
-                result = await self.step(turn, 0, argv, on_line=advance)
+                result = await self.step(turn, 0, argv, on_event=advance)
                 if result is None:
                     turn.add(Text("Setup stopped early. /setup tries the missing steps again.",
                                   AMBER))
@@ -1657,6 +2132,7 @@ class ChatApp(App[None]):
     async def resume(self, tab: Tab, folder: Path) -> None:
         info = read_session(folder)
         tab.session, tab.transcript, tab.last = folder, list(info["turns"]), None
+        tab.usage = info["usage"]
         tab.deck = tab.deck_path = tab.pool_path = None
         if info["deck"] is not None:
             with contextlib.suppress(OSError, ValueError):
@@ -1719,6 +2195,67 @@ class ChatApp(App[None]):
         self.refresh_chrome()
         await self.reply(render_deck(deck, self.lookup, path))
 
+    def pool_json(self) -> dict[str, Any] | None:
+        if self.pool_path is None:
+            return None
+        with contextlib.suppress(OSError, ValueError):
+            return json.loads(self.pool_path.read_text(encoding="utf-8"))
+        return None
+
+    async def why(self, name: str) -> None:
+        """/why CARD: who picked a card and why, from what the deck's run recorded."""
+        if not name:
+            await self.reply(Text("Name a card: /why Sol Ring", AMBER))
+        elif self.deck is None:
+            await self.reply(Text("No deck yet. Describe one to draft it, or /load a saved deck JSON.", AMBER))
+        else:
+            name = name.strip().strip("[]")
+            await self.reply(render_why(name, self.deck, self.pool_json(), self.lookup))
+
+    def version_paths(self) -> list[Path]:
+        return deck_versions(self.deck_path) if self.deck_path is not None else []
+
+    async def versions(self) -> None:
+        paths = self.version_paths()
+        if not paths:
+            await self.reply(Text("No deck yet, so no versions.", AMBER))
+            return
+        await self.reply(render_versions(paths, self.deck_path))
+
+    async def diff(self, rest: str) -> None:
+        """/diff vN [vM]: from version N to the current deck, or to version M."""
+        paths = {version_number(p): p for p in self.version_paths()}
+        words = [w.lower().removeprefix("v") for w in rest.split()]
+        if not paths or not words or not all(w.isdigit() for w in words) or len(words) > 2:
+            await self.reply(Text("Use /diff vN, or /diff vN vM; /versions lists them.", AMBER))
+            return
+        first = int(words[0])
+        second = int(words[1]) if len(words) > 1 else version_number(self.deck_path)
+        if first not in paths or second not in paths:
+            await self.reply(Text(f"No such version; this deck has v1 to v{max(paths)}.", AMBER))
+            return
+        before, after = (json.loads(paths[n].read_text(encoding="utf-8")) for n in (first, second))
+        await self.reply(render_diff(before, after, (f"v{first}", f"v{second}")))
+
+    async def undo(self) -> None:
+        """Make the version before the current one current again; nothing is deleted."""
+        paths = self.version_paths()
+        if self.deck_path not in paths or paths.index(self.deck_path) == 0:
+            await self.reply(Text("Nothing to undo: this is the deck's first version.", AMBER))
+            return
+        previous = paths[paths.index(self.deck_path) - 1]
+        try:
+            deck = json.loads(previous.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            await self.reply(Text(f"Could not read {previous.name}: {exc}", RED))
+            return
+        self.deck, self.deck_path = deck, previous
+        self.tab.note("assistant", f"Back to v{version_number(previous)} ({previous.name}).")
+        self.refresh_chrome()
+        await self.reply(Text.assemble(("Back to ", MUTED), (f"v{version_number(previous)}", f"bold {GOLD}"),
+                                       (". Every version stays saved; /versions lists them.", MUTED)),
+                         render_deck(deck, self.lookup, previous, columns=False))
+
     async def export(self, rest: str) -> None:
         """Write the deck as a text list beside its JSON, or to a new PATH, and copy it."""
         if self.deck is None or self.deck_path is None:
@@ -1762,6 +2299,8 @@ class ChatApp(App[None]):
                 s.choose_pool(value.lower())
             elif command == "/orchestrate" and value:
                 s.choose_orchestrate(value.lower())
+            elif command == "/checkpoint" and value:
+                s.choose_checkpoint(value.lower())
             elif command == "/review":
                 s.choose_review(value.lower())
         except ValueError as exc:
@@ -1787,6 +2326,10 @@ class ChatApp(App[None]):
                 }[s.pool]),
                 ("modes", Text(", ".join(POOL_MODES), MUTED)),
             ]
+        elif command == "/checkpoint":
+            rows = [("checkpoint", "on: a deck request pauses after the engine map (and the "
+                                   "council's plan) for you to pin, ban or retarget"
+                     if s.checkpoint else "off: deck requests draft without pausing")]
         elif command == "/orchestrate":
             lead, members = s.council_roles()
             rows = [
@@ -1806,6 +2349,7 @@ class ChatApp(App[None]):
 
         async def body() -> None:
             turn = tab.last = await self.reply(steps=steps, tab=tab)
+            turn.account = tab.usage
             tab.busy = True
             self.refresh_chrome()
             try:
@@ -1818,6 +2362,8 @@ class ChatApp(App[None]):
                 turn.end("failed", Text(message, RED))
             finally:
                 tab.busy = tab.waiting = False
+                if turn.usage["calls"]:
+                    tab.save_session()  # Keep the session's spending with its transcript.
                 self.refresh_chrome()
                 if tab is not self.tab and tab in self.tabs:
                     done = turn.steps[-1] if turn.steps else {"state": "done", "detail": ""}
@@ -1828,15 +2374,16 @@ class ChatApp(App[None]):
 
     async def step(
         self, turn: Turn, index: int, argv: list[str],
-        on_line: Callable[[str], None] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
-        """Run one CLI command as step `index`; return its JSON, or None after showing why not."""
+        """Run one CLI command as step `index`; return its JSON, or None after showing why not.
+        `on_event` sees every progress event, such as the stages that advance a checklist."""
         turn.start(index)
 
         def progress(line: str) -> None:
             turn.progress(line)
-            if on_line is not None:
-                on_line(line)
+            if on_event is not None and (event := parse_event(line)) is not None:
+                on_event(event)
 
         code, result = await self.runner(argv, self.data_dir, progress)
         # Exit 1 is a negative verdict with a full result; exit 2 is an error envelope.
@@ -2027,9 +2574,67 @@ class ChatApp(App[None]):
             turn.add(render_edit({**polish, "reply": "Polished before you saw it: " + polish.get("reply", "")}))
         turn.add(render_deck(deck, self.lookup, tab.deck_path))
         turn.add(Text("Reply to ask the orchestrator about this deck or for changes. "
-                      "/draft starts over, /export saves the list.", MUTED))
+                      "/why CARD explains a pick, /draft starts over, /export saves the list.",
+                      MUTED))
         self.refresh_chrome()
         tab.note("assistant", f"Drafted {tab.deck_path.name}: {status}.")
+
+    def checkpoint_card(self, pool: dict[str, Any]) -> Callable[[str, str], tuple[str | None, str]]:
+        """Checks one card a player pins or bans at a checkpoint."""
+        from .discovery import eligible
+        from .spec import DeckSpec
+
+        spec = DeckSpec.from_dict(pool["spec"])
+
+        def resolve(kind: str, name: str) -> tuple[str | None, str]:
+            card = self.lookup(name)
+            if card is None:
+                return None, f"No card is named {name}."
+            if card["name"] == spec.commander:
+                return None, "That is the commander."
+            if kind == "pin" and card_type(card) == "Land":
+                return None, "Lands are code's to choose; pin a nonland card."
+            if kind == "pin" and not eligible(card, spec):
+                return None, (f"{card['name']} is outside the commander's colors, not "
+                              "Commander-legal, excluded or against the bracket.")
+            return card["name"], ""
+
+        return resolve
+
+    async def checkpoint(self, tab: Tab, turn: Turn, pool_path: Path, plan_path: Path | None) -> bool:
+        """The optional pause before drafting: the player pins or bans cards and changes role
+        targets, which go into the pool and, with a council, its plan. False when stopped."""
+        pool = json.loads(pool_path.read_text(encoding="utf-8"))
+        plan = json.loads(plan_path.read_text(encoding="utf-8")) if plan_path else None
+        targets = (plan or {}).get("role_targets") or {
+            role: count for role, count in pool["spec"]["role_targets"].items() if role != "lands"
+        }
+        title = "Checkpoint: the council's plan" if plan else "Checkpoint: before the draft"
+        resolve = self.checkpoint_card(pool)
+        announce = True
+        while True:
+            await self.until_askable(tab, announce=announce)
+            edits = await self.push_screen_wait(CheckpointScreen(title, targets, resolve))
+            if edits != LATER:
+                break
+            announce = False  # The player switched away on purpose.
+        if edits is None:
+            turn.end("stopped", Text("Stopped at the checkpoint.", AMBER))
+            return False
+        if edits["pins"] or edits["bans"] or edits["targets"]:
+            apply_checkpoint(pool, plan, edits)
+            tab.save(pool_path.name, pool)
+            if plan_path is not None:
+                tab.save(plan_path.name, plan)
+            summary = "; ".join(filter(None, [
+                "pinned " + ", ".join(edits["pins"]) if edits["pins"] else "",
+                "banned " + ", ".join(edits["bans"]) if edits["bans"] else "",
+                "targets " + ", ".join(f"{r} {n}" for r, n in edits["targets"].items())
+                if edits["targets"] else "",
+            ]))
+            turn.add(Text.assemble(("Checkpoint  ", f"bold {GOLD}"), summary))
+            tab.note("player", f"Checkpoint: {summary}")
+        return True
 
     def draft_job(self, tab: Tab, request: str) -> Callable[[Turn], Awaitable[None]]:
         async def job(turn: Turn) -> None:
@@ -2037,6 +2642,8 @@ class ChatApp(App[None]):
             if prepared is None:
                 return
             stem, pool_path = prepared
+            if self.settings.checkpoint and not await self.checkpoint(tab, turn, pool_path, None):
+                return
             review = [] if self.settings.review else ["--skip-review"]
             argv = ["draft", "--pool", str(pool_path), *review, *self.settings.model_args()]
             deck = await self.step(turn, 4, argv)
@@ -2058,18 +2665,30 @@ class ChatApp(App[None]):
                     if turn.steps[i]["state"] in {"running", "pending"}:
                         turn.finish(i, turn.steps[i]["detail"])
 
-            def advance(line: str) -> None:
-                # Council stages 1-5 are the steps from "Plan & core" on; each stage line
-                # closes the ones before it.
-                match = COUNCIL_STAGE.search(line)
-                if match:
-                    index = min(PLAN_STEP - 1 + int(match[1]), last)
-                    close_until(index)
-                    turn.start(index, match[2])
+            def advance(event: dict[str, Any]) -> None:
+                # Council stages 1-5 are the steps from "Plan & core" on; each stage closes the
+                # ones before it.
+                if event["type"] != "stage" or event.get("scope") != "council":
+                    return
+                index = min(PLAN_STEP - 1 + int(event["index"]), last)
+                close_until(index)
+                turn.start(index, str(event.get("detail", "")))
 
+            plan_args: list[str] = []
+            if self.settings.checkpoint:
+                argv = ["council-plan", "--pool", str(pool_path), *self.settings.model_args()]
+                plan = await self.step(turn, PLAN_STEP, argv)
+                if plan is None:
+                    return
+                plan_path = tab.save(f"{stem}-plan.json", plan)
+                turn.add(render_plan(plan))
+                if not await self.checkpoint(tab, turn, pool_path, plan_path):
+                    return
+                plan_args = ["--plan", str(plan_path)]
             review = [] if self.settings.review else ["--skip-review"]
-            argv = ["council", "--pool", str(pool_path), *review, *self.settings.model_args()]
-            deck = await self.step(turn, PLAN_STEP, argv, on_line=advance)
+            argv = ["council", "--pool", str(pool_path), *plan_args, *review,
+                    *self.settings.model_args()]
+            deck = await self.step(turn, PLAN_STEP, argv, on_event=advance)
             if deck is not None:
                 close_until(last)
                 self.show_deck(tab, turn, last, stem, deck)
@@ -2116,6 +2735,9 @@ class ChatApp(App[None]):
     def action_stop(self) -> None:
         if isinstance(self.screen, QuestionPicker):
             self.screen.back()
+            return
+        if isinstance(self.screen, CheckpointScreen):
+            self.screen.dismiss(None)
             return
         if isinstance(self.screen, SessionPicker):
             self.screen.dismiss(None)

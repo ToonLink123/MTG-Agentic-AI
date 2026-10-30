@@ -5,7 +5,9 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import math
+import os
 import shutil
 import threading
 import time
@@ -14,6 +16,7 @@ from contextlib import contextmanager
 from typing import Any, TextIO
 
 from .compaction import TRIGGER, Compactor
+from .events import event
 from .llm import MALFORMED, LLMError, Message, malformed_kind, malformed_summary
 from .schema import SchemaError, load_json, validate_json
 
@@ -26,6 +29,39 @@ except ImportError:  # Optional dependency; only this provider needs it.
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 # Haiku 5.5 bills prompts above this size on its higher rate card.
 HAIKU_TIER_TOKENS = 100_000
+# List prices in US dollars per million tokens, (input, output), behind the cost estimate the
+# terminal app shows. A cache write costs 1.25x input and a cache read 0.1x. When your rates
+# differ, set MTG_CLAUDE_PRICES to JSON such as {"claude-haiku-5-5": [1, 5]}. The estimate leaves
+# out Haiku's higher rate above HAIKU_TIER_TOKENS.
+PRICES = {
+    "claude-haiku-5-5": (1.0, 5.0),
+    "claude-sonnet-5-5": (3.0, 15.0),
+    "claude-opus-5-5": (5.0, 25.0),
+    "claude-opus-5": (5.0, 25.0),
+}
+CACHE_WRITE, CACHE_READ = 1.25, 0.1
+log = logging.getLogger(__name__)
+
+
+def prices() -> dict[str, tuple[float, float]]:
+    table = dict(PRICES)
+    raw = os.getenv("MTG_CLAUDE_PRICES")
+    if raw:
+        try:
+            table.update({model: (float(rate[0]), float(rate[1])) for model, rate in json.loads(raw).items()})
+        except (ValueError, TypeError, IndexError, AttributeError):
+            log.warning("MTG_CLAUDE_PRICES is not JSON like {\"model\": [input, output]}; ignored")
+    return table
+
+
+def cost(model: str, *, input: int, cached: int, written: int, output: int) -> float | None:
+    """The estimated dollars of one call, or None for a model without a price."""
+    rate = prices().get(model)
+    if rate is None:
+        return None
+    per_input, per_output = rate
+    tokens_in = input + written * CACHE_WRITE + cached * CACHE_READ
+    return (tokens_in * per_input + output * per_output) / 1_000_000
 # Enums longer than this (card names from a large pool) are sent as plain strings: compiling
 # hundreds of names into the output grammar costs more than the local check that replaces it.
 WIRE_ENUM_LIMIT = 64
@@ -133,10 +169,8 @@ class ClaudeClient:
         with self._lock:
             self.usage[kind] += 1
             summary = malformed_summary(self.usage)
-        if self.progress:
-            line = f"MALFORMED {MALFORMED[kind]}" + (f": {detail[:120]}" if detail else "")
-            line += f" | {summary} so far"
-            print("  " + line, file=self.progress, flush=True)
+        line = f"MALFORMED {MALFORMED[kind]}" + (f": {detail[:120]}" if detail else "")
+        log.info("  %s | %s so far", line, summary)
 
     def _ask(self, messages: list[Message], schema: dict[str, Any]) -> str:
         split = _system_count(messages)
@@ -200,6 +234,7 @@ class ClaudeClient:
         # Parallel calls share one terminal, so only the main thread draws a live line.
         live = threading.current_thread() is threading.main_thread()
         status = _Status(self.progress, self.model, live=live) if self.progress else None
+        begun = time.monotonic()
         with self._prefix(_prefix_key(self.model, prefix, system)) as started:
             try:
                 with self._client.beta.messages.stream(
@@ -226,7 +261,7 @@ class ClaudeClient:
             finally:
                 if status:
                     status.clear()
-        self._record(response.usage, status)
+        self._record(response.usage, time.monotonic() - begun)
         if response.stop_reason == "refusal":
             raise LLMError("Claude declined the request")
         if response.stop_reason == "max_tokens":
@@ -302,15 +337,15 @@ class ClaudeClient:
         texts, short = self._compactor.shrink(originals, math.ceil((tokens - trigger) * ratio))
         with self._lock:
             self.usage["compactions"] += 1
-        if self.progress:
-            after = round((fixed + sum(map(len, texts))) / ratio)
-            note = f"compacted prompt ~{tokens:,} -> ~{after:,} tokens (budget {self.compact_at:,})"
-            if short:
-                note += f"; stopped short, ~{round(short / ratio):,} tokens over"
-            print("  " + note, file=self.progress, flush=True)
+        after = round((fixed + sum(map(len, texts))) / ratio)
+        note = f"compacted prompt ~{tokens:,} -> ~{after:,} tokens (budget {self.compact_at:,})"
+        if short:
+            note += f"; stopped short, ~{round(short / ratio):,} tokens over"
+        log.info("  %s", note)
         return texts
 
-    def _record(self, usage: Any, status: _Status | None) -> None:
+    def _record(self, usage: Any, elapsed: float) -> None:
+        """Count one call and report it as a usage event (see events.py)."""
         cached = usage.cache_read_input_tokens or 0
         written = usage.cache_creation_input_tokens or 0
         prompt = usage.input_tokens + cached + written
@@ -322,23 +357,27 @@ class ClaudeClient:
             totals["written"] += written
             totals["output"] += usage.output_tokens
             totals["largest"] = max(totals["largest"], prompt)
-        if status:
-            line = (
-                f"{self.model} | {status.elapsed():.1f}s | prompt {prompt:,} tok "
-                f"({cached:,} cached, {written:,} written) | out {usage.output_tokens:,}"
-            )
-            if self._haiku and prompt > HAIKU_TIER_TOKENS:
-                line += " | over 100K: higher Haiku rate"
-            print("  " + line, file=status.out, flush=True)
+        line = (
+            f"{self.model} | {elapsed:.1f}s | prompt {prompt:,} tok "
+            f"({cached:,} cached, {written:,} written) | out {usage.output_tokens:,}"
+        )
+        if self._haiku and prompt > HAIKU_TIER_TOKENS:
+            line += " | over 100K: higher Haiku rate"
+        spent = cost(self.model, input=usage.input_tokens, cached=cached, written=written,
+                     output=usage.output_tokens)
+        log.info("  %s", line, extra=event(
+            "usage", model=self.model, input=usage.input_tokens, cached=cached, written=written,
+            output=usage.output_tokens, cost=spent, seconds=round(elapsed, 1),
+        ))
 
     @property
     def _haiku(self) -> bool:
         return self.model.startswith("claude-haiku-5-5")
 
     def report(self) -> None:
-        """Print run totals to the progress stream."""
+        """Log run totals."""
         totals = self.usage
-        if not self.progress or not totals["calls"]:
+        if not totals["calls"]:
             return
         prompt = totals["input"] + totals["cached"] + totals["written"]
         line = (
@@ -352,7 +391,7 @@ class ClaudeClient:
         line += f" | {malformed_summary(totals)}"
         if totals["compactions"]:
             line += f" | compacted {totals['compactions']} request(s)"
-        print(line, file=self.progress, flush=True)
+        log.info("%s", line)
 
 
 class _Status:

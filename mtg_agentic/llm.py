@@ -13,6 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from .events import event
 from .schema import SchemaError, load_json, validate_json
 
 Message = dict[str, str]
@@ -168,6 +169,8 @@ class HTTPJSONModel:
         logger.info(
             "  %s | %.1fs | prompt %s tok | out %s | %s | %s so far",
             self.model, elapsed, f"{prompt:,}", f"{output:,}", status, summary,
+            extra=event("usage", model=self.model, input=prompt, cached=0, written=0,
+                        output=output, cost=None, seconds=round(elapsed, 1)),
         )
 
     def report(self) -> None:

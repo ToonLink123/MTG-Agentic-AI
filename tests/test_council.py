@@ -12,7 +12,7 @@ from mtg_agentic.council import council_draft, plan_deck
 from mtg_agentic.oracle import OracleStore
 from mtg_agentic.schema import SchemaError
 from tests.fixtures import card
-from tests.pipeline_fixtures import JODAH, FakeCards, draft, make_pool, playable_records
+from tests.pipeline_fixtures import JODAH, FakeCards, draft, make_pool, make_spec, playable_records
 
 PLAN = {
     "game_plan": "Cast Myojin from hand with Jodah, keep their counters, win in combat.",
@@ -155,6 +155,24 @@ class CouncilTests(unittest.TestCase):
         self.assertEqual([d["focus"] for d in deck["council"]["drafts"]], ["engine", "consistency"])
         self.assertEqual(model.calls.count("vote"), 2)
 
+    def test_an_approved_plan_is_checked_and_not_planned_again(self):
+        from mtg_agentic.council import given_plan
+
+        approved = {**plan_deck(self.pool, CouncilModel({}), set()), "core": ["Spell 1", "Not A Card"],
+                    "role_targets": {**PLAN["role_targets"], "creatures": 99, "bogus": 3}}
+        checked = given_plan(self.pool, approved, {"Spell 1"})
+        self.assertEqual(checked["core"], ["Spell 1"])  # A pool card; the made-up name is gone.
+        low = make_pool(self.store, make_spec(bracket=2))
+        self.assertEqual(given_plan(low, approved, {"Spell 1"})["core"], [])  # No Game Changers.
+        self.assertEqual(checked["role_targets"]["creatures"], 40)
+        self.assertNotIn("bogus", checked["role_targets"])
+        with self.assertRaises(ValueError):
+            given_plan(self.pool, {"core": []}, set())
+        model = CouncilModel({f: picks(*range(63)) for f in ("engine", "resilience", "consistency")})
+        deck = self.run_council(model, plan={**approved, "role_targets": PLAN["role_targets"]})
+        self.assertNotIn("plan", model.calls)
+        self.assertTrue(deck["valid"], deck["validation"]["errors"])
+
     def test_game_changers_past_the_bracket_limit_leave_the_core(self):
         plan = {**PLAN, "win_conditions": ["Spell 1"], "game_changers": ["Spell 2", "Spell 3"],
                 "key_cards": ["Spell 4", "Spell 5"]}
@@ -181,6 +199,30 @@ class CouncilCliTests(unittest.TestCase):
             self.assertEqual(
                 _council_models(args), (("qwen2.5:7b", "xhigh"), ("qwen2.5:7b", "high"))
             )
+
+    def test_council_plan_command_prints_a_plan_the_council_command_accepts(self):
+        from mtg_agentic.__main__ import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            with OracleStore(path / "oracle.sqlite3") as store:
+                store.import_cards(playable_records())
+                (path / "pool.json").write_text(json.dumps(make_pool(store).to_dict()), encoding="utf-8")
+            model = CouncilModel({focus: picks(*range(63)) for focus in ("engine", "resilience", "consistency")})
+            with patch("mtg_agentic.__main__._make_model", return_value=model):
+                status = main(["--quiet", "--data-dir", str(path), "council-plan", "--pool",
+                               str(path / "pool.json"), "--output", str(path / "plan.json")])
+                plan = json.loads((path / "plan.json").read_text(encoding="utf-8"))
+                plan["role_targets"]["creatures"] = 12
+                (path / "edited.json").write_text(json.dumps(plan), encoding="utf-8")
+                status_two = main(["--quiet", "--data-dir", str(path), "council", "--pool",
+                                   str(path / "pool.json"), "--plan", str(path / "edited.json"),
+                                   "--skip-review", "--output", str(path / "deck.json")])
+            deck = json.loads((path / "deck.json").read_text(encoding="utf-8"))
+        self.assertEqual((status, status_two), (0, 0))
+        self.assertEqual(plan["core"], ["Spell 1", "Spell 2", "Spell 3"])
+        self.assertEqual(model.calls.count("plan"), 1)  # The council did not plan again.
+        self.assertEqual(deck["spec"]["role_targets"]["creatures"], 12)
 
     def test_council_command_drafts_a_saved_pool(self):
         from mtg_agentic.__main__ import main

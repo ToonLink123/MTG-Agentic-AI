@@ -17,12 +17,13 @@ from .agent import supports_tools
 from .brackets import BracketChecker, SpellbookClient, bracket_rules
 from .bulk_search import BulkSearch
 from .card_graph import CARD_DIMENSION, index_cards, index_ready
-from .council import MEMBER, ORCHESTRATOR, council_draft
+from .council import MEMBER, ORCHESTRATOR, council_draft, plan_deck
 from .discovery import POOL_MODES, CandidatePool
 from .edit import Toolbox, edit_deck, polish_deck
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .engine_map import build_engine_map
 from .evaluation import evaluation_history, run_evaluation
+from .events import JsonLines
 from .forge import ForgeError
 from .forge_cli import load_forge
 from .forge_cli import register_commands as register_forge_commands
@@ -35,7 +36,7 @@ from .lands import generate_mana_base, is_land
 from .llm import PROVIDERS, LlamaCppClient, LLMError, OllamaClient, OpenAICompatibleClient
 from .mentions import find_cards, lookup, name_index
 from .oracle import DEFAULT_DATA_DIR, OracleStore
-from .pipeline import build_deck, discover, draft_deck, draft_from_request
+from .pipeline import build_deck, discover, draft_deck, draft_from_request, game_changer_names
 from .playability import spec_for_deck, validate_playability
 from .review import DeckReviewer, Judge
 from .revision import revise_deck
@@ -147,7 +148,8 @@ def _make_model(args: argparse.Namespace):
             api_key=_claude_api_key(),
             timeout=args.llm_timeout,
             effort=args.effort,
-            progress=None if args.quiet else sys.stderr,
+            # The live status line is for a terminal; events carry every call's usage.
+            progress=None if args.quiet or getattr(args, "events", False) else sys.stderr,
         )
     if args.provider != "openai-compatible":
         raise ValueError("Unknown MTG_LLM_PROVIDER")
@@ -450,6 +452,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--quiet", action="store_true", help="No live progress on stderr")
+    parser.add_argument(
+        "--events", action="store_true",
+        help="Progress as one JSON event per line on stderr, for the terminal app (see events.py)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     bulk = commands.add_parser(
         "download-oracle",
@@ -566,8 +572,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Explicitly skip bracket/rules safety review (not evaluation-ready)",
     )
     council_cmd.add_argument("--no-polish", action="store_true", help=POLISH_HELP)
+    council_cmd.add_argument(
+        "--plan", type=Path,
+        help="A plan from council-plan, perhaps edited; the orchestrator does not plan again",
+    )
     _embedding_options(council_cmd)
     _model_options(council_cmd)
+    plan_cmd = commands.add_parser(
+        "council-plan",
+        help="Only the council orchestrator's game plan, core and role targets, to check or edit "
+        "before council --plan",
+    )
+    plan_cmd.add_argument("--pool", required=True, type=Path)
+    plan_cmd.add_argument(
+        "--orchestrator-model", help=f"Default: {ORCHESTRATOR[0]} for claude, else --model"
+    )
+    plan_cmd.add_argument("--orchestrator-effort", choices=EFFORTS, default=ORCHESTRATOR[1])
+    _model_options(plan_cmd)
     edit_cmd = commands.add_parser(
         "edit-deck",
         help="Ask the orchestrator about a drafted deck or for changes; it can use tools",
@@ -671,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
         args.runs_dir = args.data_dir / "revisions"
     # Stage updates go to stderr so stdout stays clean JSON.
     progress = logging.StreamHandler(sys.stderr)
-    progress.setFormatter(logging.Formatter("%(message)s"))
+    progress.setFormatter(JsonLines() if args.events else logging.Formatter("%(message)s"))
     logger = logging.getLogger("mtg_agentic")
     if not args.quiet:
         logger.setLevel(logging.INFO)
@@ -915,6 +936,25 @@ def main(argv: list[str] | None = None) -> int:
                 )
             _emit(result, args.output)
             return 1 if result.get("valid") is False else 0
+        if args.command == "council-plan":
+            if args.output is not None and args.output.exists():
+                raise ValueError("Output already exists; choose a new filename")
+            orchestrator = _make_model(argparse.Namespace(**{
+                **vars(args),
+                "model": args.orchestrator_model or (ORCHESTRATOR[0] if args.provider == "claude" else args.model),
+                "effort": args.orchestrator_effort,
+            }))
+            with ExitStack() as stack, OracleStore(args.data_dir / "oracle.sqlite3") as store:
+                if hasattr(orchestrator, "report"):
+                    stack.callback(orchestrator.report)
+                if not store.ready:
+                    raise ValueError("Run download-oracle before using the LLM pipeline")
+                pool = CandidatePool.from_dict(
+                    load_json(args.pool.read_text(encoding="utf-8-sig")), store
+                )
+                result = plan_deck(pool, orchestrator, game_changer_names(pool, store))
+            _emit(result, args.output)
+            return 0
         if args.command == "council":
             if args.output is not None and args.output.exists():
                 raise ValueError("Output already exists; choose a new filename")
@@ -935,10 +975,11 @@ def main(argv: list[str] | None = None) -> int:
                     load_json(args.pool.read_text(encoding="utf-8-sig")), store
                 )
                 toolbox = _toolbox(args, stack, store, client, reviewer)
+                plan = load_json(args.plan.read_text(encoding="utf-8-sig")) if args.plan else None
                 result = council_draft(
                     pool, orchestrator, member, client, store,
                     members=args.members, max_repairs=args.repairs, reviewer=reviewer,
-                    toolbox=toolbox,
+                    toolbox=toolbox, plan=plan,
                 )
                 result = _polish(args, result, pool, orchestrator, toolbox, reviewer)
             _emit(result, args.output)

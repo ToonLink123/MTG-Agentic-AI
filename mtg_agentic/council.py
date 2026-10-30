@@ -23,6 +23,7 @@ from . import activity, prompts
 from .assembly import GAME_CHANGER_LIMITS, ranked_picks, selection_schema
 from .cards import name_key
 from .discovery import CandidatePool
+from .events import event
 from .lands import is_land, nonland_slots
 from .llm import JSONModel, concurrency, parallel, request_json
 from .oracle import OracleStore
@@ -54,8 +55,11 @@ log = logging.getLogger(__name__)
 
 
 def stage(name: str, detail: str) -> None:
-    # The TUI advances its checklist on these lines, so keep their shape.
-    log.info("council: %d/%d %s: %s", STAGES.index(name) + 1, len(STAGES), name, detail)
+    # The TUI advances its checklist on these events.
+    index = STAGES.index(name) + 1
+    log.info("council: %d/%d %s: %s", index, len(STAGES), name, detail, extra=event(
+        "stage", scope="council", index=index, total=len(STAGES), name=name, detail=detail,
+    ))
 
 
 def _pick(names: list[str], **limits: int) -> dict[str, Any]:
@@ -132,6 +136,32 @@ def plan_deck(pool: CandidatePool, model: JSONModel, changers: set[str]) -> dict
     return {
         **plan, "role_targets": targets,
         "core": [n for n in core if n not in dropped], "dropped_game_changers": dropped,
+    }
+
+
+PLAN_KEYS = ("game_plan", "non_goals", "win_conditions", "game_changers", "key_cards",
+             "role_targets", "targets_reason", "decisions", "core", "dropped_game_changers")
+
+
+def given_plan(pool: CandidatePool, plan: Any, changers: set[str]) -> dict[str, Any]:
+    """A plan made earlier (council-plan) and perhaps edited by the player at a checkpoint,
+    checked like a fresh one: only pool cards stay in its lists, Game Changers past the bracket
+    limit leave the core, and role targets are clamped to their bounds."""
+    if not isinstance(plan, dict) or any(key not in plan for key in PLAN_KEYS):
+        raise ValueError("A council plan needs " + ", ".join(PLAN_KEYS))
+    names = set(_nonlands(pool))
+    spec = pool.spec
+    lists = {
+        key: [n for n in dict.fromkeys(plan[key]) if isinstance(n, str) and n in names]
+        for key in ("win_conditions", "game_changers", "key_cards", "core")
+    }
+    limit = max(0, GAME_CHANGER_LIMITS[spec.bracket] - int(spec.commander in changers))
+    dropped = [n for n in lists["core"] if n in changers][limit:]
+    targets = {r: v for r, v in plan["role_targets"].items() if r in ROLE_BOUNDS and type(v) is int}
+    return {
+        **plan, **lists, "core": [n for n in lists["core"] if n not in dropped],
+        "dropped_game_changers": [*plan["dropped_game_changers"], *dropped],
+        "role_targets": bounded_targets(targets, spec.commander_dependency),
     }
 
 
@@ -304,15 +334,21 @@ def decide(
 def council_draft(
     pool: CandidatePool, orchestrator: JSONModel, member: JSONModel, client: ScryfallClient,
     store: OracleStore, *, members: int = 3, max_repairs: int = 3,
-    reviewer: DeckReviewer | None = None, toolbox: Any = None,
+    reviewer: DeckReviewer | None = None, toolbox: Any = None, plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """The council's draft. With `plan` (from council-plan, perhaps edited at a checkpoint)
+    the orchestrator does not plan again."""
     if type(members) is not int or not 2 <= members <= 6:
         raise ValueError("A council needs 2 to 6 members")
     checked = CandidatePool.from_dict(pool.to_dict(), store)
     changers = game_changer_names(checked, store, reviewer)
     lead = getattr(orchestrator, "model", "orchestrator")
-    stage("plan", f"{lead} sets the game plan, core and role targets")
-    plan = plan_deck(checked, orchestrator, changers)
+    if plan is not None:
+        stage("plan", "the approved game plan, core and role targets")
+        plan = given_plan(checked, plan, changers)
+    else:
+        stage("plan", f"{lead} sets the game plan, core and role targets")
+        plan = plan_deck(checked, orchestrator, changers)
     council = {key: plan[key] for key in ("game_plan", "non_goals", "core", "decisions")}
     working = _apply_plan(checked, plan)
     slots = nonland_slots(working.spec)

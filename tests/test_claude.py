@@ -1,4 +1,3 @@
-import io
 import json
 import os
 import tempfile
@@ -132,16 +131,20 @@ class ClaudeTests(unittest.TestCase):
                     client.complete_json([], SPEC_SCHEMA)
 
     def test_progress_reports_each_call_and_run_totals_with_cache_share(self):
-        out = io.StringIO()
         client, _ = fake_client(
             reply(text(json.dumps(SPEC)), prompt=52000, cached=50000),
             reply(text(json.dumps(SPEC)), prompt=120000),
-            progress=out,
         )
-        client.complete_json([], SPEC_SCHEMA)
-        client.complete_json([], SPEC_SCHEMA)
-        client.report()
-        lines = out.getvalue().splitlines()
+        with self.assertLogs("mtg_agentic.claude", "INFO") as logs:
+            client.complete_json([], SPEC_SCHEMA)
+            client.complete_json([], SPEC_SCHEMA)
+            client.report()
+        lines = [record.getMessage() for record in logs.records]
+        # Each call is also a usage event, with its estimated cost (see events.py).
+        usage = logs.records[0].event
+        self.assertEqual((usage["type"], usage["cached"], usage["input"]), ("usage", 50000, 2000))
+        self.assertAlmostEqual(usage["cost"], (2000 + 50000 * 0.1) / 1e6 + 50 * 5 / 1e6)
+        self.assertNotIn("event", logs.records[2].__dict__)
         self.assertIn("prompt 52,000 tok (50,000 cached, 0 written)", lines[0])
         self.assertIn("over 100K", lines[1])
         self.assertIn("2 calls", lines[2])
@@ -150,20 +153,18 @@ class ClaudeTests(unittest.TestCase):
         self.assertIn("0 malformed", lines[2])
 
     def test_prompt_over_the_budget_is_compacted_before_sending(self):
-        out = io.StringIO()
-        client, stream = fake_client(
-            reply(text(json.dumps(SPEC))), reply(text(json.dumps(SPEC))), progress=out
-        )
+        client, stream = fake_client(reply(text(json.dumps(SPEC))), reply(text(json.dumps(SPEC))))
         client.compact_at = 2000
         counts = [SimpleNamespace(input_tokens=6000), SimpleNamespace(input_tokens=1500)]
         client._client.messages.count_tokens.side_effect = counts
         pool = {"role": "user", "content": "p" * 9000}
-        client.complete_json([pool, {"role": "user", "content": "repair 1"}], SPEC_SCHEMA)
+        with self.assertLogs("mtg_agentic.claude", "INFO") as logs:
+            client.complete_json([pool, {"role": "user", "content": "repair 1"}], SPEC_SCHEMA)
         first = stream.call_args.kwargs["messages"]
         self.assertLess(len(first[0]["content"][0]["text"]), 9000)
         self.assertIn("characters elided", first[0]["content"][0]["text"])
         self.assertEqual(first[1]["content"], "repair 1")
-        self.assertIn("compacted prompt ~6,000", out.getvalue())
+        self.assertIn("compacted prompt ~6,000", logs.output[0])
         # The next repair re-applies the same cut, so the cached prefix is unchanged.
         client.complete_json([pool, {"role": "user", "content": "repair 2"}], SPEC_SCHEMA)
         second = stream.call_args.kwargs["messages"]

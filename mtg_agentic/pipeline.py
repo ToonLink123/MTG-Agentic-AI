@@ -323,6 +323,8 @@ class Drafting:
             "cards": cards, "spec": spec.to_dict(), "role_counts": playability["roles"]["role_counts"],
             "protection": playability["roles"]["protection"], "playability": playability,
             "assembly": built["assembly"], "land_base": built["land_base"], "land_plan": built["land_plan"],
+            # The ranked tiers this attempt built from, so /why can say how a card got in.
+            "picks": tiers or {},
             "validation": validation, "review": review, "review_passed": review["status"] == "passed",
             "pool_size": len(checked.cards), "verified_additions": [],
             "simulation": {"status": "not_run", "required_for_build": True},
