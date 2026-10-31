@@ -130,8 +130,8 @@ class EditTests(unittest.TestCase):
 
     def test_removing_a_must_include_card_on_request_drops_the_requirement(self):
         deck, pool = self.deck(spec=make_spec(must_include=["Spell 1"]))
-        # Spell 15 is another creature, so the creature count stays on target.
-        model = FakeModel(act(swaps=[swap("Spell 1", "Spell 15")], reply="Cut Spell 1 as asked."))
+        # Spells 0 to 17 are creatures, so the creature count stays on target without Spell 1.
+        model = FakeModel(act(swaps=[swap("Spell 1", "Spell 66")], reply="Cut Spell 1 as asked."))
         result = self.edit(deck, pool, model, "Cut Spell 1")
         self.assertNotIn("Spell 1", result["cards"])
         self.assertEqual(result["spec"]["must_include"], [])

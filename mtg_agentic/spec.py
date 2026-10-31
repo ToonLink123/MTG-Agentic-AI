@@ -49,6 +49,8 @@ class DeckSpec:
     bracket3_mode: str = "standard"
     # The player's words (request, interview, asks, deferred questions); see BRIEF_SCHEMA.
     brief: dict[str, Any] = dataclasses.field(default_factory=lambda: deepcopy(EMPTY_BRIEF))
+    # Rules-text phrases cards that fit print, for local card search; see ground_spec.
+    search_terms: list[str] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Any) -> DeckSpec:
@@ -56,6 +58,7 @@ class DeckSpec:
         data = deepcopy(data)
         if isinstance(data, dict):
             data.setdefault("bracket3_mode", "standard")
+            data.setdefault("search_terms", [])
             values = [data.get("themes"), data.get("win_conditions")]
             themes = " ".join(s for v in values if isinstance(v, list) for s in v if isinstance(s, str))
             data.setdefault("commander_dependency", "high" if re.search(r"equipment|voltron|commander.damage", themes, re.I) else "medium")
@@ -141,6 +144,11 @@ def ground_spec(spec: DeckSpec, store: OracleStore, commander: Card | None = Non
         raise SchemaError(errors)
     grounded = spec.to_dict()
     grounded.update(constraints)
+    # A search term must be printed on at least one card's rules text, or it finds nothing.
+    terms = {" ".join(term.casefold().split()): term.strip() for term in spec.search_terms}
+    grounded["search_terms"] = [
+        term for term in terms.values() if store.text_count(term, column="rules")
+    ] if terms else []
     grounded["role_targets"]["protection"] = max(6 if spec.commander_dependency == "high" else 4, grounded["role_targets"]["protection"])
     return DeckSpec.from_dict(grounded)
 

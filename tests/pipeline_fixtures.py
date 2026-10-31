@@ -3,7 +3,7 @@ from collections import deque
 
 from mtg_agentic.cards import name_key, trim_card
 from mtg_agentic.discovery import Candidate, CandidatePool
-from mtg_agentic.schema import DRAFT_ROLES
+from mtg_agentic.schema import DRAFT_TIERS
 from mtg_agentic.scryfall import CardNotFound
 from mtg_agentic.spec import DeckSpec
 from tests.fixtures import card
@@ -140,11 +140,12 @@ def make_pool(store, spec=None, count=70):
 
 
 def draft(count=63, **changes):
+    """A drafter's answer: Spell 0 to Spell count-1 ranked in the flex tier."""
     data = {
         "commander": JODAH["name"],
-        "buckets": {
-            **{role: [] for role in DRAFT_ROLES},
-            "support": [f"Spell {n}" for n in range(count)],
+        "picks": {
+            **{tier: [] for tier in DRAFT_TIERS},
+            "flex": [f"Spell {n}" for n in range(count)],
         },
         "outside": [],
     }
@@ -163,6 +164,32 @@ class FakeModel:
         if isinstance(output, Exception):
             raise output
         return copy.deepcopy(output)
+
+
+class FakeToolModel:
+    """Scripted native tool use: each turn is a list of (tool name, input) calls."""
+
+    def __init__(self, *turns):
+        self.turns = deque(turns)
+        self.calls = []
+
+    def tool_turn(self, messages, tools):
+        self.calls.append((copy.deepcopy(messages), copy.deepcopy(tools)))
+        number = len(self.calls)
+        calls = [
+            {"id": f"call-{number}-{index}", "name": name, "input": copy.deepcopy(args)}
+            for index, (name, args) in enumerate(self.turns.popleft())
+        ]
+        return {"calls": calls, "text": "",
+                "content": [{"type": "tool_use", **call} for call in calls]}
+
+    def complete_json(self, messages, schema):
+        raise AssertionError("A tool-capable model answers through tools here")
+
+    def results(self, turn):
+        """The tool results sent back after `turn` (1-based), by tool_use id."""
+        message = self.calls[turn][0][-1]
+        return [block for block in message["content"] if block["type"] == "tool_result"]
 
 
 class FakeCards:

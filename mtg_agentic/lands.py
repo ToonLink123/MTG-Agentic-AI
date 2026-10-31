@@ -25,6 +25,7 @@ from .mana import (
     validate_mana_base,
 )
 from .oracle import OracleStore
+from .roles import oracle_roles
 from .spec import DeckSpec, ground_spec
 from .validator import copy_limit
 
@@ -40,6 +41,44 @@ __all__ = [
 # Optional nonbasics must be among about the 2,000 most-played cards on EDHREC; below that sit
 # lands like Unknown Shores that a basic beats. Unranked cards (new printings) still qualify.
 POPULAR_LAND_RANK = 2000
+# A spec's land target of 0 means "auto": code sets the count from the deck's curve and cheap
+# ramp and draw. Before any nonlands are known, the estimate is the classic 36.
+DEFAULT_LANDS = 36
+LAND_RANGE = (32, 40)
+
+
+def expected_lands(spec: DeckSpec) -> int:
+    """The spec's land count, or the default estimate while it is still auto."""
+    return spec.role_targets["lands"] or DEFAULT_LANDS
+
+
+def nonland_slots(spec: DeckSpec) -> int:
+    return 99 - expected_lands(spec)
+
+
+def land_plan(spells: Iterable[str], store: OracleStore) -> dict[str, Any]:
+    """Frank Karsten's 99-card estimate, 31.42 + 3.13 x average mana value - 0.28 x cheap
+    (mana value 2 or less) ramp and draw, rounded and kept within LAND_RANGE."""
+    values: list[float] = []
+    cheap = 0
+    for name in spells:
+        card = store.get_card(name)
+        if card is None or is_land(card):
+            continue
+        value = float(card.get("cmc") or 0)
+        values.append(value)
+        cheap += value <= 2 and bool(oracle_roles(card) & {"ramp", "draw"})
+    if not values:
+        return {"count": DEFAULT_LANDS, "average_mana_value": None, "cheap_ramp_and_draw": 0,
+                "estimate": float(DEFAULT_LANDS), "basis": "no nonlands yet; the default count"}
+    average = sum(values) / len(values)
+    estimate = 31.42 + 3.13 * average - 0.28 * cheap
+    return {
+        "count": min(max(round(estimate), LAND_RANGE[0]), LAND_RANGE[1]),
+        "average_mana_value": round(average, 2), "cheap_ramp_and_draw": cheap,
+        "estimate": round(estimate, 1),
+        "basis": "31.42 + 3.13 x average mana value - 0.28 x cheap ramp and draw",
+    }
 
 
 def allocate_sources(weights: dict[str, float], total: int) -> dict[str, int]:
@@ -148,7 +187,8 @@ def generate_mana_base(
         card = store.get_card(name)
         if type(quantity) is not int or quantity <= 0 or card is None or is_land(card):
             raise ValueError("Mana-base generation requires known nonland cards and positive quantities")
-    slots = spec.role_targets["lands"]
+    # An auto land count (0) is set from these nonlands' curve.
+    slots = spec.role_targets["lands"] or land_plan(spells, store)["count"]
     profile = mana_profile(spells, spec.commander, store)
     weights = profile["weighted_pips"]
     strategy = profile["strategy"]

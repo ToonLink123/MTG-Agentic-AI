@@ -37,12 +37,17 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(bootstrap.status(self.path), {
             "Card data": False, "Oracle tags": False, "Rulings": False,
             "Commander Spellbook": False, "Rules index": False, "Embedding model": True,
+            "Card index": False,
         })
         with OracleStore(self.path / "oracle.sqlite3") as store:
             store.import_cards(records())
             store.import_tags(TAGS)
             store.import_rulings(RULINGS)
             store.import_combos(COMBOS)
+            store.import_card_vectors([("Spell 1", b"\0" * 8)], metadata={
+                "embedding": bootstrap.card_index_identity(),
+                "card_count": store.metadata["card_count"],
+            })
         with contextlib.closing(sqlite3.connect(self.path / bootstrap.RULES_INDEX)) as db, db:
             db.execute("CREATE TABLE rule_metadata (key TEXT PRIMARY KEY, value TEXT)")
             db.execute("INSERT INTO rule_metadata VALUES ('rule_count', '4')")
@@ -80,15 +85,16 @@ class BootstrapTests(unittest.TestCase):
             "Card data": "77 cards", "Oracle tags": "1 tags", "Rulings": "1 rulings",
             "Commander Spellbook": "skipped: --skip-combos", "Rules index": "4 rules",
             "Embedding model": "skipped: the hash backend needs no download",
+            "Card index": "skipped: the hash backend embeds no cards",
         })
         stages = [line for line in lines if line.startswith("setup: ")]
-        self.assertEqual(stages[:2], ["setup: 1/6 Card data: downloading",
-                                      "setup: 1/6 Card data: 77 cards"])
-        self.assertEqual(len(stages), 12)  # Each step starts, then reports.
+        self.assertEqual(stages[:2], ["setup: 1/7 Card data: downloading",
+                                      "setup: 1/7 Card data: 77 cards"])
+        self.assertEqual(len(stages), 14)  # Each step starts, then reports.
         # A second run finds the downloads here; the skips say so again.
         status, again, _ = self.run_setup("--skip-combos")
         self.assertEqual([k for k, v in again["steps"].items() if v != bootstrap.ALREADY],
-                         ["Commander Spellbook", "Embedding model"])
+                         ["Commander Spellbook", "Embedding model", "Card index"])
 
     def test_the_model_is_skipped_when_this_python_cannot_use_it(self):
         # The EmbeddingGemma rules index is already here, so no torch import is needed.

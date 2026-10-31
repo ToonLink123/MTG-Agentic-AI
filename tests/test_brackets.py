@@ -337,6 +337,7 @@ class BracketTests(unittest.TestCase):
             )
             self.assertEqual(result["verdict"], "uncertain")
             self.assertEqual(result["errors"], [])
+            self.assertEqual(result["flags"], [])  # It names no card a drafter could cut.
 
     def test_chain_and_early_combo_risk_trigger_revision(self):
         response = assessment(
@@ -370,6 +371,7 @@ class BracketTests(unittest.TestCase):
             {"Spell 0": 1, "Spell 1": 1}, JODAH["name"], 3
         )
         self.assertEqual(result["verdict"], "uncertain")
+        self.assertEqual([f["cards"] for f in result["flags"]], [["Spell 0", "Spell 1"]])
 
     def test_low_bracket_combo_presence_requires_intent_review(self):
         response = assessment(
@@ -379,6 +381,8 @@ class BracketTests(unittest.TestCase):
             {"Spell 0": 1, "Spell 1": 1}, JODAH["name"], 2
         )
         self.assertEqual(result["verdict"], "uncertain")
+        self.assertEqual(len(result["flags"]), 1)
+        self.assertIn("Bracket 2", result["flags"][0]["reason"])
 
     def test_hallucinated_references_missing_combo_review_and_invalid_turn_bounds_rejected(self):
         for changes in [

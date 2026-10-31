@@ -1,10 +1,13 @@
 """Local card search: the fast, model-free half of discovery.
 
-Terms come from the player's words (request, interview answers, asks, themes) and from the
-commander's Oracle text. Code drops words too common to mean anything, then ranks cards by BM25
-over their name, type line and text, so rare terms such as die rolls or divinity counters weigh
-more than common ones, and a card matching several terms beats one matching a single word. The
-engine map's model then judges the ranked cards; the rank is a hint, never a verdict.
+Terms come from the spec, never from the player's raw prose ("certain", "chances" and "heavy"
+matched card names, not mechanics): the rules-text phrases intake wrote (search_terms, each
+checked to appear on some card), the themes, mechanics and win conditions, and the commander's
+Oracle text. Code drops words too common to mean anything, then ranks cards by BM25 over their
+rules text (type line and Oracle text, never the name), so rare terms such as die rolls or
+divinity counters weigh more than common ones, and a card matching several terms beats one
+matching a single word. The engine map's model then judges the ranked cards; the rank is a hint,
+never a verdict.
 """
 
 from __future__ import annotations
@@ -81,15 +84,13 @@ def search_terms(spec: DeckSpec, commander: Card | None) -> dict[str, tuple[str,
 
     if commander is not None:
         _terms_from(unnamed(commander.get("oracle_text", "")), COMMANDER, terms)
-    brief = spec.brief
-    player = [
-        brief["request"],
-        *(a["answer"] for a in brief["interview"] if a["source"] != "agents"),
-        *(a["quote"] for a in brief["asks"]),
-        *spec.themes, *spec.mechanics, *spec.win_conditions,
-    ]
-    for text in player:
+    for text in (*spec.themes, *spec.mechanics, *spec.win_conditions):
         _terms_from(unnamed(text), PLAYER, terms)
+    # Intake's phrases are searched whole, as cards print them.
+    for phrase in spec.search_terms:
+        term = " ".join(unnamed(phrase).lower().split())
+        if term:
+            terms[_key(term)] = (term, PLAYER)
     return terms
 
 
@@ -105,7 +106,7 @@ def theme_scores(
     commander = store.get_card(spec.commander)
     useful = []
     for term, weight in search_terms(spec, commander).values():
-        count = store.text_count(term)
+        count = store.text_count(term, column="rules")
         if 0 < count <= common:
             useful.append({"term": term, "weight": weight, "cards": count,
                            "value": weight * math.log(1 + total / count)})

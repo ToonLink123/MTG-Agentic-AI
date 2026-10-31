@@ -13,7 +13,7 @@ from typing import Any
 
 from . import activity, prompts
 from .brackets import land_denial_forbidden
-from .cards import Card, name_key, trim_card
+from .cards import Card, compact_row, name_key, prompt_card
 from .engine_map import clean_map
 from .llm import JSONModel, request_json
 from .mana import is_land
@@ -170,7 +170,7 @@ class Candidate:
     roles: set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict[str, Any]:
-        return {**trim_card(self.card), "roles": sorted(self.roles)}
+        return prompt_card(self.card, self.roles)
 
 
 @dataclass
@@ -184,6 +184,9 @@ class CandidatePool:
     local_search: dict[str, Any] = field(default_factory=lambda: {"terms": [], "hits": []})
     engine_map: dict[str, Any] = field(default_factory=dict)
     mode: str = "mixed"
+    # Commander Spellbook combos of up to three cards among the candidates and the commander,
+    # found when the engine map is drawn: {id, cards, results}.
+    combos: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -195,6 +198,7 @@ class CandidatePool:
             "diagnostics": self.diagnostics,
             "local_search": self.local_search,
             "engine_map": self.engine_map,
+            "combos": self.combos,
         }
 
     @classmethod
@@ -247,10 +251,51 @@ class CandidatePool:
         if engine:
             # A saved map is re-checked like the cards: only names still in this pool remain.
             engine = {"searches": [], **engine}
+            if isinstance(engine.get("links"), list):
+                # Maps saved before link checks record none.
+                engine["links"] = [
+                    {"verified": "unchecked", **link} if isinstance(link, dict) else link
+                    for link in engine["links"]
+                ]
             validate_json(engine, map_schema(stored=True))
             nonlands = [c.card["name"] for c in cards if not is_land(c.card)]
             engine = clean_map(engine, nonlands, spec.commander, spec.brief["asks"], notes=False)
-        return cls(spec, cards, queries, diagnostics, local, engine, mode)
+        combos = _saved_combos(data.get("combos", []), {*seen, name_key(spec.commander)})
+        return cls(spec, cards, queries, diagnostics, local, engine, mode, combos)
+
+
+def _saved_combos(raw: Any, names: set[str]) -> list[dict[str, Any]]:
+    """Saved combos re-checked like the cards: only those whose cards are all still here."""
+    if not isinstance(raw, list) or len(raw) > 400:
+        raise ValueError("Invalid saved combos")
+    combos = []
+    for combo in raw:
+        if (
+            not isinstance(combo, dict) or not isinstance(combo.get("id"), str)
+            or not isinstance(combo.get("cards"), list) or not isinstance(combo.get("results"), list)
+            or not all(isinstance(v, str) for v in [*combo["cards"], *combo["results"]])
+        ):
+            raise ValueError("Invalid saved combo")
+        if {name_key(n) for n in combo["cards"]} <= names:
+            combos.append({"id": combo["id"], "cards": combo["cards"], "results": combo["results"][:4]})
+    return combos
+
+
+def candidate_rows(pool: CandidatePool, *, full: int, first: Any = ()) -> dict[str, Any]:
+    """The pool's nonland candidates for a prompt. A pool of at most `full` cards is sent whole.
+    A larger one sends full rows (rules text, tags, roles) for `first` and then the pool's own
+    ranking up to `full`, and one line each for the rest (name | cost | type | roles and
+    tags): a model reads a shortlist closely instead of skimming a thousand cards, and every
+    card stays pickable, its text one tool call away."""
+    nonlands = [c for c in pool.cards if not is_land(c.card)]
+    if len(nonlands) <= full:
+        return {"candidates": [c.to_dict() for c in nonlands]}
+    by_name = {c.card["name"]: c for c in nonlands}
+    order = list(dict.fromkeys([*(n for n in first if n in by_name), *by_name]))
+    return {
+        "candidates": [by_name[n].to_dict() for n in order[:full]],
+        "more_candidates": [compact_row(by_name[n].card, by_name[n].roles) for n in order[full:]],
+    }
 
 
 def eligible(card: Card, spec: DeckSpec) -> bool:

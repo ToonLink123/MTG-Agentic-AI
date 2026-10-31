@@ -13,5 +13,6 @@
   "role_targets": {
     "ramp": 10, "draw": 10, "removal": 8, "wipes": 3,
     "lands": 36, "creatures": 15, "protection": 4
-  }
+  },
+  "search_terms": []
 }

@@ -48,12 +48,14 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result["validation"]["card_count"], 100)
         self.assertEqual(self.client.get_calls, [])
         self.assertEqual(len(model.calls), 1)
-        self.assertNotIn("prices", model.calls[0][0][1]["content"])
-        self.assertNotIn('"name": "Plains"', model.calls[0][0][1]["content"])
+        prompt = "".join(m["content"] for m in model.calls[0][0])
+        self.assertIn('"name": "Spell 0"', model.calls[0][0][0]["content"])  # The pool comes first.
+        self.assertNotIn("prices", prompt)
+        self.assertNotIn('"name": "Plains"', prompt)
 
     def test_unknown_names_fail_immediately_then_json_errors_drive_repair(self):
         bad = draft()
-        bad["buckets"]["support"][-1] = "Invented Card"
+        bad["picks"]["flex"][-1] = "Invented Card"
         model = FakeModel(bad, draft())
         result = self.run_draft(model)
         self.assertTrue(result["valid"], result)
@@ -72,7 +74,7 @@ class PipelineTests(unittest.TestCase):
         self.store.import_cards([*self.records, extra])
         self.client = FakeCards([*self.records, extra])
         chosen = draft()
-        chosen["buckets"]["support"][-1] = extra["name"]
+        chosen["picks"]["flex"][-1] = extra["name"]
         result = self.run_draft(FakeModel(chosen), max_repairs=0)
         self.assertFalse(result["valid"])
         self.assertIn("schema", {error["error"] for error in result["validation"]["errors"]})
@@ -83,7 +85,7 @@ class PipelineTests(unittest.TestCase):
         extra = card("New Real Card", colors="U", mana_cost="{U}")
         self.client = FakeCards([*self.records, extra])
         chosen = draft()
-        chosen["buckets"]["support"][-1] = extra["name"]
+        chosen["picks"]["flex"][-1] = extra["name"]
         result = self.run_draft(FakeModel(chosen), max_repairs=0)
         self.assertFalse(result["valid"])
         self.assertIsNone(self.store.get_card(extra["name"]))
@@ -91,7 +93,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_fuzzy_or_different_named_api_response_never_silently_replaces_invention(self):
         bad = draft()
-        bad["buckets"]["support"][-1] = "Invented Card"
+        bad["picks"]["flex"][-1] = "Invented Card"
         with patch.object(self.client, "get_card", return_value=trim_card(self.records[7])) as get:
             result = self.run_draft(FakeModel(bad), max_repairs=0)
         get.assert_not_called()
@@ -107,7 +109,7 @@ class PipelineTests(unittest.TestCase):
         pool = make_pool(self.store, make_spec(exclude=["Spell 69"]))
         pool.cards = [c for c in pool.cards if c.card["name"] != "Spell 69"]
         chosen = draft()
-        chosen["buckets"]["support"][-1] = "Spell 69"
+        chosen["picks"]["flex"][-1] = "Spell 69"
         result = self.run_draft(FakeModel(chosen), pool=pool, max_repairs=0)
         self.assertFalse(result["valid"])
         self.assertIn("schema", {e["error"] for e in result["validation"]["errors"]})
@@ -125,18 +127,36 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("role_target", {e["error"] for e in result["validation"]["errors"]})
 
     def test_repair_limit_is_initial_draft_plus_at_most_three_repairs(self):
-        bad = draft()
-        bad["buckets"]["support"][-1] = "Unknown"
-        model = FakeModel(bad, bad, bad, bad)
+        bad = []
+        for number in range(5):
+            answer = draft()
+            answer["picks"]["flex"][-1] = f"Unknown {number}"
+            bad.append(answer)
+        model = FakeModel(*bad)
         result = self.run_draft(model)
         self.assertFalse(result["valid"])
         self.assertEqual(len(model.calls), 4)
         self.assertEqual(len(result["attempts"]), 4)
         self.assertIn("schema", {e["error"] for e in result["validation"]["errors"]})
+        history = json.loads(model.calls[3][0][-1]["content"])["history"]
+        self.assertEqual([h["attempt"] for h in history], [1, 2])
+        self.assertIn("Unknown 0", history[0]["problems"][0])
+
+    def test_the_same_problems_three_times_running_stop_the_repairs(self):
+        bad = draft()
+        bad["picks"]["flex"][-1] = "Unknown"
+        model = FakeModel(bad, bad, bad, bad)
+        result = self.run_draft(model)
+        self.assertEqual(len(model.calls), 3)
+        second = json.loads(model.calls[1][0][-1]["content"])
+        third = json.loads(model.calls[2][0][-1]["content"])
+        self.assertNotIn("unchanged", second)
+        self.assertIn("did not take effect", third["unchanged"])
+        self.assertFalse(result["valid"])
 
     def test_pool_only_drafting_never_spends_the_legacy_verification_budget(self):
         bad = draft()
-        bad["buckets"]["support"][-1] = "Unknown"
+        bad["picks"]["flex"][-1] = "Unknown"
         result = self.run_draft(FakeModel(bad, bad, bad, bad))
         self.assertFalse(result["valid"])
         self.assertEqual(self.client.get_calls, [])
@@ -146,14 +166,14 @@ class PipelineTests(unittest.TestCase):
 
     def test_land_and_commander_choices_cannot_override_code_policy(self):
         bad = draft(commander="Other Commander")
-        bad["buckets"]["support"][-1] = "Plains"
+        bad["picks"]["flex"][-1] = "Plains"
         result = self.run_draft(FakeModel(bad, draft()))
         self.assertTrue(result["valid"], result)
         errors = {e["error"] for e in result["attempts"][0]["errors"]}
         self.assertIn("schema", errors)
         schema_errors = result["attempts"][0]["errors"]
         self.assertTrue(any(e.get("path") == "$.commander" for e in schema_errors))
-        self.assertTrue(any(e.get("path") == "$.buckets.support[62]" for e in schema_errors))
+        self.assertTrue(any(e.get("path") == "$.picks.flex[62]" for e in schema_errors))
 
     def test_assembly_respects_game_changer_allowance_without_model_repair(self):
         changed = [
@@ -181,9 +201,9 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(result["valid"])
         self.assertIn("game_changers", {e["error"] for e in result["validation"]["errors"]})
 
-    def test_short_overlapping_buckets_are_padded_and_deduplicated(self):
+    def test_short_overlapping_tiers_are_padded_and_deduplicated(self):
         chosen = draft(40)
-        chosen["buckets"]["creatures"] = ["Spell 0", "Spell 1"]
+        chosen["picks"]["core"] = ["Spell 0", "Spell 1"]
         result = self.run_draft(FakeModel(chosen))
         self.assertTrue(result["valid"], result)
         self.assertEqual(result["assembly"]["model_selected_unique"], 40)
