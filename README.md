@@ -77,6 +77,22 @@ fails its checks. [`examples/`](examples) has a spec, a deck that fails on purpo
 pod. Optional [Forge](https://github.com/Card-Forge/forge) simulation, a four-deck evaluation
 suite and simulation-driven revisions are also built in.
 
+### Forge simulation
+
+Forge 2.0.15 needs Java 17 or newer. Unpack the
+[release](https://github.com/Card-Forge/forge/releases/tag/forge-2.0.15) `.tar.bz2`, then point
+Ring at it once:
+
+```sh
+export MTG_FORGE_HOME=/path/to/forge-2.0.15
+export MTG_FORGE_JAVA=/path/to/jdk-21/bin/java   # if java on PATH is older than 17
+python -m mtg_agentic forge-sim deck.json --pod examples/forge-pod.json --games 40 --workers 8
+```
+
+Each game runs in its own JVM (about 2 GB), so `--workers` plays several at once. Metrics
+report the win rate with a 95% interval and `win_turn`: the candidate's own turns when it won.
+Forge's own `Game Outcome: Turn N` line is half the global turn count, not a player's turn.
+
 ## Development
 
 ```sh

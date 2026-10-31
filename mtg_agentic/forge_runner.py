@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,11 @@ class ForgeSimulator:
     """One JVM per game: a hung game cannot poison the rest of a batch.
 
     Startup costs more than batch mode, but seeds, timeouts, failures and log
-    attribution are isolated. No game-log interpretation happens in this layer.
+    attribution are isolated. Forge's own clock only interrupts a slow game's
+    thread, which can keep running and draw from the shared static RNG, so a
+    batch JVM is not reproducible after its first timeout. Separate JVMs also
+    make games independent enough to run several at once. No game-log
+    interpretation happens in this layer.
     """
 
     def __init__(
@@ -61,6 +66,7 @@ class ForgeSimulator:
         timeout: float = 120,
         startup_grace: float = 30,
         max_log_bytes: int = 16 * 1024 * 1024,
+        workers: int = 1,
     ):
         if (
             not math.isfinite(timeout)
@@ -72,9 +78,12 @@ class ForgeSimulator:
             raise ValueError(
                 "Positive simulation timeout/log budget and nonnegative grace required"
             )
+        if type(workers) is not int or not 1 <= workers <= 64:
+            raise ValueError("Simulation workers must be from 1 to 64")
         self.installation, self.store, self.support = installation, store, support
         self.log_dir = Path(log_dir).resolve()
         self.timeout, self.startup_grace, self.max_log_bytes = timeout, startup_grace, max_log_bytes
+        self.workers = workers
         self._cancel = threading.Event()
         self._lock = threading.Lock()
 
@@ -89,7 +98,7 @@ class ForgeSimulator:
         n_games: int,
         *,
         seed: int = 0,
-        quiet: bool = True,
+        quiet: bool = False,
     ) -> dict[str, Any]:
         if type(n_games) is not int or not 1 <= n_games <= 1000:
             raise ValueError("n_games must be from 1 to 1000")
@@ -157,20 +166,25 @@ class ForgeSimulator:
             "status": "preflight_failed",
         }
         if all(v["valid"] for v in validations) and all(s["supported"] for s in support):
+            # Run-local copies: Forge reads them through -D, and the user's own deck
+            # folders never collect simulation files.
+            deck_dir = directory / "decks"
             exports = []
             for i, d in enumerate(decks):
-                path = self.installation.decks_dir / f"agentic-{run_id}-{i}.dck"
                 exports.append(
                     export_deck(
-                        d, self.store, path, name="Agentic Candidate" if i == 0 else f"Opponent {i}"
+                        d,
+                        self.store,
+                        deck_dir / f"deck-{i}.dck",
+                        name="Agentic Candidate" if i == 0 else f"Opponent {i}",
                     )
                 )
             report["exports"] = exports
-            report["status"] = "finished"
-            for i in range(n_games):
+            report["workers"] = self.workers
+
+            def play(i: int) -> dict[str, Any] | None:
                 if self._cancel.is_set():
-                    report["status"] = "cancelled"
-                    break
+                    return None
                 rotation = i % 4
                 ordered = exports[rotation:] + exports[:rotation]
                 seat = ((4 - rotation) % 4) + 1
@@ -179,7 +193,7 @@ class ForgeSimulator:
                     "-f",
                     "Commander",
                     "-D",
-                    str(self.installation.decks_dir),
+                    str(deck_dir),
                     "-d",
                     *[Path(e["path"]).name for e in ordered],
                     "-n",
@@ -193,10 +207,20 @@ class ForgeSimulator:
                     command.append("-q")
                 raw = dict(self._run(command, path))
                 raw.update(index=i + 1, seed=seed + i, candidate_seat=seat, path=str(path))
-                report["raw_logs"].append(raw)
-                if raw["cancelled"]:
-                    report["status"] = "cancelled"
-                    break
+                return raw
+
+            with ThreadPoolExecutor(self.workers) as pool:
+                try:
+                    played = list(pool.map(play, range(n_games)))
+                except BaseException:
+                    # Stop running games before the pool waits on them.
+                    self._cancel.set()
+                    raise
+            report["raw_logs"] = [raw for raw in played if raw is not None]
+            cancelled = len(report["raw_logs"]) < n_games or any(
+                raw["cancelled"] for raw in report["raw_logs"]
+            )
+            report["status"] = "cancelled" if cancelled else "finished"
         with (directory / "raw-manifest.json").open("x", encoding="utf-8") as output:
             json.dump(report, output, ensure_ascii=True, indent=2)
         report["artifact_dir"] = str(directory)
@@ -256,6 +280,6 @@ def simulate(
     *,
     simulator: ForgeSimulator,
     seed: int = 0,
-    quiet: bool = True,
+    quiet: bool = False,
 ) -> dict[str, Any]:
     return simulator.simulate(deck, opponents, n_games, seed=seed, quiet=quiet)

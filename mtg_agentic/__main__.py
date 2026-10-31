@@ -22,7 +22,7 @@ from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION
 from .engine_map import build_engine_map
 from .evaluation import evaluation_history, run_evaluation
 from .forge import ForgeError
-from .forge_cli import load_forge
+from .forge_cli import WORKERS_HELP, forge_home_options, load_forge
 from .forge_cli import register_commands as register_forge_commands
 from .forge_cli import run_command as run_forge_command
 from .forge_config import OpponentPod
@@ -311,7 +311,7 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _simulation_options(parser, *, required=False, games=10):
-    parser.add_argument("--forge-home", type=Path, required=required)
+    forge_home_options(parser, required=required)
     parser.add_argument(
         "--pod",
         type=Path,
@@ -320,18 +320,20 @@ def _simulation_options(parser, *, required=False, games=10):
         help="Pinned pod config; repeat for up to three comparison pods",
     )
     parser.add_argument("--decks-dir", type=Path)
-    parser.add_argument("--java")
     parser.add_argument("--known-issues", type=Path)
     parser.add_argument("--games", type=int, default=games)
     parser.add_argument("--simulation-timeout", type=float, default=120)
     parser.add_argument("--startup-grace", type=float, default=30)
     parser.add_argument("--seed", type=int, default=20261025)
+    parser.add_argument("--workers", type=int, default=1, help=WORKERS_HELP)
     parser.add_argument("--logs-dir", type=Path)
 
 
 def _simulation(args, store):
     if not args.pod or not 1 <= len(args.pod) <= 3:
         raise ValueError("Simulation requires one to three pinned --pod configs")
+    if args.forge_home is None:
+        raise ValueError("--pod requires --forge-home or MTG_FORGE_HOME")
     installation, support = load_forge(args)
     pods = [OpponentPod.load(p, installation) for p in args.pod]
     if len({p.fingerprint for p in pods}) != len(pods):
@@ -343,6 +345,7 @@ def _simulation(args, store):
         args.logs_dir or args.data_dir / "simulations",
         timeout=args.simulation_timeout,
         startup_grace=args.startup_grace,
+        workers=args.workers,
     )
     return simulator, pods
 
@@ -745,7 +748,8 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     simulation_runner = None
                     sim_config = None
-                    if args.forge_home is not None:
+                    # MTG_FORGE_HOME alone must not turn simulation on; --pod does.
+                    if args.pod:
                         simulator, pods = _simulation(args, store)
                         sim_config = {
                             "installation": simulator.installation.provenance(),
@@ -764,8 +768,6 @@ def main(argv: list[str] | None = None) -> int:
                                     {**summarize(raw), "artifact_dir": raw["artifact_dir"]}
                                 )
                             return results
-                    elif args.pod:
-                        raise ValueError("--pod requires --forge-home")
                     search = BulkSearch(store, client)
                     result = run_evaluation(
                         lambda case: draft_from_request(

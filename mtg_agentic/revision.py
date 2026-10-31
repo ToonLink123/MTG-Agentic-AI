@@ -193,15 +193,14 @@ def compare(baselines: list[dict], candidates: list[dict], *, confidence: float)
         )
         after = wilson(new["candidate_wins"], new["requested_games"], confidence)
         lower = after[0] - before[1] if before and after else None
+        # Prefer the candidate's own turns; fall back to Forge's counter for both sides alike.
+        won = [g for g in old["games"] + new["games"] if g["candidate_won"]]
+        unit = "candidate_turns" if all(g.get("candidate_turns") for g in won) else "forge_turn"
         old_turns = [
-            g["forge_turn"]
-            for g in old["games"]
-            if g["candidate_won"] and g.get("forge_turn") is not None
+            g[unit] for g in old["games"] if g["candidate_won"] and g.get(unit) is not None
         ]
         new_turns = [
-            g["forge_turn"]
-            for g in new["games"]
-            if g["candidate_won"] and g.get("forge_turn") is not None
+            g[unit] for g in new["games"] if g["candidate_won"] and g.get(unit) is not None
         ]
         turns_ok = not old_turns or (
             bool(new_turns) and statistics.median(new_turns) <= statistics.median(old_turns)

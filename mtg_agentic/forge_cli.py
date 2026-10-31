@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -21,9 +22,8 @@ def register_commands(commands) -> None:
     for name in ("forge-export", "forge-support", "forge-sim"):
         parser = commands.add_parser(name)
         parser.add_argument("deck", type=Path)
-        parser.add_argument("--forge-home", type=Path, required=True)
+        forge_home_options(parser)
         parser.add_argument("--decks-dir", type=Path)
-        parser.add_argument("--java")
         parser.add_argument("--known-issues", type=Path)
         parser.add_argument("--output", type=Path)
         if name == "forge-export":
@@ -34,8 +34,26 @@ def register_commands(commands) -> None:
             parser.add_argument("--timeout", type=float, default=120)
             parser.add_argument("--startup-grace", type=float, default=30)
             parser.add_argument("--seed", type=int, default=20261025)
-            parser.add_argument("--verbose-logs", action="store_true")
+            parser.add_argument("--workers", type=int, default=1, help=WORKERS_HELP)
+            parser.add_argument("--quiet-logs", action="store_true", help=QUIET_HELP)
             parser.add_argument("--logs-dir", type=Path)
+
+
+WORKERS_HELP = "Games played at once, one Forge JVM (about 2 GB) each"
+QUIET_HELP = "Keep only result lines; win-turn and first-cast metrics need full logs"
+
+
+def forge_home_options(parser, *, required: bool = True) -> None:
+    """MTG_FORGE_HOME and MTG_FORGE_JAVA spare repeating long install paths."""
+    home = os.getenv("MTG_FORGE_HOME")
+    parser.add_argument(
+        "--forge-home", type=Path, default=home, required=required and not home,
+        help="Forge release folder (default: MTG_FORGE_HOME)",
+    )
+    parser.add_argument(
+        "--java", default=os.getenv("MTG_FORGE_JAVA"),
+        help="Java 17+ executable (default: MTG_FORGE_JAVA, else java on PATH)",
+    )
 
 
 def load_forge(args: argparse.Namespace) -> tuple[ForgeInstallation, ForgeSupport]:
@@ -80,11 +98,10 @@ def run_command(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             args.logs_dir or args.data_dir / "simulations",
             timeout=args.timeout,
             startup_grace=args.startup_grace,
+            workers=args.workers,
         )
         try:
-            report = simulator.simulate(
-                deck, pod, args.games, seed=args.seed, quiet=not args.verbose_logs
-            )
+            report = simulator.simulate(deck, pod, args.games, seed=args.seed, quiet=args.quiet_logs)
         except KeyboardInterrupt:
             simulator.cancel()
             raise

@@ -7,7 +7,7 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
-from statistics import NormalDist
+from statistics import NormalDist, fmean, median, stdev
 from typing import Any
 
 from .forge_config import file_hash
@@ -18,9 +18,16 @@ RESULT = re.compile(
     re.M,
 )
 OUTCOME = re.compile(r"^Game Outcome: (Ai\([1-4]\)-.+) has won because .+$", re.M)
+# Forge prints ceil(global turn / 2) here, a two-player convention: in a four-player
+# game "Turn 26" means global turn 51 or 52, about table round 13.
 TURNS = re.compile(r"^Game Outcome: Turn (\d+)$", re.M)
 TURN_START = re.compile(r"^Turn: Turn (\d+) \(Ai\(([1-4])\)-.+\)$")
 EXCEPTION = re.compile(r"^(?:java\.[\w.]+(?:Exception|Error)|Exception in thread)", re.M)
+# Forge gives each AI decision a 5 s wall-clock budget, prints this trace when it runs out
+# and falls back to a simpler choice; the game goes on. Busy CPUs make it more frequent.
+AI_DECISION_TIMEOUT = re.compile(
+    r"^java\.util\.concurrent\.TimeoutException\n(?:\s+at java\..+\n)*\s+at forge\.ai\.", re.M
+)
 WARNING_PATTERNS = {
     "target_selection_failure": "Couldn't add to stack, failed to target",
     "fight_ai_warning": "FightAi.canFightAi",
@@ -61,9 +68,14 @@ def parse_game(text: str, raw: dict[str, Any], *, release: str = "2.0.15") -> di
         "winner_seat": None,
         "candidate_won": False,
         "forge_turn": None,
+        "candidate_turns": None,
+        "table_rounds": None,
         "reported_winner": None,
         "runtime_warnings": {n: text.count(p) for n, p in WARNING_PATTERNS.items() if p in text},
     }
+    ai_timeouts = len(AI_DECISION_TIMEOUT.findall(text))
+    if ai_timeouts:
+        result["runtime_warnings"]["ai_decision_timeout"] = ai_timeouts
     matches = list(RESULT.finditer(text))
     if len(matches) == 1:
         result["reported_winner"] = matches[0][3]
@@ -73,7 +85,11 @@ def parse_game(text: str, raw: dict[str, Any], *, release: str = "2.0.15") -> di
         result["status"] = "timeout"
     elif raw.get("log_limit_exceeded"):
         result["status"] = "log_limit"
-    elif raw.get("launch_error") or raw.get("returncode") != 0 or EXCEPTION.search(text):
+    elif (
+        raw.get("launch_error")
+        or raw.get("returncode") != 0
+        or len(EXCEPTION.findall(text)) > ai_timeouts
+    ):
         result["status"] = "engine_error"
     elif release != "2.0.15":
         result["status"] = "unsupported_release"
@@ -83,6 +99,11 @@ def parse_game(text: str, raw: dict[str, Any], *, release: str = "2.0.15") -> di
         turns = TURNS.findall(text)
         if len(turns) == 1:
             result["forge_turn"] = int(turns[0])
+        trace = turn_trace(text)
+        # Verbose logs only; the global counter must also agree with Forge's own summary.
+        if trace and result["forge_turn"] in (None, -(-trace["global"] // 2)):
+            result["candidate_turns"] = trace["own"].get(raw["candidate_seat"], 0)
+            result["table_rounds"] = max(trace["own"].values())
         if m[3] is None and not winners:
             result["status"] = "draw"
         elif winners == [m[3]]:
@@ -95,6 +116,19 @@ def parse_game(text: str, raw: dict[str, Any], *, release: str = "2.0.15") -> di
         else:
             result["status"] = "inconsistent_result"
     return result
+
+
+def turn_trace(text: str) -> dict[str, Any] | None:
+    """Turn starts from a verbose log: the last global turn and each seat's own turn count."""
+    turns, own = [], Counter()
+    for line in text.splitlines():
+        start = TURN_START.match(line)
+        if start:
+            turns.append(int(start[1]))
+            own[int(start[2])] += 1
+    if not turns or turns != list(range(1, turns[-1] + 1)):
+        return None
+    return {"global": turns[-1], "own": dict(own)}
 
 
 def commander_cast(text: str, seat: int, commander: str) -> dict[str, Any]:
@@ -173,7 +207,20 @@ def summarize(manifest: dict[str, Any]) -> dict[str, Any]:
         "requested_games": requested,
         "oracle_metadata": manifest.get("oracle_metadata"),
     }
-    histogram = Counter(g["forge_turn"] for g in wins if g.get("forge_turn") is not None)
+    win_turns = [g["candidate_turns"] for g in wins if g.get("candidate_turns") is not None]
+    histogram = Counter(win_turns)
+    win_turn: dict[str, Any] = {
+        "available": bool(win_turns) and len(win_turns) == len(wins),
+        "observed_wins": len(win_turns),
+        "mean": fmean(win_turns) if win_turns else None,
+        "median": median(win_turns) if win_turns else None,
+        "stdev": stdev(win_turns) if len(win_turns) > 1 else None,
+        "mean_ci95": None,
+    }
+    if len(win_turns) > 1:
+        radius = 1.96 * win_turn["stdev"] / len(win_turns) ** 0.5
+        win_turn["mean_ci95"] = [win_turn["mean"] - radius, win_turn["mean"] + radius]
+    rounds = [g["table_rounds"] for g in completed if g.get("table_rounds") is not None]
     tier2 = {name: dict(value) for name, value in TIER2.items()}
     casts = [
         g["commander_first_cast"]
@@ -213,8 +260,11 @@ def summarize(manifest: dict[str, Any]) -> dict[str, Any]:
             {k: s.get(k) for k in ("supported", "missing", "known_issues", "ai_warnings")}
             for s in manifest["support"]
         ],
+        "win_turn": win_turn,
         "win_turn_distribution": {str(t): n for t, n in sorted(histogram.items())} or None,
-        "turn_unit": "Forge Game Outcome turn counter, not inferred multiplayer rounds",
+        "mean_game_rounds": fmean(rounds) if rounds else None,
+        "turn_unit": "The candidate's own turns started when it won, counted from verbose logs; "
+        "extra turns count. forge_turn per game is Forge's ceil(global turn / 2) counter.",
         "tier2": tier2,
         "games": games,
         "limitations": [

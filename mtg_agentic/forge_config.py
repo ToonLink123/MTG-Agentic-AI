@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from collections import Counter
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ from typing import Any
 
 from .forge import ForgeError
 from .schema import load_json
+
+# Forge 2.x is compiled for Java 17 (class file 61); older JVMs fail before printing anything useful.
+MIN_JAVA = 17
 
 
 def file_hash(path: Path) -> str:
@@ -50,6 +54,21 @@ def read_dck(path: str | Path) -> dict[str, Any]:
             "Exactly one Commander section card is required; partner/background unsupported"
         )
     return {"commander": next(iter(commanders)), "cards": dict(main), "bracket": 4}
+
+
+def java_major_version(java: str) -> int | None:
+    """`java -version` prints 'version "21.0.13"', or '"1.8.0_401"' before Java 9, on stderr."""
+    try:
+        result = subprocess.run(
+            [java, "-version"], capture_output=True, text=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    match = re.search(r'version "(\d+)(?:\.(\d+))?', result.stderr + result.stdout)
+    if not match:
+        return None
+    major = int(match[1])
+    return int(match[2] or 0) if major == 1 else major
 
 
 def _properties(path: Path) -> dict[str, str]:
@@ -93,6 +112,13 @@ class ForgeInstallation:
         java_path = shutil.which(java or "java")
         if not java_path:
             raise ForgeError("Java is not installed or the executable was not found")
+        version = java_major_version(java_path)
+        if version is None or version < MIN_JAVA:
+            found = "an unreadable version" if version is None else f"Java {version}"
+            raise ForgeError(
+                f"Forge needs Java {MIN_JAVA} or newer, but {java_path} is {found}; "
+                "pass --java or set MTG_FORGE_JAVA to a newer java executable"
+            )
         props = _properties(home / "forge.profile.properties")
         if decks_dir is None:
             if os.name == "nt":

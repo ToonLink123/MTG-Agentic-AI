@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from mtg_agentic.forge import ForgeError
 from mtg_agentic.forge_config import ForgeInstallation, OpponentPod, file_hash, read_dck
@@ -18,7 +18,7 @@ class ConfigTests(unittest.TestCase):
         (self.path / "forge.profile.properties").write_text("userDir=./isolated-user\n")
         with patch(
             "mtg_agentic.forge_config.shutil.which", return_value=str(self.path / "java.exe")
-        ):
+        ), patch("mtg_agentic.forge_config.java_major_version", return_value=21):
             self.install = ForgeInstallation.inspect(self.path)
         self.deck = self.path / "precon.dck"
         self.deck.write_text(
@@ -30,6 +30,27 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(self.install.command()[-1], "sim")
         self.assertIn("-Djava.awt.headless=true", self.install.command())
         self.assertEqual(self.install.release, "2.0.15")
+
+    def test_java_older_than_17_is_rejected_before_any_game(self):
+        for version in (11, None):
+            with patch(
+                "mtg_agentic.forge_config.shutil.which", return_value=str(self.path / "java.exe")
+            ), patch("mtg_agentic.forge_config.java_major_version", return_value=version):
+                with self.assertRaisesRegex(ForgeError, "Java 17"):
+                    ForgeInstallation.inspect(self.path)
+
+    def test_java_version_banners(self):
+        from mtg_agentic.forge_config import java_major_version
+
+        for banner, expected in (
+            ('openjdk version "21.0.13" 2025-10-21', 21),
+            ('openjdk version "11.0.29" 2025-10-21', 11),
+            ('java version "1.8.0_401"', 8),
+            ("not java", None),
+        ):
+            result = Mock(stderr=banner, stdout="")
+            with patch("mtg_agentic.forge_config.subprocess.run", return_value=result):
+                self.assertEqual(java_major_version("java"), expected)
 
     def test_precon_import_keeps_commander_separate_and_aggregates_prints(self):
         deck = read_dck(self.deck)

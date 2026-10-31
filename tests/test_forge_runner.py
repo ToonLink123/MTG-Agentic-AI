@@ -145,11 +145,49 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([g["candidate_seat"] for g in report["raw_logs"]], [1, 4, 3, 2])
         self.assertEqual(process.call_count, 4)
         command = process.call_args.args[0]
-        self.assertIn("-q", command)
+        # Full logs by default: win turns and first casts are read from turn events.
+        self.assertNotIn("-q", command)
         deck_start = command.index("-d") + 1
         self.assertEqual(len(command[deck_start : command.index("-n")]), 4)
+        # Decks are exported beside the run's logs, never into the user's Forge folders.
+        decks = Path(command[command.index("-D") + 1])
+        self.assertEqual(decks, Path(report["artifact_dir"]) / "decks")
+        self.assertFalse(self.install.decks_dir.exists())
         saved = json.loads((Path(report["artifact_dir"]) / "raw-manifest.json").read_text())
         self.assertEqual(saved["requested_games"], 4)
+
+    def test_parallel_workers_keep_game_order_and_quiet_is_opt_in(self):
+        runner = ForgeSimulator(
+            self.install, self.store, self.support, self.path / "logs", workers=3
+        )
+        seen = []
+
+        def run(command, path):
+            seen.append(command[command.index("-s") + 1])
+            return {"cancelled": False, "returncode": 0, "timed_out": False}
+
+        with patch.object(runner, "_run", side_effect=run):
+            report = runner.simulate(self.deck, self.opponents, 7, seed=5, quiet=True)
+        self.assertEqual(report["status"], "finished")
+        self.assertEqual([g["index"] for g in report["raw_logs"]], list(range(1, 8)))
+        self.assertEqual(sorted(seen, key=int), [str(s) for s in range(5, 12)])
+        self.assertEqual(report["workers"], 3)
+        with self.assertRaises(ValueError):
+            ForgeSimulator(self.install, self.store, self.support, self.path / "logs", workers=0)
+
+    def test_cancel_during_a_parallel_run_skips_unstarted_games(self):
+        runner = ForgeSimulator(
+            self.install, self.store, self.support, self.path / "logs", workers=2
+        )
+
+        def run(command, path):
+            runner.cancel()
+            return {"cancelled": True, "returncode": None, "timed_out": False}
+
+        with patch.object(runner, "_run", side_effect=run) as process:
+            report = runner.simulate(self.deck, self.opponents, 10)
+        self.assertEqual(report["status"], "cancelled")
+        self.assertLessEqual(process.call_count, 2)
 
     def test_invalid_game_count_and_wrong_opponent_count_fail(self):
         for n in (0, True, 1001):

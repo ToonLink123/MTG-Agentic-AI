@@ -43,12 +43,45 @@ class MetricsTests(unittest.TestCase):
             parse_game(self.clean, self.raw, release="new")["status"], "unsupported_release"
         )
 
+    def test_ai_decision_timeout_is_a_warning_but_other_exceptions_still_fail(self):
+        # As printed by a 2.0.15 game under CPU load; the game then finished normally.
+        trace = (
+            "java.util.concurrent.TimeoutException\n"
+            "\tat java.base/java.util.concurrent.FutureTask.get(FutureTask.java:204)\n"
+            "\tat forge.ai.AiController.chooseSpellAbilityToPlayFromList(AiController.java:1686)\n"
+        )
+        g = parse_game(trace + trace + self.clean, self.raw)
+        self.assertEqual(g["status"], "completed")
+        self.assertEqual(g["runtime_warnings"]["ai_decision_timeout"], 2)
+        crash = "java.lang.NullPointerException\n\tat forge.game.Game.x(Game.java:1)\n"
+        self.assertEqual(parse_game(trace + crash + self.clean, self.raw)["status"], "engine_error")
+        engine_timeout = trace.replace("forge.ai.AiController", "forge.game.GameAction")
+        self.assertEqual(parse_game(engine_timeout + self.clean, self.raw)["status"], "engine_error")
+
     def test_synthetic_inconsistent_winners_are_not_success(self):
         text = self.clean.replace(
             "Ai(1)-Agentic Jodah Smoke has lost because life total reached 0",
             "Ai(1)-Agentic Jodah Smoke has won because all opponents have lost",
         )
         self.assertEqual(parse_game(text, self.raw)["status"], "inconsistent_result")
+
+    def test_win_turn_counts_the_winners_own_turns_not_forge_outcome_counter(self):
+        # Ten global turns over four seats; Forge reports ceil(10 / 2) = 5.
+        seats = [2, 3, 4, 1, 2, 3, 4, 1, 2, 3]
+        trace = "".join(f"Turn: Turn {n} (Ai({s})-Deck {s})\n" for n, s in enumerate(seats, 1))
+        text = trace + self.clean.replace("Turn 33", "Turn 5")
+        g = parse_game(text, {**self.raw, "candidate_seat": 2})
+        self.assertTrue(g["candidate_won"])
+        self.assertEqual(g["forge_turn"], 5)
+        self.assertEqual(g["candidate_turns"], 3)
+        self.assertEqual(g["table_rounds"], 3)
+        self.assertEqual(parse_game(text, self.raw)["candidate_turns"], 2)
+        # A trace that disagrees with Forge's own counter, or is incomplete, is not used.
+        self.assertIsNone(parse_game(trace + self.clean, self.raw)["candidate_turns"])
+        gap = text.replace("Turn: Turn 4 ", "missing ")
+        self.assertIsNone(parse_game(gap, self.raw)["candidate_turns"])
+        # Quiet logs have no trace.
+        self.assertIsNone(parse_game(self.clean, self.raw)["candidate_turns"])
 
     def test_confidence_intervals_include_sampling_uncertainty(self):
         self.assertIsNone(wilson(0, 0))
@@ -100,6 +133,8 @@ class MetricsTests(unittest.TestCase):
             self.assertEqual(result["completion_rate"], 0.5)
             self.assertEqual(result["timeout_rate"], 0.5)
             self.assertEqual(result["win_rate"], 0)
+            self.assertFalse(result["win_turn"]["available"])
+            self.assertIsNone(result["win_turn_distribution"])
             self.assertFalse(result["tier2"]["opening_lands"]["available"])
             Path(logs[0]["path"]).write_text("modified")
             self.assertEqual(summarize(manifest)["status_counts"]["invalid_log"], 1)
