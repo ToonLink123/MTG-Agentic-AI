@@ -198,3 +198,56 @@ python -m benchmarks.rules_retrieval
 the originals are never modified. It prints both tables above. The previous
 algorithm (A) is reimplemented in the script, since it no longer exists in
 `mtg_agentic/rules.py`.
+
+# Goldfish engine benchmark
+
+`/goldfish` plays a deck alone against three idle opponents in a Rust engine (`goldfish-rs/`,
+built by setup). Python compiles the deck once, turning each card's Oracle text into costs,
+mana and effects; the engine plays the games. Every game has its own splitmix64 seed, so a
+seed gives the same counters on any number of threads, which the benchmark checks before it
+times anything.
+
+## Results
+
+Games per second, 1,000,000 games of 10 turns, seed 1, on a 24-core Windows 11 machine with
+Rust 1.84.1. Times include starting the process and passing the deck as JSON (about 5 ms).
+
+| Deck | 1 thread | 2 | 4 | 8 | 16 | 24 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Jodah, Archmage Eternal | 117,936 | 235,633 | 467,201 | 855,898 | 988,328 | 1,296,272 |
+| Mr. House, President and CEO | 128,971 | 250,789 | 491,478 | 911,493 | 1,269,377 | 1,477,881 |
+| Clive, Ifrit's Dominant | 162,146 | 321,816 | 634,839 | 1,166,802 | 1,655,667 | 1,813,073 |
+| Machine Man, Model X-51 | 149,985 | 308,585 | 518,878 | 1,027,973 | 1,508,143 | 2,035,925 |
+
+Counters were identical at every thread count in all four decks.
+
+### Against the Python engine it replaced
+
+The engine began as Python, kept beside the Rust port as a reference until the two agreed
+game for game on nine real decks and a test deck, then removed. On the same four decks, with
+the same seeds and identical counters, Python played 4,866-7,572 games per second on one core
+and 56,070-89,312 on 24 processes (20,000 games each): Rust is 20-26× faster per core, and the
+gap holds on every core.
+
+## Reading the results
+
+- **The default `/goldfish` takes about 10 milliseconds.** 10,000 games run in 6-9 ms on 24
+  threads, plus 5 ms to start the process; compiling a deck takes 5-6 ms. In Python they took
+  1.3-2.1 s.
+- **Scaling is nearly linear to 8 threads** and flattens after: 16 threads are 8-10× one
+  thread, 24 threads 11-14×, as the machine's cores share caches and power.
+- **The speed matters for loops, not single reports.** A self-improvement loop that scores
+  hundreds of candidate decks at 100,000 games each spends under a second per candidate.
+- The engine is a straight port (vectors allocated per payment, no tuning), so these figures
+  are a floor.
+
+## Reproduce
+
+```powershell
+python -m mtg_agentic setup   # builds goldfish-rs
+python -m benchmarks.goldfish_speed deck1.json deck2.json --data-dir .cache/mtg-agentic
+cargo test --release --manifest-path goldfish-rs/Cargo.toml   # the engine's own tests
+```
+
+`benchmarks/goldfish_speed.py` prints `identical=True` for each deck whose counters matched at
+every thread count and writes the full timings as JSON with `--output`.

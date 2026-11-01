@@ -31,6 +31,7 @@ from .forge_cli import run_command as run_forge_command
 from .forge_config import OpponentPod
 from .forge_metrics import summarize
 from .forge_runner import ForgeSimulator
+from .goldfish import build_engine, build_problem, engine_problem, run_goldfish
 from .interview import MAX_ROUNDS, interview_round
 from .lands import generate_mana_base, is_land
 from .llm import PROVIDERS, LlamaCppClient, LLMError, OllamaClient, OpenAICompatibleClient
@@ -360,6 +361,13 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
             )
             return f"{index_cards(store, embedder):,} cards embedded"
 
+        def goldfish() -> str:
+            if problem := build_problem():
+                return f"skipped: {problem}"
+            if engine_problem() is None and not args.refresh:
+                return bootstrap.ALREADY
+            return build_engine()
+
         actions = {
             "Card data": cards,
             "Oracle tags": lambda: f"{client.download_oracle_tags(store, force=args.refresh)['tag_count']:,} tags",
@@ -370,14 +378,15 @@ def _setup(args: argparse.Namespace) -> dict[str, Any]:
             "Rules index": rules,
             "Embedding model": model,
             "Card index": card_index,
+            "Goldfish engine": goldfish,
         }
         for name in bootstrap.STEPS:
-            # The model steps always check for themselves, to say why they skip.
-            if done[name] and name not in {"Embedding model", "Card index"}:
+            # These steps always check for themselves, to say why they skip.
+            if done[name] and name not in {"Embedding model", "Card index", "Goldfish engine"}:
                 bootstrap.stage(name, bootstrap.ALREADY)
                 steps[name] = bootstrap.ALREADY
                 continue
-            bootstrap.stage(name, "downloading")
+            bootstrap.stage(name, "building" if name == "Goldfish engine" else "downloading")
             steps[name] = actions[name]()
             bootstrap.stage(name, steps[name])
     return {"ready": True, "steps": steps}
@@ -497,6 +506,15 @@ def main(argv: list[str] | None = None) -> int:
     mana_base.add_argument("deck", type=Path, help="JSON with commander, cards, and optional spec")
     mana_base.add_argument("--lands", type=int, choices=range(100), help="Override the spec land count (default 36 without a spec; 0 sets it from the curve)")
     mana_base.add_argument("--output", type=Path, help="Write the mana-base report to a NEW file")
+    goldfish = commands.add_parser(
+        "goldfish", help="Play solitaire games: mana, curve, commander and kill turns"
+    )
+    goldfish.add_argument("deck", type=Path, help="JSON deck with commander and cards")
+    goldfish.add_argument("--games", type=int, default=10_000)
+    goldfish.add_argument("--turns", type=int, default=10)
+    goldfish.add_argument("--seed", type=int, default=1)
+    goldfish.add_argument("--threads", type=int, default=0, help="Rust threads; 0 uses every core")
+    goldfish.add_argument("--output", type=Path, help="Write the report to a NEW file")
     commands.add_parser("spec-schema", help="Print the fixed intake JSON schema")
     interview_cmd = commands.add_parser(
         "interview",
@@ -714,6 +732,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "setup":
             _emit(_setup(args))
+            return 0
+        if args.command == "goldfish":
+            if args.output is not None and args.output.exists():
+                raise ValueError("Output already exists; choose a new filename")
+            with OracleStore(args.data_dir / "oracle.sqlite3") as store:
+                if not store.ready:
+                    raise ValueError("Run download-oracle first")
+                result = run_goldfish(
+                    _deck_json(args.deck), store, games=args.games, turns=args.turns,
+                    seed=args.seed, threads=args.threads,
+                )
+            _emit(result, args.output)
             return 0
         if args.command == "mana-base":
             if args.output is not None and args.output.exists():

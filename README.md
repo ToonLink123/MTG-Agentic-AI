@@ -43,7 +43,7 @@ flowchart LR
 
 ## Quick start
 
-Requires Python 3.10 or newer.
+Requires Python 3.10 or newer, and [Rust](https://rustup.rs) for `/goldfish`.
 
 ```sh
 git clone https://github.com/ToonLink123/MTG-Agentic-AI.git
@@ -52,9 +52,9 @@ python -m pip install -e ".[tui,embeddings,claude]"
 python -m mtg_agentic tui
 ```
 
-On its first start, Ring downloads what it reads locally, about 2.3 GB, with a checklist
-(run `python -m mtg_agentic setup` to do it ahead of time). Then type a commander's name and
-describe your deck.
+On its first start, Ring downloads what it reads locally, about 2.3 GB, and builds its Rust
+goldfish engine, with a checklist (run `python -m mtg_agentic setup` to do it ahead of time).
+Then type a commander's name and describe your deck.
 
 Claude is the default: put `CLAUDE_API=<your key>` in a `.env` file at the repository root; it
 is ignored by Git. To stay free and offline, pass `--provider ollama` and use a local model
@@ -110,14 +110,35 @@ Each game runs in its own JVM (about 2 GB), so `--workers` plays several at once
 report the win rate with a 95% interval and `win_turn`: the candidate's own turns when it won.
 Forge's own `Game Outcome: Turn N` line is half the global turn count, not a player's turn.
 
+### Goldfish
+
+`/goldfish [GAMES]` in the terminal app, or `goldfish deck.json`, plays the deck alone against
+three idle 40-life opponents, 10,000 games by default. It reports land drops, mana available
+and spent by turn, color screw, the commander's cast turn, the first and last kill turns, and
+the cards that get stuck in hand. A greedy pilot plays lands, mana rocks and dorks, land ramp,
+fetches, card draw, Treasure, burn and creature tokens. The report lists every card whose
+effects it doesn't play. Opponents never block, remove or counter anything, so these numbers
+measure consistency and speed, not strength.
+
+The games run in a Rust engine, `goldfish-rs/`, which `setup` builds with cargo; without
+Rust, setup skips that step and says why. When the engine is missing or older than its source,
+`/goldfish` asks you to run `/setup` again. It plays the default 10,000 games in about 10 ms.
+
+```sh
+python -m mtg_agentic setup                                   # builds goldfish-rs if needed
+python -m mtg_agentic goldfish deck.json --games 100000
+```
+
 ## Development
 
 ```sh
 python -m unittest discover -s tests -v
+cargo test --release --manifest-path goldfish-rs/Cargo.toml
 ```
 
-The tests need no network, downloads or model. [BENCHMARK.md](BENCHMARK.md) explains how rules
-retrieval is measured.
+The tests need no network, downloads or model; the few that play goldfish games skip until
+setup has built the engine. [BENCHMARK.md](BENCHMARK.md) explains how rules retrieval is
+measured and how fast the goldfish engine runs.
 
 ## Credits
 

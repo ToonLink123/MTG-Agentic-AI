@@ -17,3 +17,6 @@ trajector-doctor-*/
 .env
 .claude/
 .empryo/
+
+# Rust goldfish engine build output
+goldfish-rs/target/

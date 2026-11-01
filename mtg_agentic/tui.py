@@ -34,6 +34,7 @@ from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from .bootstrap import STARTED as SETUP_STARTED
 from .bootstrap import STEPS as SETUP_STEPS
 from .bootstrap import embedding_problem
 from .bootstrap import status as setup_status
@@ -81,6 +82,9 @@ HELP = (
     ("/validate", "Offline legality and playability check of the current deck"),
     ("/bracket", "Bracket assessment of the current deck"),
     ("/review", "Bracket plus rules review of the current deck"),
+    ("/goldfish [GAMES]", "Play the current deck alone against three idle opponents, 10,000 "
+                          "games by default: land drops, mana, color screw, commander and "
+                          "kill turns, and the cards that get stuck in hand"),
     ("/review on|off", "Whether each draft runs that review itself (on by default)"),
     ("/orchestrate on|off", "Draft with a council: an orchestrator plans, members debate (on by default)"),
     ("/checkpoint on|off", "Pause after the engine map and the council's plan to pin or ban cards "
@@ -109,7 +113,7 @@ HELP = (
     ("/stop  /clear  /quit", "Also Esc, Ctrl+L and Ctrl+Q; Tab completes a command"),
 )
 SUGGESTIONS = [
-    "/commander ", "/card ", "/search ", "/ask ", "/validate", "/bracket", "/review",
+    "/commander ", "/card ", "/search ", "/ask ", "/validate", "/bracket", "/review", "/goldfish",
     "/review on", "/review off", "/orchestrate on", "/orchestrate off", "/checkpoint on",
     "/checkpoint off", "/deck", "/why ", "/versions", "/diff ", "/undo", "/load ",
     "/export", "/draft ", "/new", "/close", "/session", "/setup", "/setup refresh",
@@ -147,8 +151,9 @@ AGENT_COLORS = {
 SETUP_NOTE = (
     "Downloading what the deck pipeline reads locally, once: card data, tags and rulings from "
     "Scryfall, Commander Spellbook's combos (700 MB), the rules index and the EmbeddingGemma 2 "
-    "model (1.5 GB), about 2.3 GB in all. Deck requests wait until it finishes. Esc stops; "
-    "/setup picks up where it left off."
+    "model (1.5 GB), about 2.3 GB in all, then builds the Rust goldfish engine if Rust is "
+    "installed. Deck requests wait until it finishes. Esc stops; /setup picks up where it left "
+    "off."
 )
 TYPE_ORDER = ("Creature", "Planeswalker", "Battle", "Instant", "Sorcery", "Artifact", "Enchantment")
 PLURALS = {"Sorcery": "Sorceries", "Other": "Other"}
@@ -748,6 +753,60 @@ def render_review(result: dict[str, Any]) -> Group:
         parts.append(problems(result["errors"]))
     if result.get("warnings"):
         parts.append(unverified(result["warnings"]))
+    return Group(*parts)
+
+
+def render_goldfish(report: dict[str, Any]) -> Group:
+    turns, by_turn = report["turns"], report["by_turn"]
+    head = Text.assemble(
+        ("Goldfish", f"bold {GOLD}"),
+        (f"  {report['games']:,} games of {turns} turns · {report['seconds']:.2f}s", MUTED),
+    )
+    table = Table.grid(padding=(0, 1))
+    table.add_column(style=MUTED, no_wrap=True)
+    for _ in by_turn:
+        table.add_column(justify="right", no_wrap=True)
+    table.add_row("Turn", *(Text(str(row["turn"]), MUTED) for row in by_turn))
+    table.add_row("Land drop", *(f"{row['land_drop']:.0%}" for row in by_turn))
+    table.add_row("Mana", *(f"{row['mana_available']:.1f}" for row in by_turn))
+    table.add_row("Spent", *(f"{row['mana_spent']:.1f}" for row in by_turn))
+    table.add_row("Color screw", *(
+        Text(f"{row['color_screw']:.0%}", AMBER if row["color_screw"] >= 0.2 else "")
+        for row in by_turn
+    ))
+
+    def when(milestone: dict[str, Any], mana_value: int = 0) -> str:
+        missed = f"not by turn {turns}: {milestone['not_reached']:.0%}"
+        parts = [f"median turn {milestone['median_turn']}"] if milestone["median_turn"] else []
+        if 0 < mana_value <= turns:
+            parts.append(f"by turn {mana_value}: {milestone['by_turn'][mana_value - 1]:.0%}")
+        return " · ".join([*parts, missed])
+
+    commander = report["commander"]
+    rows: list[tuple[str, Any]] = [
+        ("Mulligans", f"{report['mulligans']['rate']:.0%} of games (the first one is free)"),
+        ("Commander", f"{commander['name']}: {when(commander, commander['mana_value'])}"),
+        ("First kill", when(report["first_kill"])),
+        ("Whole table", when(report["table_kill"])),
+    ]
+    stuck = [card for card in report["cards"] if card["stranded_rate"] >= 0.25][:6]
+    if stuck:
+        rows.append(("Stuck in hand", ", ".join(
+            f"{card['name']} {card['stranded_rate']:.0%}" for card in stuck
+        )))
+    coverage = report.get("coverage", {})
+    played = [k for k in coverage if k not in {"cast only", "not cast", "land"}]
+    rows.append(("Simulated", ", ".join(f"{k} {len(coverage[k])}" for k in played)
+                 or "nothing beyond casting"))
+    cast_only = coverage.get("cast only", [])
+    if cast_only:
+        listed = ", ".join(cast_only[:6]) + (", ..." if len(cast_only) > 6 else "")
+        cards = f"{len(cast_only)} card" + ("s" if len(cast_only) != 1 else "")
+        rows.append(("Cast only", f"{cards} whose effects aren't played: {listed}"))
+    parts: list[Any] = [head, table, labeled(rows)]
+    if report.get("warning"):
+        parts.append(Text(report["warning"], AMBER))
+    parts.append(Text(report["scope"], MUTED))
     return Group(*parts)
 
 
@@ -1997,6 +2056,8 @@ class ChatApp(App[None]):
             await self.undo()
         elif command in {"/validate", "/bracket", "/review", "/deck"}:
             await self.deck_command(command)
+        elif command == "/goldfish":
+            await self.goldfish(rest)
         elif command == "/load" and rest:
             await self.load(Path(rest.strip("\"'")).expanduser())
         elif command == "/export":
@@ -2022,14 +2083,14 @@ class ChatApp(App[None]):
     def setup_job(self, refresh: bool) -> Callable[[Turn], Awaitable[None]]:
         async def job(turn: Turn) -> None:
             def advance(event: dict[str, Any]) -> None:
-                # A setup stage starts ("downloading"), then reports its result.
+                # A setup stage starts ("downloading" or "building"), then reports its result.
                 if event["type"] != "stage" or event.get("scope") != "setup":
                     return
                 index, detail = int(event["index"]) - 1, str(event.get("detail", ""))
                 if not 0 <= index < len(turn.steps):
                     return
-                if detail == "downloading":
-                    turn.start(index, "downloading")
+                if detail in SETUP_STARTED:
+                    turn.start(index, detail)
                 else:
                     state = "warn" if detail.startswith("skipped") else "done"
                     turn.finish(index, detail, state)
@@ -2176,6 +2237,21 @@ class ChatApp(App[None]):
                 ["review-deck", str(self.deck_path), *self.settings.model_args()],
                 render_review, lambda r: r.get("status", "").replace("_", " "),
             ))
+
+    async def goldfish(self, rest: str) -> None:
+        """Solitaire games of the current deck, in the Rust engine /setup builds."""
+        if self.deck is None or self.deck_path is None:
+            message = "No deck yet. Describe one to draft it, or /load a saved deck JSON."
+            await self.reply(Text(message, AMBER))
+            return
+        games = rest.replace(",", "").replace("_", "")
+        if games and not (games.isdigit() and 1 <= int(games) <= 1_000_000):
+            await self.reply(Text("Use /goldfish, or /goldfish GAMES for 1 to 1,000,000.", AMBER))
+            return
+        argv = ["goldfish", str(self.deck_path), "--games", games or "10000"]
+        self.launch(["Goldfish"], self.single(
+            argv, render_goldfish, lambda r: f"{r['games']:,} games",
+        ))
 
     async def load(self, path: Path) -> None:
         try:

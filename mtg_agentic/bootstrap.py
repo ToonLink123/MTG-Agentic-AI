@@ -3,8 +3,9 @@
 `python -m mtg_agentic setup` downloads each missing piece once: Scryfall's Oracle Cards,
 Oracle tags and rulings, Commander Spellbook's combo export, the Comprehensive Rules with their
 prebuilt vectors, and the EmbeddingGemma 2 weights that embed rulings and rules questions
-(about 2.3 GB in all, most of it the model and the combo export). The TUI runs it on a first
-start; `status()` tells it what is missing without any network call or heavy import.
+(about 2.3 GB in all, most of it the model and the combo export). Last, it builds the Rust
+goldfish engine with cargo. The TUI runs it on a first start; `status()` tells it what is
+missing without any network call or heavy import.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from . import goldfish
 from .card_graph import card_identity, index_ready
 from .embeddings import EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION, FORMAT_VERSION
 from .events import event
@@ -24,10 +26,12 @@ from .oracle import COMBO_CARDS, OracleStore
 
 STEPS = (
     "Card data", "Oracle tags", "Rulings", "Commander Spellbook", "Rules index", "Embedding model",
-    "Card index",
+    "Card index", "Goldfish engine",
 )
 RULES_INDEX = "rules-embeddinggemma-2.sqlite3"  # The default embedding backend's rules index.
 ALREADY = "already here"
+# What a stage says when it starts; every other detail is its result.
+STARTED = ("downloading", "building")
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +80,12 @@ def card_index_identity() -> str:
     return card_identity(EMBEDDINGGEMMA_MODEL, EMBEDDINGGEMMA_REVISION, FORMAT_VERSION)
 
 
+def goldfish_ready() -> bool:
+    """Built and newer than its source, or impossible to build here (no Rust), in which case
+    setup says why it skips the step instead of a start running setup for it again."""
+    return goldfish.engine_problem() is None or goldfish.build_problem() is not None
+
+
 def status(data_dir: Path, rules_index: str = RULES_INDEX) -> dict[str, bool]:
     """Which setup steps are done. The model and the card index count as done when this Python
     could not use them anyway, so a start does not run setup for them; setup itself says why it
@@ -101,4 +111,5 @@ def status(data_dir: Path, rules_index: str = RULES_INDEX) -> dict[str, bool]:
             row = db.execute("SELECT value FROM rule_metadata WHERE key='rule_count'").fetchone()
             done["Rules index"] = bool(row and int(row[0]) > 0)
     done["Embedding model"] = embedding_problem() is not None or model_cached()
+    done["Goldfish engine"] = goldfish_ready()
     return done

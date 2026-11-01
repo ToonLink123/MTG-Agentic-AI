@@ -33,6 +33,7 @@ if HAS_TEXTUAL:
         mana,
         parse_question,
         render_deck,
+        render_goldfish,
         render_interaction,
         render_map,
         render_review,
@@ -83,6 +84,25 @@ def stage(scope, index, total, name, detail):
 
 def agent(name, state, message="", **fields):
     return ev("agent", message or f"agent: {name} | {state}", name=name, state=state, **fields)
+
+
+def goldfish_report():
+    from mtg_agentic.goldfish import summarize
+
+    pieces = [
+        {"name": JODAH["name"], "land": False, "mv": 4, "effects": ["attacks"], "castable": True},
+        {"name": "Sol Ring", "land": False, "mv": 1, "effects": ["mana"], "castable": True},
+        {"name": "Mana Drain", "land": False, "mv": 2, "effects": [], "castable": True},
+    ]
+    counters = dict(
+        games=10, turns=3, on_play=3, opening_lands=[0, 0, 4, 4, 2, 0, 0, 0],
+        mulligans=[8, 2, 0, 0, 0, 0, 0, 0], land_drops=[10, 9, 7],
+        lands_on_curve=[10, 9, 6], mana_available=[10, 21, 30], mana_spent=[8, 15, 20],
+        color_screw=[0, 1, 3], commander_turn=[0, 2, 4, 4], first_kill=[0, 0, 0, 10],
+        kill=[0, 0, 0, 10], drawn=[0, 4, 5], cast=[3, 1, 0], cast_turn_sum=[9, 2, 0],
+        stranded=[0, 3, 5],
+    )
+    return {**summarize({"commander": 0, "pieces": pieces}, counters), "seconds": 0.01}
 
 
 def plain(renderable, width=120):
@@ -256,6 +276,14 @@ class TuiHelperTests(unittest.TestCase):
         self.assertEqual(mana("{1}{U} // {3}{R}").plain, "1U // 3R")
         self.assertEqual(identity(["B", "G", "R", "U", "W"]).plain, "WUBRG")
         self.assertEqual(identity([]).plain, "C")
+
+    def test_goldfish_shows_turns_milestones_stuck_cards_and_what_is_simulated(self):
+        text = plain(render_goldfish(goldfish_report()))
+        self.assertIn("10 games of 3 turns · 0.01s", text)
+        self.assertIn("Color screw", text)
+        self.assertIn("Jodah, Archmage Eternal: median turn 3 · not by turn 3: 40%", text)
+        self.assertIn("Stuck in hand  Mana Drain 100%, Sol Ring 75%", text)
+        self.assertIn("Cast only      1 card whose effects aren't played: Mana Drain", text)
 
     def test_deck_groups_cards_by_front_face_type_with_lands_last(self):
         self.assertEqual(card_type({"type_line": "Artifact Creature — Golem"}), "Creature")
@@ -712,8 +740,9 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             (4, "Commander Spellbook", "skipped: --skip-combos"),
             (5, "Rules index", "already here"), (6, "Embedding model", "already here"),
             (7, "Card index", "downloading"), (7, "Card index", "28,000 cards embedded"),
+            (8, "Goldfish engine", "building"), (8, "Goldfish engine", "built in 21s"),
         ]
-        lines = [stage("setup", n, 7, name, detail) for n, name, detail in steps]
+        lines = [stage("setup", n, 8, name, detail) for n, name, detail in steps]
         gate = asyncio.Event()
         cli = FakeCli({"setup": (0, {"ready": True, "steps": {}}),
                        "card": (0, trim_card(JODAH))}, wait=gate, lines={"setup": lines})
@@ -733,6 +762,7 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([argv[0] for argv in cli.calls], ["setup", "card"])
         self.assertEqual(steps[0], ("Card data", "done", "33,000 cards"))
         self.assertEqual(steps[3], ("Commander Spellbook", "warn", "skipped: --skip-combos"))
+        self.assertEqual(steps[7], ("Goldfish engine", "done", "built in 21s"))
         self.assertEqual({state for _, state, _ in steps}, {"done", "warn"})
 
     async def test_a_start_with_everything_local_runs_no_setup(self):
@@ -776,6 +806,23 @@ class TuiAppTests(unittest.IsolatedAsyncioTestCase):
             ["validate", str(deck)],
             ["bracket-check", str(deck), "--provider", "claude"],
             ["review-deck", str(deck), "--provider", "claude"],
+        ])
+
+    async def test_goldfish_plays_the_current_deck_with_an_optional_game_count(self):
+        cli = FakeCli({"goldfish": (0, goldfish_report())})
+        app = ChatApp(self.data_dir, Settings(provider="claude"), runner=cli)
+        deck = self.data_dir / "deck.json"
+        deck.write_text(json.dumps(DECK), encoding="utf-8")
+        async with app.run_test() as pilot:
+            await self.send(app, pilot, "/goldfish")
+            self.assertEqual(cli.calls, [])
+            await self.send(app, pilot, f"/load {deck}")
+            await self.send(app, pilot, "/goldfish")
+            await self.send(app, pilot, "/goldfish 50,000")
+            await self.send(app, pilot, "/goldfish lots")
+        self.assertEqual(cli.calls, [
+            ["goldfish", str(deck), "--games", "10000"],
+            ["goldfish", str(deck), "--games", "50000"],
         ])
 
     async def test_run_cli_streams_a_real_command_and_returns_its_json(self):

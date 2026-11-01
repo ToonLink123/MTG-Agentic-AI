@@ -1,0 +1,16 @@
+[package]
+name = "goldfish-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust engine for Ring's goldfish simulator; mirrors mtg_agentic/goldfish.py"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
